@@ -1,0 +1,1 @@
+/data/data/com.termux/files/usr/bin/c++ -O2 -g -DNDEBUG -Xlinker --dependency-file=CMakeFiles/example.dir/link.d CMakeFiles/example.dir/example.cpp.o -o example  libmotioncam_decoder.a

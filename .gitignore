@@ -1,0 +1,25 @@
+# Rust build artifacts
+/target
+Cargo.lock
+
+# Media files (sample clips, exports)
+*.mcraw
+*.mov
+*.mp4
+*.dng
+
+# Raw dump files
+*.raw
+
+# Documentation (not source)
+*.md
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,37 @@
+[package]
+name = "mcraw-tui"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-platform TUI for browsing and exploring MotionCam (.mcraw) files"
+authors = ["Terminal Developer"]
+license = "Apache-2.0"
+
+[build-dependencies]
+cc = "1.2"
+
+[dependencies]
+# TUI framework
+ratatui = "0.29"
+crossterm = "0.28"
+
+# CLI & error handling
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Async runtime (for future file I/O)
+tokio = { version = "1", features = ["full"] }
+
+# UUID for internal tracking
+uuid = { version = "1", features = ["v4"] }
+
+# TIFF/DNG writing
+tiff = "0.9"
