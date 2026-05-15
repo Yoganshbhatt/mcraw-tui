@@ -162,6 +162,11 @@ fn render_info_content(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_export_content(frame: &mut Frame, app: &App, area: Rect) {
+    let show_rate = !matches!(app.export_codec_family,
+        crate::export::CodecFamily::ProRes
+        | crate::export::CodecFamily::DNxHR
+        | crate::export::CodecFamily::CinemaDNG
+    );
     let vert = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -169,6 +174,7 @@ fn render_export_content(frame: &mut Frame, app: &App, area: Rect) {
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
+            Constraint::Length(if show_rate { 3 } else { 0 }),
             Constraint::Min(1),
         ])
         .split(area);
@@ -205,12 +211,17 @@ fn render_export_content(frame: &mut Frame, app: &App, area: Rect) {
 
     // --- Codec Family selector ---
     // Color-coding: ProRes and DNxHR are always software → warn (yellow).
-    // HEVC is green if a hardware encoder is available, yellow otherwise.
+    // HEVC, H.264 and AV1 are green when a hardware encoder is available,
+    // yellow (CPU fallback) otherwise.
     let co_focused = app.export_focus == ExportFocus::CodecFamily;
     let co_base = match app.export_codec_family {
         crate::export::CodecFamily::ProRes | crate::export::CodecFamily::DNxHR => Color::Yellow,
         crate::export::CodecFamily::HEVC if app.hardware_caps.hevc_is_hw => Color::Green,
         crate::export::CodecFamily::HEVC => Color::Yellow,
+        crate::export::CodecFamily::H264 if app.hardware_caps.h264_is_hw => Color::Green,
+        crate::export::CodecFamily::H264 => Color::Yellow,
+        crate::export::CodecFamily::AV1 if app.hardware_caps.av1_is_hw => Color::Green,
+        crate::export::CodecFamily::AV1 => Color::Yellow,
         _ => Color::White,
     };
     let co_style = if co_focused {
@@ -258,7 +269,34 @@ fn render_export_content(frame: &mut Frame, app: &App, area: Rect) {
     let pr_block = Block::default().borders(Borders::ALL);
     frame.render_widget(Paragraph::new(pr_line).block(pr_block), vert[3]);
 
+    // --- Rate Control selector (hidden for ProRes / DNxHR) ---
+    if show_rate {
+        let rc_focused = app.export_focus == ExportFocus::RateControl;
+        let rc_editing = app.is_editing_custom_rate;
+        // Show a placeholder hint when the Custom string is empty
+        let rc_label = if matches!(&app.active_rate_control, crate::export::RateControl::Custom(v) if v.is_empty()) {
+            "Custom: [ e.g., 200M or 18 ]".to_string()
+        } else {
+            app.active_rate_control.name()
+        };
+        let (rc_fg, rc_mod) = if rc_editing {
+            (Color::Green, Modifier::BOLD)
+        } else if rc_focused {
+            (Color::Yellow, Modifier::BOLD)
+        } else {
+            (Color::White, Modifier::empty())
+        };
+        let rc_line = Line::from(vec![
+            Span::styled(" Rate [r]:   ", Style::default().fg(Color::Gray)),
+            Span::styled(rc_label, Style::default().fg(rc_fg).add_modifier(rc_mod)),
+            Span::styled("  <Up/Down>", Style::default().fg(if rc_focused { Color::Green } else { Color::DarkGray })),
+        ]);
+        let rc_block = Block::default().borders(Borders::ALL);
+        frame.render_widget(Paragraph::new(rc_line).block(rc_block), vert[4]);
+    }
+
     // --- Action area ---
+    let action_idx = if show_rate { 5 } else { 4 };
     let mut action_lines = vec![
         Line::from(Span::styled(
             " Press [v] to start video export",
@@ -294,7 +332,7 @@ fn render_export_content(frame: &mut Frame, app: &App, area: Rect) {
     let action_block = Paragraph::new(action_lines)
         .block(Block::default().borders(Borders::ALL))
         .wrap(Wrap { trim: true });
-    frame.render_widget(action_block, vert[4]);
+    frame.render_widget(action_block, vert[action_idx]);
 }
 
 fn render_right_pane(frame: &mut Frame, app: &App, area: Rect) {

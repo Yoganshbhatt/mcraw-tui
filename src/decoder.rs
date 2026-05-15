@@ -81,6 +81,9 @@ pub struct Decoder {
     handle: *mut McDecoder,
 }
 
+// Safe: Decoder is used from only one thread at a time (loader stage).
+unsafe impl Send for Decoder {}
+
 impl Decoder {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path_str = path.as_ref().to_string_lossy();

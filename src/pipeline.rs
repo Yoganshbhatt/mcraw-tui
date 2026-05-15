@@ -10,32 +10,65 @@ use crate::decoder::Decoder;
 use crate::encoder::VideoEncoder;
 use crate::export::{
     Av1Profile, CodecFamily, DnxhrProfile, H264Profile, HevcProfile,
-    ProResProfile, Vp9Profile,
+    ProResProfile, RateControl, Vp9Profile,
 };
 use crate::file::McrawFileInfo;
 use anyhow::{anyhow, Result};
+use crossbeam_channel::bounded;
 use rayon::prelude::*;
 use std::fs;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Instant;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// Number of frame slots in the producer-consumer pool.
+const PIPELINE_DEPTH: usize = 3;
+
+/// A pre-allocated buffer slot that circulates through the pipeline stages.
+struct FrameSlot {
+    bayer: Vec<u16>,
+    frame_bytes: Vec<u8>,
+    as_shot_neutral: [f32; 3],
+}
+
+/// Per-stage nanosecond accumulators (shared across threads via atomics).
+struct ProfileTimers {
+    p1_load: AtomicU64,
+    p2_demosaic: AtomicU64,
+    p3_process: AtomicU64,
+    p4_push: AtomicU64,
+}
+
+impl ProfileTimers {
+    fn new() -> Self {
+        Self {
+            p1_load: AtomicU64::new(0),
+            p2_demosaic: AtomicU64::new(0),
+            p3_process: AtomicU64::new(0),
+            p4_push: AtomicU64::new(0),
+        }
+    }
+}
 
 /// Build FFmpeg codec arguments.
 /// Delegates to `CodecFamily::to_ffmpeg_args` which independently resolves
 /// the codec family, the user-chosen profile, and the runtime-detected
-/// HEVC hardware encoder.
+/// encoder names.
 pub fn build_ffmpeg_codec_args(
     family: CodecFamily,
     hevc_encoder: &str,
+    h264_encoder: &str,
+    av1_encoder: &str,
     prores: ProResProfile,
     dnxhr: DnxhrProfile,
     hevc: HevcProfile,
     h264: H264Profile,
     av1: Av1Profile,
     vp9: Vp9Profile,
-) -> (&'static str, &'static str, Vec<&'static str>) {
-    family.to_ffmpeg_args(hevc_encoder, prores, dnxhr, hevc, h264, av1, vp9)
+    rate_control: &RateControl,
+) -> (&'static str, &'static str, Vec<String>) {
+    family.to_ffmpeg_args(hevc_encoder, h264_encoder, av1_encoder, prores, dnxhr, hevc, h264, av1, vp9, rate_control)
 }
 
 pub fn get_ffmpeg_vui_tags(color_space: &ColorSpace, transfer: &TransferFunction) -> Vec<&'static str> {
@@ -64,8 +97,6 @@ pub fn get_ffmpeg_vui_tags(color_space: &ColorSpace, transfer: &TransferFunction
 }
 
 pub fn run_naked(info: &McrawFileInfo, output_path: &str) -> Result<()> {
-    // eprintln!("[NAKED] Starting raw bayer dump to: {}", output_path);
-
     let decoder = Decoder::new(&info.path)?;
     let timestamps = decoder.timestamps()?;
 
@@ -73,21 +104,10 @@ pub fn run_naked(info: &McrawFileInfo, output_path: &str) -> Result<()> {
         return Err(anyhow!("No frames found in file"));
     }
 
-    // eprintln!("[NAKED] Raw dimensions: {}x{} (stride={})", info.width, info.height, info.width);
-    // eprintln!("[NAKED] Active area: {}x{} @ ({},{})",
-    //     info.active_width, info.active_height, info.active_offset_x, info.active_offset_y);
-    // eprintln!("[NAKED] Frame count: {}", timestamps.len());
-    // eprintln!("[NAKED] Bayer pattern: {:?}", info.bayer_pattern);
-
     let mut out_file = fs::File::create(output_path)?;
 
-    for (_i, ts) in timestamps.iter().enumerate() {
-        // if (_i + 1) % 10 == 0 || _i == timestamps.len() - 1 {
-        //     eprintln!("[NAKED] Dumping frame {}/{}", _i + 1, timestamps.len());
-        // }
-
+    for ts in &timestamps {
         let (bayer_bytes, _meta) = decoder.load_frame(*ts)?;
-
         let bayer_u16: Vec<u16> = bayer_bytes
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
@@ -98,25 +118,40 @@ pub fn run_naked(info: &McrawFileInfo, output_path: &str) -> Result<()> {
         }
     }
 
-    // eprintln!("[NAKED] Raw dump complete: {} frames -> {}", timestamps.len(), output_path);
     Ok(())
 }
 
 pub fn run(info: &McrawFileInfo, output_path: &str) -> Result<()> {
     let never_cancel = Arc::new(AtomicBool::new(false));
-    run_export(info, output_path, &|_| {}, &never_cancel, &ColorSpace::Rec709, &TransferFunction::Rec709,
-        CodecFamily::ProRes, ProResProfile::HQ, DnxhrProfile::HQX,
-        HevcProfile::Main10_420, H264Profile::Main_8bit, Av1Profile::Profile0_420_10bit, Vp9Profile::Profile2_420_10bit, "libx265")
+    run_export(
+        info.clone(),
+        output_path.to_string(),
+        Arc::new(|_| {}),
+        never_cancel,
+        ColorSpace::Rec709,
+        TransferFunction::Rec709,
+        CodecFamily::ProRes,
+        ProResProfile::HQ,
+        DnxhrProfile::HQX,
+        HevcProfile::Main10_420,
+        H264Profile::Main_8bit,
+        Av1Profile::Profile0_420_10bit,
+        Vp9Profile::Profile2_420_10bit,
+        "libx265".to_string(),
+        "libx264".to_string(),
+        "libaom-av1".to_string(),
+        RateControl::Lossless,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn run_export(
-    info: &McrawFileInfo,
-    output_path: &str,
-    on_progress: &dyn Fn(f64),
-    cancelled: &AtomicBool,
-    export_cs: &ColorSpace,
-    export_tf: &TransferFunction,
+    info: McrawFileInfo,
+    output_path: String,
+    on_progress: Arc<dyn Fn(f64) + Send + Sync>,
+    cancelled: Arc<AtomicBool>,
+    export_cs: ColorSpace,
+    export_tf: TransferFunction,
     codec_family: CodecFamily,
     prores_profile: ProResProfile,
     dnxhr_profile: DnxhrProfile,
@@ -124,11 +159,11 @@ pub fn run_export(
     h264_profile: H264Profile,
     av1_profile: Av1Profile,
     vp9_profile: Vp9Profile,
-    hevc_encoder: &str,
+    hevc_encoder: String,
+    h264_encoder: String,
+    av1_encoder: String,
+    rate_control: RateControl,
 ) -> Result<()> {
-    // eprintln!("Starting video export to: {}", output_path);
-    // eprintln!("Export settings: {} / {}", export_cs.name(), export_tf.name());
-
     let decoder = Decoder::new(&info.path)?;
     let timestamps = decoder.timestamps()?;
 
@@ -147,11 +182,6 @@ pub fn run_export(
     }
 
     let fps = if info.fps > 0.0 { info.fps } else { 25.0 };
-
-    // eprintln!("File info: {}x{} active area at ({},{}), stride {}",
-    //     active_width, active_height, offset_x, offset_y, stride_width);
-    // eprintln!("White level: {}, Black level: {}", info.white_level, info.black_level);
-    // eprintln!("Bayer pattern: {:?}", info.bayer_pattern);
 
     // --- Build Camera→XYZ matrix from available DNG matrices ---
     let cm1_f32: [f32; 9] = info.camera_metadata.color_matrix
@@ -195,8 +225,6 @@ pub fn run_export(
         }
     };
 
-    // eprintln!("Camera→XYZ matrix: {:?}", cam_to_xyz);
-
     let is_log = export_tf.is_log_bypass();
     let target_xyz_to_rgb = export_cs.get_xyz_to_rgb_matrix();
 
@@ -206,140 +234,280 @@ pub fn run_export(
     let total_frames = timestamps.len();
 
     let (codec_name, pix_fmt, mut extra_args) = build_ffmpeg_codec_args(
-        codec_family, hevc_encoder,
+        codec_family, &hevc_encoder, &h264_encoder, &av1_encoder,
         prores_profile, dnxhr_profile, hevc_profile,
         h264_profile, av1_profile, vp9_profile,
+        &rate_control,
     );
 
-    let vui_tags = get_ffmpeg_vui_tags(export_cs, export_tf);
-    extra_args.extend(vui_tags);
+    let vui_tags = get_ffmpeg_vui_tags(&export_cs, &export_tf);
+    extra_args.extend(vui_tags.into_iter().map(String::from));
 
-    let demosaic = BilinearDemosaic::new(pattern);
     let xyz_to_rec = xyz_to_rec709();
 
     let mut encoder = VideoEncoder::new(
-        output_path, active_width, active_height, fps,
+        &output_path, active_width, active_height, fps,
         codec_name, pix_fmt, &extra_args,
     )?;
 
-    // Pre-allocate byte buffer once (6 bytes per pixel = 3 channels × u16)
+    // ----------------------------------------------------------------
+    // Pre-allocate the buffer pool (eliminates per-frame heap churn)
+    // ----------------------------------------------------------------
+    let stride_pixels = stride_width as usize * info.height as usize;
     let pixel_count = (active_width * active_height) as usize;
     let bytes_per_frame = pixel_count * 6;
-    let mut frame_bytes = vec![0u8; bytes_per_frame];
 
-    // Lightweight profiling accumulators (nanoseconds)
-    let mut p1_load: u64 = 0;
-    let mut p2_demosaic: u64 = 0;
-    let mut p3_process: u64 = 0;
-    let mut p4_push: u64 = 0;
+    let (free_tx, free_rx) = bounded::<FrameSlot>(PIPELINE_DEPTH);
+    let (loaded_tx, loaded_rx) = bounded::<FrameSlot>(PIPELINE_DEPTH);
+    let (processed_tx, processed_rx) = bounded::<FrameSlot>(PIPELINE_DEPTH);
 
-    for (i, ts) in timestamps.iter().enumerate() {
-        if cancelled.load(Ordering::Relaxed) {
-            encoder.finish()?;
-            log_profile(p1_load, p2_demosaic, p3_process, p4_push, i);
-            return Err(anyhow!("Export cancelled by user"));
-        }
-
-        // --- Phase 1: load frame from disk & byte-swap ---
-        let t0 = Instant::now();
-        let (bayer_bytes, frame_meta) = decoder.load_frame(*ts)?;
-        let bayer_u16: Vec<u16> = bayer_bytes
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect();
-        let t1 = Instant::now();
-        p1_load += (t1 - t0).as_nanos() as u64;
-
-        // --- Phase 2: demosaic + normalize ---
-        let mut linear_rgb = demosaic.process_par(&bayer_u16, stride_width, offset_x, offset_y, active_width, active_height, &pattern)?;
-        normalize_linear_f32(&mut linear_rgb, black_level as f32, white_level as f32);
-        let t2 = Instant::now();
-        p2_demosaic += (t2 - t1).as_nanos() as u64;
-
-        // --- Per-frame white balance & fused matrix ---
-        let as_shot = frame_meta.as_shot_neutral;
-        let (r_gain, b_gain) = if as_shot[0] > 1e-6 && as_shot[1] > 1e-6 && as_shot[2] > 1e-6 {
-            (as_shot[1] / as_shot[0], as_shot[1] / as_shot[2])
-        } else {
-            (1.0, 1.0)
-        };
-
-        let scene_white_xyz: [f32; 3] = if as_shot[0] > 1e-6 && as_shot[1] > 1e-6 && as_shot[2] > 1e-6 {
-            mat_mul_vec3(&cam_to_xyz, &as_shot)
-        } else {
-            [D65_XYZ[0], D65_XYZ[1], D65_XYZ[2]]
-        };
-
-        // Fuse camera→XYZ, CAT16 adaptation, and output RGB matrix into one 3×3
-        let output_matrix = if is_log { &target_xyz_to_rgb } else { &xyz_to_rec };
-        let fused = build_cat16_output_matrix(&cam_to_xyz, &scene_white_xyz, &D65_XYZ, output_matrix);
-
-        // --- Phase 3: all pixel processing (fused pass + OETF + byte conversion) ---
-        // Temporal WB → highlight clip → revert WB → fused matrix → clamp negatives
-        linear_rgb.par_chunks_exact_mut(3).for_each(|chunk| {
-            let r = chunk[0] * r_gain;
-            let g = chunk[1];
-            let b = chunk[2] * b_gain;
-
-            // Highlight clip in WB-space
-            let max_val = r.max(g).max(b);
-            let (r, g, b) = if max_val > 0.95f32 {
-                let t = ((max_val - 0.95) / 0.05).min(1.0);
-                (r + (max_val - r) * t,
-                 g + (max_val - g) * t,
-                 b + (max_val - b) * t)
-            } else {
-                (r, g, b)
-            };
-
-            // Revert WB so the fused matrix sees native sensor ratios
-            let rr = r / r_gain;
-            let bb = b / b_gain;
-
-            // Single 3×3 multiply: native RGB → adapted XYZ → output RGB
-            let out = mat_mul_vec3(&fused, &[rr, g, bb]);
-            chunk[0] = out[0].max(0.0);
-            chunk[1] = out[1].max(0.0);
-            chunk[2] = out[2].max(0.0);
-        });
-
-        // Apply OETF / log encoding
-        if is_log {
-            export_tf.process(&mut linear_rgb);
-        } else {
-            linear_rgb.par_iter_mut().for_each(|v| {
-                if *v < 0.0 { *v = 0.0; }
-                *v = if *v < 0.018 { 4.5 * *v } else { 1.099 * v.powf(0.45) - 0.099 };
-            });
-        }
-
-        // Convert f32 → u16 bytes in parallel (no intermediate Vec<u16>)
-        frame_bytes.par_chunks_exact_mut(6).enumerate().for_each(|(pi, out)| {
-            let base = pi * 3;
-            let ru = (linear_rgb[base].clamp(0.0, 1.0) * 65535.0) as u16;
-            let gu = (linear_rgb[base + 1].clamp(0.0, 1.0) * 65535.0) as u16;
-            let bu = (linear_rgb[base + 2].clamp(0.0, 1.0) * 65535.0) as u16;
-            out[0] = ru as u8;
-            out[1] = (ru >> 8) as u8;
-            out[2] = gu as u8;
-            out[3] = (gu >> 8) as u8;
-            out[4] = bu as u8;
-            out[5] = (bu >> 8) as u8;
-        });
-        let t3 = Instant::now();
-        p3_process += (t3 - t2).as_nanos() as u64;
-
-        // --- Phase 4: push to ffmpeg pipe ---
-        encoder.push_frame(&frame_bytes)?;
-        let t4 = Instant::now();
-        p4_push += (t4 - t3).as_nanos() as u64;
-
-        on_progress((i + 1) as f64 / total_frames as f64 * 100.0);
+    for _ in 0..PIPELINE_DEPTH {
+        free_tx.send(FrameSlot {
+            bayer: vec![0u16; stride_pixels],
+            frame_bytes: vec![0u8; bytes_per_frame],
+            as_shot_neutral: [0.0; 3],
+        })?;
     }
 
-    encoder.finish()?;
-    log_profile(p1_load, p2_demosaic, p3_process, p4_push, timestamps.len());
-    Ok(())
+    let timers = Arc::new(ProfileTimers::new());
+    let free_tx_writer = free_tx.clone();
+
+    // ==================================================================
+    // Stage 1 — Loader thread: raw frame I/O + byte-swap
+    // ==================================================================
+    let loader_handle = std::thread::Builder::new()
+        .name("loader".into())
+        .spawn({
+            let cancelled = cancelled.clone();
+            let timers = timers.clone();
+            move || -> Result<()> {
+                for ts in &timestamps {
+                    if cancelled.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let t0 = Instant::now();
+
+                    let mut slot = free_rx
+                        .recv()
+                        .map_err(|_| anyhow!("Loader: free pool closed prematurely"))?;
+
+                    let (bayer_bytes, frame_meta) = decoder.load_frame(*ts)?;
+
+                    // Byte-swap directly into the pre-allocated buffer
+                    let dst = &mut slot.bayer[..bayer_bytes.len() / 2];
+                    for (i, chunk) in bayer_bytes.chunks_exact(2).enumerate() {
+                        dst[i] = u16::from_le_bytes([chunk[0], chunk[1]]);
+                    }
+                    slot.as_shot_neutral = frame_meta.as_shot_neutral;
+
+                    let t1 = t0.elapsed().as_nanos() as u64;
+                    timers.p1_load.fetch_add(t1, Ordering::Relaxed);
+
+                    loaded_tx
+                        .send(slot)
+                        .map_err(|_| anyhow!("Loader: processor channel closed"))?;
+                }
+
+                drop(loaded_tx);
+                Ok(())
+            }
+        })?;
+
+    // ==================================================================
+    // Stage 2 — Processor thread: demosaic → color pipeline → OETF → u16
+    // ==================================================================
+    let processor_handle = std::thread::Builder::new()
+        .name("processor".into())
+        .spawn({
+            let cancelled = cancelled.clone();
+            let timers = timers.clone();
+            move || -> Result<()> {
+                // Pre-allocate the RGB working buffer ONCE for all frames
+                let mut rgb = vec![0.0f32; pixel_count * 3];
+                let demosaic = BilinearDemosaic::new(pattern);
+
+                for mut slot in loaded_rx {
+                    if cancelled.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    // --- Per-frame white balance from metadata ---
+                    let as_shot = slot.as_shot_neutral;
+                    let (r_gain, b_gain) = if as_shot[0] > 1e-6 && as_shot[1] > 1e-6 && as_shot[2] > 1e-6 {
+                        (as_shot[1] / as_shot[0], as_shot[1] / as_shot[2])
+                    } else {
+                        (1.0, 1.0)
+                    };
+
+                    let scene_white_xyz: [f32; 3] = if as_shot[0] > 1e-6 && as_shot[1] > 1e-6 && as_shot[2] > 1e-6 {
+                        mat_mul_vec3(&cam_to_xyz, &as_shot)
+                    } else {
+                        [D65_XYZ[0], D65_XYZ[1], D65_XYZ[2]]
+                    };
+
+                    let output_matrix = if is_log { &target_xyz_to_rgb } else { &xyz_to_rec };
+                    let fused = build_cat16_output_matrix(&cam_to_xyz, &scene_white_xyz, &D65_XYZ, output_matrix);
+
+                    // -- Phase 2: demosaic + normalize (into pre-allocated rgb) --
+                    let t1 = Instant::now();
+                    demosaic.process_par_into(
+                        &slot.bayer, stride_width, offset_x, offset_y,
+                        active_width, active_height, &pattern, &mut rgb,
+                    )?;
+                    normalize_linear_f32(&mut rgb, black_level as f32, white_level as f32);
+                    let t2 = t1.elapsed().as_nanos() as u64;
+                    timers.p2_demosaic.fetch_add(t2, Ordering::Relaxed);
+
+                    // -- Phase 3: pixel processing (fused pass + OETF + byte conversion) --
+                    let t2_total = Instant::now();
+
+                    // WB gain → highlight clip → revert WB → single 3×3 matrix multiply
+                    rgb.par_chunks_exact_mut(3).for_each(|chunk| {
+                        let r = chunk[0] * r_gain;
+                        let g = chunk[1];
+                        let b = chunk[2] * b_gain;
+
+                        let max_val = r.max(g).max(b);
+                        let (r, g, b) = if max_val > 0.95f32 {
+                            let t = ((max_val - 0.95) / 0.05).min(1.0);
+                            (r + (max_val - r) * t,
+                             g + (max_val - g) * t,
+                             b + (max_val - b) * t)
+                        } else {
+                            (r, g, b)
+                        };
+
+                        let rr = r / r_gain;
+                        let bb = b / b_gain;
+
+                        let out = mat_mul_vec3(&fused, &[rr, g, bb]);
+                        chunk[0] = out[0].max(0.0);
+                        chunk[1] = out[1].max(0.0);
+                        chunk[2] = out[2].max(0.0);
+                    });
+
+                    // Apply OETF / log encoding
+                    if is_log {
+                        export_tf.process(&mut rgb);
+                    } else {
+                        rgb.par_iter_mut().for_each(|v| {
+                            if *v < 0.0 { *v = 0.0; }
+                            *v = if *v < 0.018 { 4.5 * *v } else { 1.099 * v.powf(0.45) - 0.099 };
+                        });
+                    }
+
+                    // Convert f32 → u16 bytes (into pre-allocated frame_bytes)
+                    slot.frame_bytes.par_chunks_exact_mut(6).enumerate().for_each(|(pi, out)| {
+                        let base = pi * 3;
+                        let ru = (rgb[base].clamp(0.0, 1.0) * 65535.0) as u16;
+                        let gu = (rgb[base + 1].clamp(0.0, 1.0) * 65535.0) as u16;
+                        let bu = (rgb[base + 2].clamp(0.0, 1.0) * 65535.0) as u16;
+                        out[0] = ru as u8;
+                        out[1] = (ru >> 8) as u8;
+                        out[2] = gu as u8;
+                        out[3] = (gu >> 8) as u8;
+                        out[4] = bu as u8;
+                        out[5] = (bu >> 8) as u8;
+                    });
+
+                    let t3 = t2_total.elapsed().as_nanos() as u64;
+                    timers.p3_process.fetch_add(t3, Ordering::Relaxed);
+
+                    processed_tx
+                        .send(slot)
+                        .map_err(|_| anyhow!("Processor: writer channel closed"))?;
+                }
+
+                drop(processed_tx);
+                Ok(())
+            }
+        })?;
+
+    // ==================================================================
+    // Stage 3 — Writer thread: drain processed frames to FFmpeg stdin
+    // ==================================================================
+    let writer_cancelled = cancelled.clone();
+    let writer_timers = timers.clone();
+    let writer_handle = std::thread::Builder::new()
+        .name("writer".into())
+        .spawn(move || -> Result<()> {
+            let mut frames_written: usize = 0;
+
+            for slot in processed_rx {
+                if writer_cancelled.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let t3 = Instant::now();
+                encoder.push_frame(&slot.frame_bytes)?;
+                let t4 = t3.elapsed().as_nanos() as u64;
+                writer_timers.p4_push.fetch_add(t4, Ordering::Relaxed);
+
+                frames_written += 1;
+                on_progress(frames_written as f64 / total_frames as f64 * 100.0);
+
+                // Return slot to the free pool for reuse by the loader
+                let _ = free_tx_writer.send(slot);
+            }
+
+            encoder.finish()?;
+            Ok(())
+        })?;
+
+    // ==================================================================
+    // Join all stages & propagate the first error
+    // ==================================================================
+    let mut export_error: Option<anyhow::Error> = None;
+
+    match loader_handle.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            cancelled.store(true, Ordering::Relaxed);
+            export_error = Some(e);
+        }
+        Err(_) => {
+            cancelled.store(true, Ordering::Relaxed);
+            export_error = Some(anyhow!("Loader thread panicked"));
+        }
+    }
+
+    match processor_handle.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            cancelled.store(true, Ordering::Relaxed);
+            export_error.get_or_insert(e);
+        }
+        Err(_) => {
+            cancelled.store(true, Ordering::Relaxed);
+            export_error.get_or_insert(anyhow!("Processor thread panicked"));
+        }
+    }
+
+    match writer_handle.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            export_error.get_or_insert(e);
+        }
+        Err(_) => {
+            export_error.get_or_insert(anyhow!("Writer thread panicked"));
+        }
+    }
+
+    // Log profile data
+    let p1 = timers.p1_load.load(Ordering::Relaxed);
+    let p2 = timers.p2_demosaic.load(Ordering::Relaxed);
+    let p3 = timers.p3_process.load(Ordering::Relaxed);
+    let p4 = timers.p4_push.load(Ordering::Relaxed);
+    log_profile(p1, p2, p3, p4, total_frames);
+
+    match export_error {
+        Some(_) if cancelled.load(Ordering::Relaxed) => {
+            Err(anyhow!("Export cancelled by user"))
+        }
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 fn log_profile(p1: u64, p2: u64, p3: u64, p4: u64, frames: usize) {

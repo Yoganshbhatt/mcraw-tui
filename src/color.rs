@@ -238,51 +238,51 @@ impl TransferFunction {
             TransferFunction::Linear => {}
 
             TransferFunction::Rec709 => {
-                for v in pixels.iter_mut() {
+                pixels.par_iter_mut().for_each(|v| {
                     *v = rec709_oetf(*v).min(1.0).max(0.0);
-                }
+                });
             }
 
             // Sony S-Log3 (colour-science / Sony pub.)
             // cut = 0.01125, linear: y = 0.092864 + x*6.6219
             // log: y = 0.594965 + 0.255626*log10(x + 0.01)
             TransferFunction::SLog3 => {
-                for v in pixels.iter_mut() {
+                pixels.par_iter_mut().for_each(|v| {
                     let x = *v;
                     *v = if x >= 0.01125000 {
                         0.594965_f32 + 0.255626_f32 * (x + 0.01).log10()
                     } else {
                         0.092864_f32 + x * 6.62194_f32
                     };
-                }
+                });
             }
 
             // Panasonic V-Log (colour-science / Panasonic pub.)
             // cut = 0.01, linear: V = 5.6*x + 0.125
             // log: V = 0.241514*log10(x + 0.00873) + 0.598206
             TransferFunction::VLog => {
-                for v in pixels.iter_mut() {
+                pixels.par_iter_mut().for_each(|v| {
                     let x = *v;
                     *v = if x < 0.01 {
                         5.6_f32 * x + 0.125_f32
                     } else {
                         0.241514_f32 * (x + 0.00873_f32).log10() + 0.598206_f32
                     };
-                }
+                });
             }
 
             // ARRI LogC3 EI 800, Linear Scene Exposure Factor (colour-science)
             // cut = 0.010591, linear: t = 5.367655*x + 0.092809
             // log: t = 0.247190*log10(5.555556*x + 0.052272) + 0.385537
             TransferFunction::ARRIlog3 => {
-                for v in pixels.iter_mut() {
+                pixels.par_iter_mut().for_each(|v| {
                     let x = *v;
                     *v = if x > 0.010591_f32 {
                         0.247190_f32 * (5.555556_f32 * x + 0.052272_f32).log10() + 0.385537_f32
                     } else {
                         5.367655_f32 * x + 0.092809_f32
                     };
-                }
+                });
             }
 
             // Canon C-Log3 v1.2, 3-segment (colour-science / Canon 2020)
@@ -291,11 +291,10 @@ impl TransferFunction {
             // Linear:   1.9754798*x + 0.12512219                     (x between grafts)
             // Toe:      -0.36726845*log10(x*14.98325+1) + 0.12240537 (x > pos_graft_lin)
             TransferFunction::CLog3 => {
-                for v in pixels.iter_mut() {
+                let neg_graft_lin = (0.097465473_f32 - 0.12512219_f32) / 1.9754798_f32;
+                let pos_graft_lin = (0.15277891_f32 - 0.12512219_f32) / 1.9754798_f32;
+                pixels.par_iter_mut().for_each(|v| {
                     let x = *v;
-                    // Decode the graft points from linear:
-                    let neg_graft_lin = (0.097465473_f32 - 0.12512219_f32) / 1.9754798_f32; // -0.014
-                    let pos_graft_lin = (0.15277891_f32 - 0.12512219_f32) / 1.9754798_f32; // +0.014
                     *v = if x < neg_graft_lin {
                         -0.36726845_f32 * ((-x * 14.98325_f32 + 1.0_f32).max(1e-10_f32)).log10()
                             + 0.12783901_f32
@@ -304,62 +303,62 @@ impl TransferFunction {
                     } else {
                         0.36726845_f32 * (x * 14.98325_f32 + 1.0_f32).log10() + 0.12240537_f32
                     };
-                }
+                });
             }
 
             // Fujifilm F-Log2 (colour-science / Fujifilm 2022a)
             // cut = 0.000889, linear: out = 8.799461*x + 0.092864
             // log: out = 0.245281*log10(5.555556*x + 0.064829) + 0.384316
             TransferFunction::FLog2 => {
-                for v in pixels.iter_mut() {
+                pixels.par_iter_mut().for_each(|v| {
                     let x = *v;
                     *v = if x >= 0.000889_f32 {
                         0.245281_f32 * (5.555556_f32 * x + 0.064829_f32).log10() + 0.384316_f32
                     } else {
                         8.799461_f32 * x + 0.092864_f32
                     };
-                }
+                });
             }
 
             // ACEScct (colour-science / Academy)
             // cut = 0.0078125, linear: V = 10.54023774*x + 0.07290553
             // log: V = (log2(x) + 9.72) / 17.52
             TransferFunction::ACESCCT => {
-                for v in pixels.iter_mut() {
+                pixels.par_iter_mut().for_each(|v| {
                     let x = *v;
                     *v = if x > 0.0078125_f32 {
                         (x.log2() + 9.72_f32) / 17.52_f32
                     } else {
                         10.5402377416545_f32 * x + 0.0729055341958355_f32
                     };
-                }
+                });
             }
 
             // SMPTE ST.2084 (PQ) (colour-science)
             // V = ((c1 + c2 * x^m1) / (1 + c3 * x^m1))^m2
             // m1=0.1593017578125, m2=78.84375, c1=0.8359375, c2=18.8515625, c3=18.6875
             TransferFunction::PQ => {
-                for v in pixels.iter_mut() {
+                pixels.par_iter_mut().for_each(|v| {
                     let x = *v;
                     let x_m1 = x.powf(0.1593017578125_f32);
                     *v = ((0.8359375_f32 + 18.8515625_f32 * x_m1)
                         / (1.0_f32 + 18.6875_f32 * x_m1))
                     .powf(78.84375_f32);
-                }
+                });
             }
 
             // HLG (BT.2100) with E=1 breakpoint (colour-science)
             // if x <= 1.0: V = sqrt(x)
             // else: V = a*ln(x - b) + c,  a=0.17883277, b=0.28466892, c=0.55991073
             TransferFunction::HLG => {
-                for v in pixels.iter_mut() {
+                pixels.par_iter_mut().for_each(|v| {
                     let x = *v;
                     *v = if x <= 1.0_f32 {
                         x.sqrt()
                     } else {
                         0.17883277_f32 * (x - 0.28466892_f32).ln() + 0.55991073_f32
                     };
-                }
+                });
             }
         }
     }
@@ -811,6 +810,82 @@ impl BilinearDemosaic {
 
         Ok(rgb)
     }
+
+    /// Parallel demosaic writing into a pre-allocated output buffer.
+    /// `output` must have length >= `active_width * active_height * 3`.
+    pub fn process_par_into(
+        &self,
+        bayer: &[u16],
+        stride_width: u32,
+        offset_x: u32,
+        offset_y: u32,
+        active_width: u32,
+        active_height: u32,
+        pattern: &BayerPattern,
+        output: &mut [f32],
+    ) -> Result<()> {
+        let stride = stride_width as usize;
+        let ox = offset_x as i32;
+        let oy = offset_y as i32;
+        let aw = active_width as usize;
+        let ah = active_height as usize;
+
+        let min_len = (stride * (oy as usize + ah - 1) + ox as usize + aw - 1) + 1;
+        if bayer.len() < min_len {
+            anyhow::bail!("Bayer data too short: len={}, need at least {} for {}x{} active at offset {},{}",
+                bayer.len(), min_len, active_width, active_height, offset_x, offset_y);
+        }
+
+        if output.len() < aw * ah * 3 {
+            anyhow::bail!("Output buffer too short: len={}, need at least {}",
+                output.len(), aw * ah * 3);
+        }
+
+        let pat = *pattern;
+        let row_len = aw * 3;
+
+        output.par_chunks_exact_mut(row_len).enumerate().for_each(|(sy, row)| {
+            let y = sy as i32 + oy;
+            for sx in 0..aw {
+                let x = sx as i32 + ox;
+                let is_red = self.is_red_site(x, y, pat);
+                let is_blue = self.is_blue_site(x, y, pat);
+
+                let (r, g, b) = if is_red {
+                    (self.get_pixel(bayer, stride_width, x, y),
+                     self.interp_green_at_red(bayer, stride_width, active_height, x, y, pat),
+                     self.interp_blue_at_red(bayer, stride_width, active_height, x, y, pat))
+                } else if is_blue {
+                    (self.interp_red_at_blue(bayer, stride_width, active_height, x, y, pat),
+                     self.interp_green_at_blue(bayer, stride_width, active_height, x, y, pat),
+                     self.get_pixel(bayer, stride_width, x, y))
+                } else {
+                    let is_top_green = match pat {
+                        BayerPattern::RGGB | BayerPattern::BGGR => y % 2 == 0,
+                        BayerPattern::GRBG => y % 2 == 0,
+                        BayerPattern::GBRG => y % 2 == 1,
+                        _ => y % 2 == 0,
+                    };
+                    if is_top_green {
+                        (self.interp_red_at_blue(bayer, stride_width, active_height, x + 1, y, pat),
+                         self.get_pixel(bayer, stride_width, x, y),
+                         self.interp_blue_at_red(bayer, stride_width, active_height, x - 1, y, pat))
+                    } else {
+                        (self.interp_red_at_blue(bayer, stride_width, active_height, x - 1, y, pat),
+                         self.get_pixel(bayer, stride_width, x, y),
+                         self.interp_blue_at_red(bayer, stride_width, active_height, x + 1, y, pat))
+                    }
+                };
+
+                let base = sx * 3;
+                row[base] = r as f32;
+                row[base + 1] = g as f32;
+                row[base + 2] = b as f32;
+            }
+        });
+
+        Ok(())
+    }
 }
 
 impl Demosaic for BilinearDemosaic {
@@ -909,9 +984,9 @@ impl Rec709TransferFunction {
 
 impl TransferFunctionProcessor for Rec709TransferFunction {
     fn process(&self, pixels: &mut [f32]) {
-        for v in pixels.iter_mut() {
+        pixels.par_iter_mut().for_each(|v| {
             *v = rec709_oetf(*v).min(1.0).max(0.0);
-        }
+        });
     }
 }
 

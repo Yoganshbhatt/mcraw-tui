@@ -13,7 +13,7 @@ use crate::cli::{Cli, CliCommands, ResolvedCli};
 use crate::color::{ColorSpace, TransferFunction};
 use crate::export::{
     Av1Profile, CodecFamily, DnxhrProfile, H264Profile, HevcProfile,
-    ProResProfile, Vp9Profile,
+    ProResProfile, RateControl, Vp9Profile,
 };
 use crate::hardware::probe_hardware;
 use std::sync::Arc;
@@ -67,6 +67,10 @@ pub struct App {
 
     // Runtime hardware probe result
     pub hardware_caps: crate::hardware::HardwareCaps,
+
+    // Rate control
+    pub active_rate_control: RateControl,
+    pub is_editing_custom_rate: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +79,7 @@ pub enum ExportFocus {
     TransferFunction,
     CodecFamily,
     Profile,
+    RateControl,
 }
 
 impl App {
@@ -115,6 +120,8 @@ impl App {
             vp9_profile: Vp9Profile::Profile2_420_10bit,
 
             hardware_caps: caps,
+            active_rate_control: RateControl::Lossless,
+            is_editing_custom_rate: false,
         }
     }
 
@@ -219,6 +226,12 @@ impl App {
             CodecFamily::VP9 => self.vp9_profile.name(),
             CodecFamily::CinemaDNG => "—",
         }
+    }
+
+    pub fn cycle_rate_control(&mut self) {
+        self.active_rate_control = self.active_rate_control.next();
+        self.is_editing_custom_rate = false;
+        self.status_message = format!("Rate: {}", self.active_rate_control.name());
     }
 
     pub fn active_encoder_label(&self) -> String {
@@ -334,6 +347,8 @@ impl App {
         let ap = self.av1_profile;
         let vp = self.vp9_profile;
         let hevc_enc = self.hardware_caps.best_hevc_encoder.clone();
+        let h264_enc = self.hardware_caps.best_h264_encoder.clone();
+        let av1_enc = self.hardware_caps.best_av1_encoder.clone();
 
         self.is_exporting = true;
         self.export_progress = 0.0;
@@ -350,11 +365,25 @@ impl App {
             self.active_profile_name(),
         );
 
+        // Build an owned, thread-safe progress callback
+        let progress_cb = {
+            let prog_tx = tx.clone();
+            Arc::new(move |pct: f64| { let _ = prog_tx.send(pct); })
+        };
+
+        let rate_control = self.active_rate_control.clone();
+
         std::thread::spawn(move || {
-            let result = crate::pipeline::run_export(
-                &info, &output_path, &|pct| { let _ = tx.send(pct); },
-                &cancel_flag,
-                &cs, &tf, cf, pp, dp, hp, h4p, ap, vp, &hevc_enc,
+            let _result = crate::pipeline::run_export(
+                info,
+                output_path,
+                progress_cb,
+                cancel_flag,
+                cs, tf, cf, pp, dp, hp, h4p, ap, vp,
+                hevc_enc,
+                h264_enc,
+                av1_enc,
+                rate_control,
             );
             let _ = tx.send(100.0);
         });
@@ -578,13 +607,43 @@ async fn event_loop(tx: mpsc::Sender<Event>) {
 async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder) {
     match event {
         Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
+            // Ctrl-C always quits
             if let crossterm::event::KeyCode::Char('c') = key_event.code {
                 if key_event.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
                     app.running = false;
-                    // println!("\nExiting MCRAW TUI... Goodbye!");
                     return;
                 }
             }
+
+            // ----------------------------------------------------------------
+            // Custom rate-control inline editing — intercepts ALL keystrokes
+            // ----------------------------------------------------------------
+            if app.is_editing_custom_rate {
+                match key_event.code {
+                    crossterm::event::KeyCode::Char(c) => {
+                        if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == 'M' || c == 'k' || c == 'm' {
+                            if let RateControl::Custom(ref mut val) = app.active_rate_control {
+                                val.push(c);
+                            }
+                        }
+                    }
+                    crossterm::event::KeyCode::Backspace => {
+                        if let RateControl::Custom(ref mut val) = app.active_rate_control {
+                            val.pop();
+                        }
+                    }
+                    crossterm::event::KeyCode::Enter | crossterm::event::KeyCode::Esc => {
+                        app.is_editing_custom_rate = false;
+                        app.status_message = format!("Rate: {}", app.active_rate_control.name());
+                    }
+                    _ => {}
+                }
+                return;
+            }
+
+            // ----------------------------------------------------------------
+            // Normal character-key dispatch
+            // ----------------------------------------------------------------
             if let crossterm::event::KeyCode::Char(c) = key_event.code {
                 match c {
                     'q' => {
@@ -594,7 +653,15 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder) {
                         app.show_help = !app.show_help;
                     }
                     'i' => {
-                        if app.file_info.is_some() {
+                        // When Custom rate is active on the Export screen, 'i' toggles edit mode
+                        if app.screen == Screen::Export
+                            && matches!(app.active_rate_control, RateControl::Custom(_))
+                        {
+                            app.is_editing_custom_rate = !app.is_editing_custom_rate;
+                            if app.is_editing_custom_rate {
+                                app.status_message = "Type a rate value (e.g. 20, 400M, 50000k). Press Enter to confirm, Esc to cancel.".to_string();
+                            }
+                        } else if app.file_info.is_some() {
                             app.screen = Screen::Info;
                         }
                     }
@@ -648,6 +715,12 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder) {
                             app.cycle_profile(true);
                         }
                     }
+                    'r' => {
+                        if app.screen == Screen::Export {
+                            app.export_focus = ExportFocus::RateControl;
+                            app.cycle_rate_control();
+                        }
+                    }
                     'n' => {
                         if let Some(ref info) = app.file_info {
                             let output_path = "naked_dump.raw";
@@ -670,6 +743,10 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder) {
                     _ => {}
                 }
             }
+
+            // ----------------------------------------------------------------
+            // Non-character keys
+            // ----------------------------------------------------------------
             match key_event.code {
                 crossterm::event::KeyCode::Esc => {
                     match app.screen {
@@ -678,21 +755,31 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder) {
                     }
                 }
                 crossterm::event::KeyCode::Enter => {
-                    match app.screen {
-                        Screen::Browse => {
-                            app.navigate_browser(BrowserDirection::Enter);
+                    // Enter on Custom rate toggles editing
+                    if app.screen == Screen::Export
+                        && matches!(app.active_rate_control, RateControl::Custom(_))
+                    {
+                        app.is_editing_custom_rate = !app.is_editing_custom_rate;
+                        if app.is_editing_custom_rate {
+                            app.status_message = "Type a rate value. Enter to confirm, Esc to cancel.".to_string();
                         }
-                        Screen::Export => {
-                            if let Some(ref info) = app.file_info {
-                                let format = OutputFormat::DNG {
-                                    output_path: std::path::PathBuf::from(
-                                        format!("/tmp/export_{}.dng", info.path.split('/').last().unwrap_or("file")),
-                                    ),
-                                };
-                                app.add_encode_job(format);
+                    } else {
+                        match app.screen {
+                            Screen::Browse => {
+                                app.navigate_browser(BrowserDirection::Enter);
                             }
+                            Screen::Export => {
+                                if let Some(ref info) = app.file_info {
+                                    let format = OutputFormat::DNG {
+                                        output_path: std::path::PathBuf::from(
+                                            format!("/tmp/export_{}.dng", info.path.split('/').last().unwrap_or("file")),
+                                        ),
+                                    };
+                                    app.add_encode_job(format);
+                                }
+                            }
+                            Screen::Info => {}
                         }
-                        Screen::Info => {}
                     }
                 }
                 crossterm::event::KeyCode::Right | crossterm::event::KeyCode::Char('l') => {
@@ -724,6 +811,9 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder) {
                             ExportFocus::Profile => {
                                 app.cycle_profile(false);
                             }
+                            ExportFocus::RateControl => {
+                                app.cycle_rate_control();
+                            }
                         }
                     }
                 }
@@ -745,6 +835,9 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder) {
                             }
                             ExportFocus::Profile => {
                                 app.cycle_profile(true);
+                            }
+                            ExportFocus::RateControl => {
+                                app.cycle_rate_control();
                             }
                         }
                     }

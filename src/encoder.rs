@@ -106,7 +106,7 @@ pub struct VideoEncoder {
 }
 
 impl VideoEncoder {
-    pub fn new(output_path: &str, width: u32, height: u32, fps: f64, codec: &str, pix_fmt: &str, extra_args: &[&str]) -> Result<Self> {
+    pub fn new(output_path: &str, width: u32, height: u32, fps: f64, codec: &str, pix_fmt: &str, extra_args: &[String]) -> Result<Self> {
         const INPUT_PIX_FMT: &str = "rgb48le";
 
         let mut cmd = Command::new("ffmpeg");
