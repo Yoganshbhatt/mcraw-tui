@@ -6,7 +6,7 @@ use crossterm::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::widgets::ListState;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time;
 
 use crate::cli::{Cli, CliCommands, ResolvedCli};
@@ -15,6 +15,7 @@ use crate::export::{
     Av1Profile, CodecFamily, DnxhrProfile, H264Profile, HevcProfile,
     ProResProfile, Vp9Profile,
 };
+use crate::hardware::probe_hardware;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use crate::decoder::Decoder;
@@ -54,6 +55,7 @@ pub struct App {
     pub export_transfer_function: TransferFunction,
     pub export_codec_family: CodecFamily,
     pub export_focus: ExportFocus,
+    pub export_start_time: Option<Instant>,
 
     // Sticky per-codec profiles (NOT reset when switching codec family)
     pub prores_profile: ProResProfile,
@@ -62,6 +64,9 @@ pub struct App {
     pub h264_profile: H264Profile,
     pub av1_profile: Av1Profile,
     pub vp9_profile: Vp9Profile,
+
+    // Runtime hardware probe result
+    pub hardware_caps: crate::hardware::HardwareCaps,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +81,7 @@ impl App {
     pub fn new() -> Self {
         let mut list_state = ListState::default();
         list_state.select(Some(0));
+        let caps = probe_hardware();
         App {
             running: true,
             screen: Screen::Browse,
@@ -97,8 +103,9 @@ impl App {
 
             export_color_space: ColorSpace::Rec709,
             export_transfer_function: TransferFunction::Rec709,
-            export_codec_family: CodecFamily::ProRes,
+            export_codec_family: CodecFamily::HEVC,
             export_focus: ExportFocus::ColorSpace,
+            export_start_time: None,
 
             prores_profile: ProResProfile::HQ,
             dnxhr_profile: DnxhrProfile::HQX,
@@ -106,6 +113,8 @@ impl App {
             h264_profile: H264Profile::Main_8bit,
             av1_profile: Av1Profile::Profile0_420_10bit,
             vp9_profile: Vp9Profile::Profile2_420_10bit,
+
+            hardware_caps: caps,
         }
     }
 
@@ -212,6 +221,17 @@ impl App {
         }
     }
 
+    pub fn active_encoder_label(&self) -> String {
+        match self.export_codec_family {
+            CodecFamily::HEVC => format!(
+                "{} {}",
+                self.hevc_profile.name(),
+                self.hardware_caps.best_hevc_encoder,
+            ),
+            _ => self.active_profile_name().to_string(),
+        }
+    }
+
     pub fn cycle_codec(&mut self, forward: bool) {
         self.export_codec_family = if forward {
             self.export_codec_family.next()
@@ -313,9 +333,11 @@ impl App {
         let h4p = self.h264_profile;
         let ap = self.av1_profile;
         let vp = self.vp9_profile;
+        let hevc_enc = self.hardware_caps.best_hevc_encoder.clone();
 
         self.is_exporting = true;
         self.export_progress = 0.0;
+        self.export_start_time = Some(Instant::now());
         let cancel_flag = Arc::new(AtomicBool::new(false));
         self.cancel_token = Some(cancel_flag.clone());
         let (tx, rx) = mpsc::channel();
@@ -332,12 +354,9 @@ impl App {
             let result = crate::pipeline::run_export(
                 &info, &output_path, &|pct| { let _ = tx.send(pct); },
                 &cancel_flag,
-                &cs, &tf, cf, pp, dp, hp, h4p, ap, vp,
+                &cs, &tf, cf, pp, dp, hp, h4p, ap, vp, &hevc_enc,
             );
             let _ = tx.send(100.0);
-            if let Err(e) = result {
-                eprintln!("Export thread error: {}", e);
-            }
         });
     }
 
@@ -360,8 +379,16 @@ impl App {
                 if self.status_message == "Cancelling export..." {
                     self.status_message = "Export cancelled".to_string();
                 } else {
-                    self.status_message = "Video export completed".to_string();
+                    let elapsed = self.export_start_time
+                        .map(|t| t.elapsed())
+                        .unwrap_or_default();
+                    let mins = elapsed.as_secs() / 60;
+                    let secs = elapsed.as_secs() % 60;
+                    self.status_message = format!(
+                        "Video export completed ({:02}m {:02}s)", mins, secs
+                    );
                 }
+                self.export_start_time = None;
             }
         }
     }
@@ -432,21 +459,21 @@ pub async fn run(args: Cli) -> Result<()> {
             let path = match file {
                 Some(p) => p,
                 None => {
-                    eprintln!("Error: No file specified. Use: mcraw-tui info -f <path>");
+                    // eprintln!("Error: No file specified. Use: mcraw-tui info -f <path>");
                     return Err(anyhow::anyhow!("No file specified"));
                 }
             };
             match McrawFileInfo::from_path(&path) {
                 Ok(mut info) => {
                     info.enhance_with_decoder();
-                    let display = crate::metadata::format_metadata_for_display(&info);
-                    for line in display {
-                        println!("{}", line);
-                    }
+                    // let display = crate::metadata::format_metadata_for_display(&info);
+                    // for line in display {
+                    //     println!("{}", line);
+                    // }
                     return Ok(());
                 }
                 Err(e) => {
-                    eprintln!("Error: {}", e);
+                    // eprintln!("Error: {}", e);
                     return Err(e);
                 }
             }
@@ -457,7 +484,7 @@ pub async fn run(args: Cli) -> Result<()> {
             output,
         }) => {
             if file.is_none() {
-                eprintln!("Error: No file specified. Use: mcraw-tui export -f <path>");
+                // eprintln!("Error: No file specified. Use: mcraw-tui export -f <path>");
                 return Err(anyhow::anyhow!("No file specified"));
             }
             if let Err(e) = Cli::validate_export_format(&format) {
@@ -489,11 +516,11 @@ pub async fn run(args: Cli) -> Result<()> {
             match encoder.start_job(job.clone()).await {
                 Ok(()) => {
                     job.status = EncodeStatus::Completed;
-                    println!("Export (stub) completed: {:?}", job.output_path().map(|p| p.to_string_lossy()));
+                    // println!("Export (stub) completed: {:?}", job.output_path().map(|p| p.to_string_lossy()));
                 }
                 Err(e) => {
                     job.status = EncodeStatus::Failed(e.to_string());
-                    eprintln!("Export failed: {}", e);
+                    // eprintln!("Export failed: {}", e);
                 }
             }
             return Ok(());
@@ -554,7 +581,7 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder) {
             if let crossterm::event::KeyCode::Char('c') = key_event.code {
                 if key_event.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
                     app.running = false;
-                    println!("\nExiting MCRAW TUI... Goodbye!");
+                    // println!("\nExiting MCRAW TUI... Goodbye!");
                     return;
                 }
             }

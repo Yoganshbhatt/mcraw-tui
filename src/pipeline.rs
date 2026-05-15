@@ -1,24 +1,33 @@
 use crate::color::{
-    pipeline_convert_to_u16, normalize_linear, identity_ccm,
+    normalize_linear_f32, identity_ccm,
     mat_mul_vec3, camera_to_xyz_matrix, interpolate_matrix,
-    cat16_adapt, D65_XYZ, xyz_to_rec709,
-    BilinearDemosaic, Rec709TransferFunction,
-    Demosaic, TransferFunctionProcessor, ColorSpace, TransferFunction,
+    build_cat16_output_matrix,
+    D65_XYZ, xyz_to_rec709,
+    BilinearDemosaic,
+    ColorSpace, TransferFunction,
 };
 use crate::decoder::Decoder;
 use crate::encoder::VideoEncoder;
-use crate::export::{CodecFamily, ProResProfile, DnxhrProfile, HevcProfile, H264Profile, Av1Profile, Vp9Profile};
+use crate::export::{
+    Av1Profile, CodecFamily, DnxhrProfile, H264Profile, HevcProfile,
+    ProResProfile, Vp9Profile,
+};
 use crate::file::McrawFileInfo;
 use anyhow::{anyhow, Result};
+use rayon::prelude::*;
 use std::fs;
 use std::io::Write;
 use std::sync::Arc;
+use std::time::Instant;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Build FFmpeg codec arguments from the selected codec family + profile.
-/// Returns (codec_name, pixel_format, extra_args).
+/// Build FFmpeg codec arguments.
+/// Delegates to `CodecFamily::to_ffmpeg_args` which independently resolves
+/// the codec family, the user-chosen profile, and the runtime-detected
+/// HEVC hardware encoder.
 pub fn build_ffmpeg_codec_args(
     family: CodecFamily,
+    hevc_encoder: &str,
     prores: ProResProfile,
     dnxhr: DnxhrProfile,
     hevc: HevcProfile,
@@ -26,64 +35,7 @@ pub fn build_ffmpeg_codec_args(
     av1: Av1Profile,
     vp9: Vp9Profile,
 ) -> (&'static str, &'static str, Vec<&'static str>) {
-    match family {
-        CodecFamily::ProRes => {
-            let (profile_v, pix_fmt) = match prores {
-                ProResProfile::Proxy => ("0", "yuv422p10le"),
-                ProResProfile::LT => ("1", "yuv422p10le"),
-                ProResProfile::Standard => ("2", "yuv422p10le"),
-                ProResProfile::HQ => ("3", "yuv422p10le"),
-                ProResProfile::P4444 => ("4", "yuva444p10le"),
-                ProResProfile::XQ4444 => ("5", "yuva444p12le"),
-            };
-            ("prores_ks", pix_fmt, vec!["-profile:v", profile_v])
-        }
-        CodecFamily::DNxHR => {
-            let (profile_str, pix_fmt) = match dnxhr {
-                DnxhrProfile::SQ => ("dnxhr_sq", "yuv422p10le"),
-                DnxhrProfile::HD => ("dnxhr_hd", "yuv422p10le"),
-                DnxhrProfile::HDX => ("dnxhr_hdx", "yuv422p10le"),
-                DnxhrProfile::HQX => ("dnxhr_hqx", "yuv422p10le"),
-                DnxhrProfile::P444 => ("dnxhr_444", "yuv444p10le"),
-            };
-            ("dnxhd", pix_fmt, vec!["-profile:v", profile_str])
-        }
-        CodecFamily::HEVC => {
-            let (pix_fmt, extra_crf) = match hevc {
-                HevcProfile::Main10_420 => ("yuv420p10le", "16"),
-                HevcProfile::Main10_444 => ("yuv444p10le", "14"),
-            };
-            ("libx265", pix_fmt, vec!["-crf", extra_crf, "-pix_fmt", pix_fmt])
-        }
-        CodecFamily::H264 => {
-            match h264 {
-                H264Profile::Main_8bit => {
-                    ("libx264", "yuv420p", vec!["-preset", "slow", "-crf", "18"])
-                }
-                H264Profile::High_10bit => {
-                    ("libx264", "yuv422p10le", vec!["-preset", "slow", "-crf", "18"])
-                }
-            }
-        }
-        CodecFamily::AV1 => {
-            let crf = match av1 {
-                Av1Profile::Profile0_420_10bit => "30",
-                Av1Profile::Profile1_444_10bit => "30",
-            };
-            ("libaom-av1", "yuv420p10le", vec!["-crf", crf, "-cpu-used", "4"])
-        }
-        CodecFamily::VP9 => {
-            let crf = match vp9 {
-                Vp9Profile::Profile2_420_10bit => "30",
-                Vp9Profile::Profile3_444_10bit => "30",
-            };
-            ("libvpx-vp9", "yuv420p10le", vec!["-crf", crf, "-b:v", "0"])
-        }
-        CodecFamily::CinemaDNG => {
-            // cDNG is handled via TIFF/DNG writer, not FFmpeg
-            ("", "", vec![])
-        }
-    }
+    family.to_ffmpeg_args(hevc_encoder, prores, dnxhr, hevc, h264, av1, vp9)
 }
 
 pub fn get_ffmpeg_vui_tags(color_space: &ColorSpace, transfer: &TransferFunction) -> Vec<&'static str> {
@@ -112,7 +64,7 @@ pub fn get_ffmpeg_vui_tags(color_space: &ColorSpace, transfer: &TransferFunction
 }
 
 pub fn run_naked(info: &McrawFileInfo, output_path: &str) -> Result<()> {
-    eprintln!("[NAKED] Starting raw bayer dump to: {}", output_path);
+    // eprintln!("[NAKED] Starting raw bayer dump to: {}", output_path);
 
     let decoder = Decoder::new(&info.path)?;
     let timestamps = decoder.timestamps()?;
@@ -121,21 +73,18 @@ pub fn run_naked(info: &McrawFileInfo, output_path: &str) -> Result<()> {
         return Err(anyhow!("No frames found in file"));
     }
 
-    let w = info.width as u32;
-    let h = info.height as u32;
-
-    eprintln!("[NAKED] Raw dimensions: {}x{} (stride={})", w, h, w);
-    eprintln!("[NAKED] Active area: {}x{} @ ({},{})",
-        info.active_width, info.active_height, info.active_offset_x, info.active_offset_y);
-    eprintln!("[NAKED] Frame count: {}", timestamps.len());
-    eprintln!("[NAKED] Bayer pattern: {:?}", info.bayer_pattern);
+    // eprintln!("[NAKED] Raw dimensions: {}x{} (stride={})", info.width, info.height, info.width);
+    // eprintln!("[NAKED] Active area: {}x{} @ ({},{})",
+    //     info.active_width, info.active_height, info.active_offset_x, info.active_offset_y);
+    // eprintln!("[NAKED] Frame count: {}", timestamps.len());
+    // eprintln!("[NAKED] Bayer pattern: {:?}", info.bayer_pattern);
 
     let mut out_file = fs::File::create(output_path)?;
 
-    for (i, ts) in timestamps.iter().enumerate() {
-        if (i + 1) % 10 == 0 || i == timestamps.len() - 1 {
-            eprintln!("[NAKED] Dumping frame {}/{}", i + 1, timestamps.len());
-        }
+    for (_i, ts) in timestamps.iter().enumerate() {
+        // if (_i + 1) % 10 == 0 || _i == timestamps.len() - 1 {
+        //     eprintln!("[NAKED] Dumping frame {}/{}", _i + 1, timestamps.len());
+        // }
 
         let (bayer_bytes, _meta) = decoder.load_frame(*ts)?;
 
@@ -149,7 +98,7 @@ pub fn run_naked(info: &McrawFileInfo, output_path: &str) -> Result<()> {
         }
     }
 
-    eprintln!("[NAKED] Raw dump complete: {} frames -> {}", timestamps.len(), output_path);
+    // eprintln!("[NAKED] Raw dump complete: {} frames -> {}", timestamps.len(), output_path);
     Ok(())
 }
 
@@ -157,7 +106,7 @@ pub fn run(info: &McrawFileInfo, output_path: &str) -> Result<()> {
     let never_cancel = Arc::new(AtomicBool::new(false));
     run_export(info, output_path, &|_| {}, &never_cancel, &ColorSpace::Rec709, &TransferFunction::Rec709,
         CodecFamily::ProRes, ProResProfile::HQ, DnxhrProfile::HQX,
-        HevcProfile::Main10_420, H264Profile::Main_8bit, Av1Profile::Profile0_420_10bit, Vp9Profile::Profile2_420_10bit)
+        HevcProfile::Main10_420, H264Profile::Main_8bit, Av1Profile::Profile0_420_10bit, Vp9Profile::Profile2_420_10bit, "libx265")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -175,9 +124,10 @@ pub fn run_export(
     h264_profile: H264Profile,
     av1_profile: Av1Profile,
     vp9_profile: Vp9Profile,
+    hevc_encoder: &str,
 ) -> Result<()> {
-    eprintln!("Starting video export to: {}", output_path);
-    eprintln!("Export settings: {} / {}", export_cs.name(), export_tf.name());
+    // eprintln!("Starting video export to: {}", output_path);
+    // eprintln!("Export settings: {} / {}", export_cs.name(), export_tf.name());
 
     let decoder = Decoder::new(&info.path)?;
     let timestamps = decoder.timestamps()?;
@@ -198,10 +148,10 @@ pub fn run_export(
 
     let fps = if info.fps > 0.0 { info.fps } else { 25.0 };
 
-    eprintln!("File info: {}x{} active area at ({},{}), stride {}",
-        active_width, active_height, offset_x, offset_y, stride_width);
-    eprintln!("White level: {}, Black level: {}", info.white_level, info.black_level);
-    eprintln!("Bayer pattern: {:?}", info.bayer_pattern);
+    // eprintln!("File info: {}x{} active area at ({},{}), stride {}",
+    //     active_width, active_height, offset_x, offset_y, stride_width);
+    // eprintln!("White level: {}, Black level: {}", info.white_level, info.black_level);
+    // eprintln!("Bayer pattern: {:?}", info.bayer_pattern);
 
     // --- Build Camera→XYZ matrix from available DNG matrices ---
     let cm1_f32: [f32; 9] = info.camera_metadata.color_matrix
@@ -245,7 +195,7 @@ pub fn run_export(
         }
     };
 
-    eprintln!("Camera→XYZ matrix: {:?}", cam_to_xyz);
+    // eprintln!("Camera→XYZ matrix: {:?}", cam_to_xyz);
 
     let is_log = export_tf.is_log_bypass();
     let target_xyz_to_rgb = export_cs.get_xyz_to_rgb_matrix();
@@ -256,7 +206,8 @@ pub fn run_export(
     let total_frames = timestamps.len();
 
     let (codec_name, pix_fmt, mut extra_args) = build_ffmpeg_codec_args(
-        codec_family, prores_profile, dnxhr_profile, hevc_profile,
+        codec_family, hevc_encoder,
+        prores_profile, dnxhr_profile, hevc_profile,
         h264_profile, av1_profile, vp9_profile,
     );
 
@@ -264,81 +215,154 @@ pub fn run_export(
     extra_args.extend(vui_tags);
 
     let demosaic = BilinearDemosaic::new(pattern);
-    let rec709_oetf = Rec709TransferFunction::new();
+    let xyz_to_rec = xyz_to_rec709();
 
     let mut encoder = VideoEncoder::new(
         output_path, active_width, active_height, fps,
         codec_name, pix_fmt, &extra_args,
     )?;
 
+    // Pre-allocate byte buffer once (6 bytes per pixel = 3 channels × u16)
+    let pixel_count = (active_width * active_height) as usize;
+    let bytes_per_frame = pixel_count * 6;
+    let mut frame_bytes = vec![0u8; bytes_per_frame];
+
+    // Lightweight profiling accumulators (nanoseconds)
+    let mut p1_load: u64 = 0;
+    let mut p2_demosaic: u64 = 0;
+    let mut p3_process: u64 = 0;
+    let mut p4_push: u64 = 0;
+
     for (i, ts) in timestamps.iter().enumerate() {
         if cancelled.load(Ordering::Relaxed) {
-            eprintln!("Export cancelled at frame {}/{}", i + 1, total_frames);
             encoder.finish()?;
+            log_profile(p1_load, p2_demosaic, p3_process, p4_push, i);
             return Err(anyhow!("Export cancelled by user"));
         }
 
-        if i % 10 == 0 || i == total_frames - 1 {
-            eprintln!("Processing frame {}/{}", i + 1, total_frames);
-        }
-
+        // --- Phase 1: load frame from disk & byte-swap ---
+        let t0 = Instant::now();
         let (bayer_bytes, frame_meta) = decoder.load_frame(*ts)?;
         let bayer_u16: Vec<u16> = bayer_bytes
             .chunks_exact(2)
             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
             .collect();
+        let t1 = Instant::now();
+        p1_load += (t1 - t0).as_nanos() as u64;
 
-        let mut linear_rgb = demosaic.process(&bayer_u16, stride_width, offset_x, offset_y, active_width, active_height, &pattern)?;
-        normalize_linear(&mut linear_rgb, black_level, white_level);
+        // --- Phase 2: demosaic + normalize ---
+        let mut linear_rgb = demosaic.process_par(&bayer_u16, stride_width, offset_x, offset_y, active_width, active_height, &pattern)?;
+        normalize_linear_f32(&mut linear_rgb, black_level as f32, white_level as f32);
+        let t2 = Instant::now();
+        p2_demosaic += (t2 - t1).as_nanos() as u64;
 
-        // --- Per-frame chromatic adaptation with CAT16: camera raw → D65 XYZ ---
+        // --- Per-frame white balance & fused matrix ---
         let as_shot = frame_meta.as_shot_neutral;
+        let (r_gain, b_gain) = if as_shot[0] > 1e-6 && as_shot[1] > 1e-6 && as_shot[2] > 1e-6 {
+            (as_shot[1] / as_shot[0], as_shot[1] / as_shot[2])
+        } else {
+            (1.0, 1.0)
+        };
+
         let scene_white_xyz: [f32; 3] = if as_shot[0] > 1e-6 && as_shot[1] > 1e-6 && as_shot[2] > 1e-6 {
             mat_mul_vec3(&cam_to_xyz, &as_shot)
         } else {
             [D65_XYZ[0], D65_XYZ[1], D65_XYZ[2]]
         };
 
-        // Convert camera raw → XYZ D65
-        let mut frame_xyz: Vec<f32> = Vec::with_capacity(linear_rgb.len());
-        for chunk in linear_rgb.chunks_exact(3) {
-            let xyz = mat_mul_vec3(&cam_to_xyz, &[chunk[0], chunk[1], chunk[2]]);
-            let adapted = cat16_adapt(&xyz, &scene_white_xyz, &D65_XYZ);
-            frame_xyz.push(adapted[0]);
-            frame_xyz.push(adapted[1]);
-            frame_xyz.push(adapted[2]);
-        }
+        // Fuse camera→XYZ, CAT16 adaptation, and output RGB matrix into one 3×3
+        let output_matrix = if is_log { &target_xyz_to_rgb } else { &xyz_to_rec };
+        let fused = build_cat16_output_matrix(&cam_to_xyz, &scene_white_xyz, &D65_XYZ, output_matrix);
 
+        // --- Phase 3: all pixel processing (fused pass + OETF + byte conversion) ---
+        // Temporal WB → highlight clip → revert WB → fused matrix → clamp negatives
+        linear_rgb.par_chunks_exact_mut(3).for_each(|chunk| {
+            let r = chunk[0] * r_gain;
+            let g = chunk[1];
+            let b = chunk[2] * b_gain;
+
+            // Highlight clip in WB-space
+            let max_val = r.max(g).max(b);
+            let (r, g, b) = if max_val > 0.95f32 {
+                let t = ((max_val - 0.95) / 0.05).min(1.0);
+                (r + (max_val - r) * t,
+                 g + (max_val - g) * t,
+                 b + (max_val - b) * t)
+            } else {
+                (r, g, b)
+            };
+
+            // Revert WB so the fused matrix sees native sensor ratios
+            let rr = r / r_gain;
+            let bb = b / b_gain;
+
+            // Single 3×3 multiply: native RGB → adapted XYZ → output RGB
+            let out = mat_mul_vec3(&fused, &[rr, g, bb]);
+            chunk[0] = out[0].max(0.0);
+            chunk[1] = out[1].max(0.0);
+            chunk[2] = out[2].max(0.0);
+        });
+
+        // Apply OETF / log encoding
         if is_log {
-            // --- LOG BYPASS: Scene-referred log export, no tonemapping ---
-            for chunk in frame_xyz.chunks_exact_mut(3) {
-                let rgb = mat_mul_vec3(&target_xyz_to_rgb, &[chunk[0], chunk[1], chunk[2]]);
-                chunk[0] = rgb[0].max(0.0);
-                chunk[1] = rgb[1].max(0.0);
-                chunk[2] = rgb[2].max(0.0);
-            }
-            export_tf.process(&mut frame_xyz);
+            export_tf.process(&mut linear_rgb);
         } else {
-            // --- STANDARD PATH: XYZ → Rec709 + OETF (no AgX for now) ---
-            for chunk in frame_xyz.chunks_exact_mut(3) {
-                let rgb = mat_mul_vec3(&xyz_to_rec709(), &[chunk[0], chunk[1], chunk[2]]);
-                chunk[0] = rgb[0].max(0.0).min(1.0);
-                chunk[1] = rgb[1].max(0.0).min(1.0);
-                chunk[2] = rgb[2].max(0.0).min(1.0);
-            }
-            // TODO: When TransferFunction::Rec709 is selected, optionally apply AgX
-            // tonemapping here before the OETF.
-            rec709_oetf.process(&mut frame_xyz);
+            linear_rgb.par_iter_mut().for_each(|v| {
+                if *v < 0.0 { *v = 0.0; }
+                *v = if *v < 0.018 { 4.5 * *v } else { 1.099 * v.powf(0.45) - 0.099 };
+            });
         }
 
-        let u16_data = pipeline_convert_to_u16(&frame_xyz);
-        let bytes: Vec<u8> = u16_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
-        encoder.push_frame(&bytes)?;
+        // Convert f32 → u16 bytes in parallel (no intermediate Vec<u16>)
+        frame_bytes.par_chunks_exact_mut(6).enumerate().for_each(|(pi, out)| {
+            let base = pi * 3;
+            let ru = (linear_rgb[base].clamp(0.0, 1.0) * 65535.0) as u16;
+            let gu = (linear_rgb[base + 1].clamp(0.0, 1.0) * 65535.0) as u16;
+            let bu = (linear_rgb[base + 2].clamp(0.0, 1.0) * 65535.0) as u16;
+            out[0] = ru as u8;
+            out[1] = (ru >> 8) as u8;
+            out[2] = gu as u8;
+            out[3] = (gu >> 8) as u8;
+            out[4] = bu as u8;
+            out[5] = (bu >> 8) as u8;
+        });
+        let t3 = Instant::now();
+        p3_process += (t3 - t2).as_nanos() as u64;
+
+        // --- Phase 4: push to ffmpeg pipe ---
+        encoder.push_frame(&frame_bytes)?;
+        let t4 = Instant::now();
+        p4_push += (t4 - t3).as_nanos() as u64;
 
         on_progress((i + 1) as f64 / total_frames as f64 * 100.0);
     }
 
     encoder.finish()?;
-    eprintln!("Video export complete: {}", output_path);
+    log_profile(p1_load, p2_demosaic, p3_process, p4_push, timestamps.len());
     Ok(())
+}
+
+fn log_profile(p1: u64, p2: u64, p3: u64, p4: u64, frames: usize) {
+    let fmt_ns = |ns: u64| -> String {
+        if ns >= 1_000_000_000 {
+            format!("{:.3}s", ns as f64 / 1_000_000_000.0)
+        } else if ns >= 1_000_000 {
+            format!("{:.1}ms", ns as f64 / 1_000_000.0)
+        } else if ns >= 1_000 {
+            format!("{:.1}µs", ns as f64 / 1_000.0)
+        } else {
+            format!("{ns}ns")
+        }
+    };
+    let total = p1 + p2 + p3 + p4;
+    if let Ok(mut f) = fs::File::create("ffmpeg_debug.txt") {
+        let _ = writeln!(f, "=== Pipeline profile ({} frames) ===", frames);
+        let _ = writeln!(f, "Phase 1  load_frame + byte-swap : {:>12}  {:>5.0}%", fmt_ns(p1), p1 as f64 / total as f64 * 100.0);
+        let _ = writeln!(f, "Phase 2  demosaic + normalize   : {:>12}  {:>5.0}%", fmt_ns(p2), p2 as f64 / total as f64 * 100.0);
+        let _ = writeln!(f, "Phase 3  pixel processing       : {:>12}  {:>5.0}%", fmt_ns(p3), p3 as f64 / total as f64 * 100.0);
+        let _ = writeln!(f, "Phase 4  encoder.push_frame     : {:>12}  {:>5.0}%", fmt_ns(p4), p4 as f64 / total as f64 * 100.0);
+        let _ = writeln!(f, "──────────────────────────────────────────────");
+        let _ = writeln!(f, "Total                          : {:>12}", fmt_ns(total));
+        let _ = writeln!(f, "Per-frame (1/{} frames)         : {:>12}", frames, fmt_ns(total / frames as u64));
+    }
 }

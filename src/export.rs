@@ -45,6 +45,81 @@ impl CodecFamily {
         let pos = all.iter().position(|&x| x == self).unwrap_or(0);
         all[(pos + all.len() - 1) % all.len()]
     }
+
+    /// Build FFmpeg arguments:
+    /// - Codec and pixel format are determined by the family and the
+    ///   runtime-detected HEVC encoder name.
+    /// - Profile is resolved independently so the user's choice is preserved.
+    pub fn to_ffmpeg_args(
+        &self,
+        hevc_encoder: &str,
+        prores: ProResProfile,
+        dnxhr: DnxhrProfile,
+        hevc: HevcProfile,
+        h264: H264Profile,
+        av1: Av1Profile,
+        vp9: Vp9Profile,
+    ) -> (&'static str, &'static str, Vec<&'static str>) {
+        match self {
+            CodecFamily::ProRes => {
+                let (profile_v, pix_fmt) = match prores {
+                    ProResProfile::Proxy => ("0", "yuv422p10le"),
+                    ProResProfile::LT => ("1", "yuv422p10le"),
+                    ProResProfile::Standard => ("2", "yuv422p10le"),
+                    ProResProfile::HQ => ("3", "yuv422p10le"),
+                    ProResProfile::P4444 => ("4", "yuva444p10le"),
+                    ProResProfile::XQ4444 => ("5", "yuva444p12le"),
+                };
+                ("prores_ks", pix_fmt, vec!["-profile:v", profile_v])
+            }
+            CodecFamily::DNxHR => {
+                let (profile_str, pix_fmt) = match dnxhr {
+                    DnxhrProfile::SQ => ("dnxhr_sq", "yuv422p10le"),
+                    DnxhrProfile::HD => ("dnxhr_hd", "yuv422p10le"),
+                    DnxhrProfile::HDX => ("dnxhr_hdx", "yuv422p10le"),
+                    DnxhrProfile::HQX => ("dnxhr_hqx", "yuv422p10le"),
+                    DnxhrProfile::P444 => ("dnxhr_444", "yuv444p10le"),
+                };
+                ("dnxhd", pix_fmt, vec!["-profile:v", profile_str])
+            }
+            CodecFamily::HEVC => match hevc_encoder {
+                "hevc_nvenc" => ("hevc_nvenc", "p010le", vec!["-preset", "p6"]),
+                "hevc_amf" => ("hevc_amf", "p010le", vec!["-quality", "quality"]),
+                "hevc_qsv" => ("hevc_qsv", "p010le", vec![]),
+                "hevc_videotoolbox" => ("hevc_videotoolbox", "p010le", vec![]),
+                _ => {
+                    let (pix_fmt, extra_crf) = match hevc {
+                        HevcProfile::Main10_420 => ("yuv420p10le", "16"),
+                        HevcProfile::Main10_444 => ("yuv444p10le", "14"),
+                    };
+                    ("libx265", pix_fmt, vec!["-crf", extra_crf, "-pix_fmt", pix_fmt])
+                }
+            },
+            CodecFamily::H264 => match h264 {
+                H264Profile::Main_8bit => {
+                    ("libx264", "yuv420p", vec!["-preset", "slow", "-crf", "18"])
+                }
+                H264Profile::High_10bit => {
+                    ("libx264", "yuv422p10le", vec!["-preset", "slow", "-crf", "18"])
+                }
+            },
+            CodecFamily::AV1 => {
+                let crf = match av1 {
+                    Av1Profile::Profile0_420_10bit => "30",
+                    Av1Profile::Profile1_444_10bit => "30",
+                };
+                ("libaom-av1", "yuv420p10le", vec!["-crf", crf, "-cpu-used", "4"])
+            }
+            CodecFamily::VP9 => {
+                let crf = match vp9 {
+                    Vp9Profile::Profile2_420_10bit => "30",
+                    Vp9Profile::Profile3_444_10bit => "30",
+                };
+                ("libvpx-vp9", "yuv420p10le", vec!["-crf", crf, "-b:v", "0"])
+            }
+            CodecFamily::CinemaDNG => ("", "", vec![]),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,13 +189,7 @@ impl DnxhrProfile {
     }
 
     pub fn all() -> &'static [DnxhrProfile] {
-        &[
-            DnxhrProfile::SQ,
-            DnxhrProfile::HD,
-            DnxhrProfile::HDX,
-            DnxhrProfile::HQX,
-            DnxhrProfile::P444,
-        ]
+        &[DnxhrProfile::SQ, DnxhrProfile::HD, DnxhrProfile::HDX, DnxhrProfile::HQX, DnxhrProfile::P444]
     }
 
     pub fn next(self) -> Self {
@@ -155,10 +224,7 @@ impl HevcProfile {
     }
 
     pub fn all() -> &'static [HevcProfile] {
-        &[
-            HevcProfile::Main10_420,
-            HevcProfile::Main10_444,
-        ]
+        &[HevcProfile::Main10_420, HevcProfile::Main10_444]
     }
 
     pub fn next(self) -> Self {

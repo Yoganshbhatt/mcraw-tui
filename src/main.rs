@@ -8,6 +8,7 @@ mod error;
 mod export;
 mod file;
 mod file_browser;
+mod hardware;
 mod metadata;
 mod pipeline;
 mod ui;

@@ -30,6 +30,9 @@ env_logger = "0.11"
 # Async runtime (for future file I/O)
 tokio = { version = "1", features = ["full"] }
 
+# Parallel iteration for pixel processing
+rayon = "1.10"
+
 # UUID for internal tracking
 uuid = { version = "1", features = ["v4"] }
 

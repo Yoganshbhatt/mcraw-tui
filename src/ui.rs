@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Tabs, Wrap},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Tabs, Wrap},
     Frame,
 };
 
@@ -11,6 +11,7 @@ use crate::encoder::EncodeStatus;
 
 pub fn render(frame: &mut Frame, app: &App) {
     let size = frame.area();
+    frame.render_widget(Clear, size);
 
     let vert = Layout::default()
         .direction(Direction::Vertical)
@@ -203,11 +204,19 @@ fn render_export_content(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(tf_line).block(tf_block), vert[1]);
 
     // --- Codec Family selector ---
+    // Color-coding: ProRes and DNxHR are always software → warn (yellow).
+    // HEVC is green if a hardware encoder is available, yellow otherwise.
     let co_focused = app.export_focus == ExportFocus::CodecFamily;
+    let co_base = match app.export_codec_family {
+        crate::export::CodecFamily::ProRes | crate::export::CodecFamily::DNxHR => Color::Yellow,
+        crate::export::CodecFamily::HEVC if app.hardware_caps.hevc_is_hw => Color::Green,
+        crate::export::CodecFamily::HEVC => Color::Yellow,
+        _ => Color::White,
+    };
     let co_style = if co_focused {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default().fg(co_base).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(co_base)
     };
     let co_line = Line::from(vec![
         Span::styled(" Codec [c]:  ", Style::default().fg(Color::Gray)),

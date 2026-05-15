@@ -1,0 +1,8 @@
+=== Pipeline profile (150 frames) ===
+Phase 1  load_frame + byte-swap :       5.683s     11%
+Phase 2  demosaic + normalize   :       3.833s      7%
+Phase 3  pixel processing       :      35.220s     68%
+Phase 4  encoder.push_frame     :       7.192s     14%
+──────────────────────────────────────────────
+Total                          :      51.929s
+Per-frame (1/150 frames)         :      346.2ms

@@ -1,6 +1,7 @@
 use crate::agx::{AgxConfig, AgxPipeline, Gamut, OutputTransfer, Transfer};
 use crate::file::BayerPattern;
 use anyhow::Result;
+use rayon::prelude::*;
 
 pub trait Demosaic {
     fn process(&self, bayer: &[u16], stride_width: u32, offset_x: u32, offset_y: u32, active_width: u32, active_height: u32, pattern: &BayerPattern) -> Result<Vec<f32>>;
@@ -491,14 +492,14 @@ pub fn rec709_to_xyz() -> [f32; 9] {
 /* ------------------------------------------------------------------ */
 
 /// CAT16 cone-response matrix (MCAT16)
-const MCAT16: [f32; 9] = [
+pub(crate) const MCAT16: [f32; 9] = [
      0.401288,  0.650173, -0.051461,
     -0.250268,  1.204414,  0.045854,
     -0.002079,  0.048952,  0.953127,
 ];
 
 /// Inverse of MCAT16
-const MCAT16_INV: [f32; 9] = [
+pub(crate) const MCAT16_INV: [f32; 9] = [
      1.86206786, -1.01125463,  0.14918678,
      0.38752654,  0.62144744, -0.00897398,
     -0.01584150, -0.03412294,  1.04996444,
@@ -521,6 +522,39 @@ pub fn cat16_adapt(xyz: &[f32; 3], src_white: &[f32; 3], dst_white: &[f32; 3]) -
         lms[2] * (s_d / s_s),
     ];
     mat_mul_vec3(&MCAT16_INV, &adapted)
+}
+
+/// Build a single fused 3×3 matrix combining camera→XYZ, CAT16 chromatic
+/// adaptation, and the output RGB matrix.  Applying this matrix once per pixel
+/// replaces the old three-step:  cam_to_xyz → cat16_adapt → output_matrix.
+pub fn build_cat16_output_matrix(
+    cam_to_xyz: &[f32; 9],
+    scene_white_xyz: &[f32; 3],
+    dst_white: &[f32; 3],
+    xyz_to_output: &[f32; 9],
+) -> [f32; 9] {
+    // Gains in LMS space:  l_d/l_s,  m_d/m_s,  s_d/s_s
+    let [l_s, m_s, s_s] = mat_mul_vec3(&MCAT16, scene_white_xyz);
+    let [l_d, m_d, s_d] = mat_mul_vec3(&MCAT16, dst_white);
+    let r_l = l_d / l_s;
+    let r_m = m_d / m_s;
+    let r_s = s_d / s_s;
+
+    // MCAT16 * cam_to_xyz   (maps camera RGB → LMS)
+    let rgb_to_lms = mat_mul_3x3(&MCAT16, cam_to_xyz);
+
+    // Apply diagonal LMS gains   (LMS → adapted LMS)
+    let rgb_to_adapted = [
+        rgb_to_lms[0] * r_l, rgb_to_lms[1] * r_l, rgb_to_lms[2] * r_l,
+        rgb_to_lms[3] * r_m, rgb_to_lms[4] * r_m, rgb_to_lms[5] * r_m,
+        rgb_to_lms[6] * r_s, rgb_to_lms[7] * r_s, rgb_to_lms[8] * r_s,
+    ];
+
+    // MCAT16_INV * adapted   (adapted LMS → adapted XYZ)
+    let rgb_to_xyz = mat_mul_3x3(&MCAT16_INV, &rgb_to_adapted);
+
+    // Output matrix * XYZ   (XYZ → output RGB)
+    mat_mul_3x3(xyz_to_output, &rgb_to_xyz)
 }
 
 #[inline]
@@ -713,6 +747,69 @@ impl BilinearDemosaic {
         }
 
         if count > 0.0 { sum / count } else { self.get_pixel(bayer, stride, x, y) }
+    }
+
+    /// Parallel demosaic by row.  Each row is processed independently on a
+    /// rayon thread, reading from the shared `bayer` buffer (immutable) and
+    /// writing into its own disjoint span of the output.
+    pub fn process_par(&self, bayer: &[u16], stride_width: u32, offset_x: u32, offset_y: u32, active_width: u32, active_height: u32, pattern: &BayerPattern) -> Result<Vec<f32>> {
+        let stride = stride_width as usize;
+        let ox = offset_x as i32;
+        let oy = offset_y as i32;
+        let aw = active_width as usize;
+        let ah = active_height as usize;
+
+        let min_len = (stride * (oy as usize + ah - 1) + ox as usize + aw - 1) + 1;
+        if bayer.len() < min_len {
+            anyhow::bail!("Bayer data too short: len={}, need at least {} for {}x{} active at offset {},{}",
+                bayer.len(), min_len, active_width, active_height, offset_x, offset_y);
+        }
+
+        let mut rgb = vec![0.0f32; aw * ah * 3];
+        let pat = *pattern;
+        let row_len = aw * 3;
+
+        rgb.par_chunks_exact_mut(row_len).enumerate().for_each(|(sy, row)| {
+            let y = sy as i32 + oy;
+            for sx in 0..aw {
+                let x = sx as i32 + ox;
+                let is_red = self.is_red_site(x, y, pat);
+                let is_blue = self.is_blue_site(x, y, pat);
+
+                let (r, g, b) = if is_red {
+                    (self.get_pixel(bayer, stride_width, x, y),
+                     self.interp_green_at_red(bayer, stride_width, active_height, x, y, pat),
+                     self.interp_blue_at_red(bayer, stride_width, active_height, x, y, pat))
+                } else if is_blue {
+                    (self.interp_red_at_blue(bayer, stride_width, active_height, x, y, pat),
+                     self.interp_green_at_blue(bayer, stride_width, active_height, x, y, pat),
+                     self.get_pixel(bayer, stride_width, x, y))
+                } else {
+                    let is_top_green = match pat {
+                        BayerPattern::RGGB | BayerPattern::BGGR => y % 2 == 0,
+                        BayerPattern::GRBG => y % 2 == 0,
+                        BayerPattern::GBRG => y % 2 == 1,
+                        _ => y % 2 == 0,
+                    };
+                    if is_top_green {
+                        (self.interp_red_at_blue(bayer, stride_width, active_height, x + 1, y, pat),
+                         self.get_pixel(bayer, stride_width, x, y),
+                         self.interp_blue_at_red(bayer, stride_width, active_height, x - 1, y, pat))
+                    } else {
+                        (self.interp_red_at_blue(bayer, stride_width, active_height, x - 1, y, pat),
+                         self.get_pixel(bayer, stride_width, x, y),
+                         self.interp_blue_at_red(bayer, stride_width, active_height, x + 1, y, pat))
+                    }
+                };
+
+                let base = sx * 3;
+                row[base] = r as f32;
+                row[base + 1] = g as f32;
+                row[base + 2] = b as f32;
+            }
+        });
+
+        Ok(rgb)
     }
 }
 
@@ -952,12 +1049,40 @@ pub fn pipeline_convert_to_u16(pixels: &[f32]) -> Vec<u16> {
     pixels.iter().map(|&v| (v.clamp(0.0, 1.0) * 65535.0) as u16).collect()
 }
 
+pub fn highlight_clip(pixels: &mut [f32], threshold: f32) {
+    let range = 1.0 - threshold;
+    if range <= 0.0 {
+        return;
+    }
+    for chunk in pixels.chunks_exact_mut(3) {
+        let r = chunk[0];
+        let g = chunk[1];
+        let b = chunk[2];
+        let max_val = r.max(g).max(b);
+        if max_val > threshold {
+            let t = ((max_val - threshold) / range).min(1.0);
+            chunk[0] = r + (max_val - r) * t;
+            chunk[1] = g + (max_val - g) * t;
+            chunk[2] = b + (max_val - b) * t;
+        }
+    }
+}
+
 pub fn normalize_linear(pixels: &mut [f32], black_level: f64, white_level: f64) {
     let range = if white_level > black_level { white_level - black_level } else { 1.0 };
     let inv_range = 1.0 / range;
     for v in pixels.iter_mut() {
         *v = ((*v as f64 - black_level) * inv_range).clamp(0.0, 1.0) as f32;
     }
+}
+
+pub fn normalize_linear_f32(pixels: &mut [f32], black_level: f32, white_level: f32) {
+    let range = if white_level > black_level { white_level - black_level } else { 1.0 };
+    let inv_range = 1.0 / range;
+    pixels.par_iter_mut().for_each(|v| {
+        *v = (*v - black_level) * inv_range;
+        if *v < 0.0 { *v = 0.0; } else if *v > 1.0 { *v = 1.0; }
+    });
 }
 
 #[cfg(test)]
