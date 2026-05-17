@@ -256,15 +256,6 @@ impl McrawFileInfo {
             }
         };
         if let Ok(container_meta) = decoder.container_metadata() {
-            if self.width == 0 || self.height == 0 {
-                self.width = container_meta.width as u16;
-                self.height = container_meta.height as u16;
-                log::info!(
-                    "Enhanced from container metadata: {}x{}",
-                    container_meta.width,
-                    container_meta.height
-                );
-            }
             if container_meta.white_level > 0.0 {
                 self.white_level = container_meta.white_level;
                 log::info!("White level from container metadata: {}", self.white_level);

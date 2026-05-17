@@ -6,9 +6,6 @@ description = "Cross-platform TUI for browsing and exploring MotionCam (.mcraw) 
 authors = ["Terminal Developer"]
 license = "Apache-2.0"
 
-[build-dependencies]
-cc = "1.2"
-
 [dependencies]
 # TUI framework
 ratatui = "0.29"
@@ -35,6 +32,9 @@ rayon = "1.10"
 
 # Multi-producer multi-consumer channels for pipeline stages
 crossbeam-channel = "0.5"
+
+# Pure-Rust MotionCam decoder (replaces C++ FFI)
+motioncam-decoder = { path = "../motioncam-decoder-rust", default-features = false }
 
 # UUID for internal tracking
 uuid = { version = "1", features = ["v4"] }

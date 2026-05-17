@@ -1,2 +1,0 @@
-/data/data/com.termux/files/usr/bin/llvm-ar qc libmotioncam_decoder.a CMakeFiles/motioncam_decoder.dir/lib/Decoder.cpp.o CMakeFiles/motioncam_decoder.dir/lib/RawData.cpp.o CMakeFiles/motioncam_decoder.dir/lib/RawData_Legacy.cpp.o
-/data/data/com.termux/files/usr/bin/llvm-ranlib libmotioncam_decoder.a

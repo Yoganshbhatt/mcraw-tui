@@ -19,8 +19,7 @@ use rayon::prelude::*;
 use std::fs;
 use std::io::Write;
 use std::sync::Arc;
-use std::time::Instant;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Number of frame slots in the producer-consumer pool.
 const PIPELINE_DEPTH: usize = 3;
@@ -30,25 +29,6 @@ struct FrameSlot {
     bayer: Vec<u16>,
     frame_bytes: Vec<u8>,
     as_shot_neutral: [f32; 3],
-}
-
-/// Per-stage nanosecond accumulators (shared across threads via atomics).
-struct ProfileTimers {
-    p1_load: AtomicU64,
-    p2_demosaic: AtomicU64,
-    p3_process: AtomicU64,
-    p4_push: AtomicU64,
-}
-
-impl ProfileTimers {
-    fn new() -> Self {
-        Self {
-            p1_load: AtomicU64::new(0),
-            p2_demosaic: AtomicU64::new(0),
-            p3_process: AtomicU64::new(0),
-            p4_push: AtomicU64::new(0),
-        }
-    }
 }
 
 /// Build FFmpeg codec arguments.
@@ -107,13 +87,9 @@ pub fn run_naked(info: &McrawFileInfo, output_path: &str) -> Result<()> {
     let mut out_file = fs::File::create(output_path)?;
 
     for ts in &timestamps {
-        let (bayer_bytes, _meta) = decoder.load_frame(*ts)?;
-        let bayer_u16: Vec<u16> = bayer_bytes
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
+        let (bayer, _meta) = decoder.load_frame(*ts)?;
 
-        for &v in &bayer_u16 {
+        for &v in &bayer {
             out_file.write_all(&v.to_le_bytes())?;
         }
     }
@@ -269,40 +245,29 @@ pub fn run_export(
         })?;
     }
 
-    let timers = Arc::new(ProfileTimers::new());
     let free_tx_writer = free_tx.clone();
 
     // ==================================================================
-    // Stage 1 — Loader thread: raw frame I/O + byte-swap
+    // Stage 1 — Loader thread: raw frame I/O
     // ==================================================================
     let loader_handle = std::thread::Builder::new()
         .name("loader".into())
         .spawn({
             let cancelled = cancelled.clone();
-            let timers = timers.clone();
             move || -> Result<()> {
                 for ts in &timestamps {
                     if cancelled.load(Ordering::Relaxed) {
                         break;
                     }
 
-                    let t0 = Instant::now();
-
                     let mut slot = free_rx
                         .recv()
                         .map_err(|_| anyhow!("Loader: free pool closed prematurely"))?;
 
-                    let (bayer_bytes, frame_meta) = decoder.load_frame(*ts)?;
+                    let (bayer, frame_meta) = decoder.load_frame(*ts)?;
 
-                    // Byte-swap directly into the pre-allocated buffer
-                    let dst = &mut slot.bayer[..bayer_bytes.len() / 2];
-                    for (i, chunk) in bayer_bytes.chunks_exact(2).enumerate() {
-                        dst[i] = u16::from_le_bytes([chunk[0], chunk[1]]);
-                    }
+                    slot.bayer = bayer;
                     slot.as_shot_neutral = frame_meta.as_shot_neutral;
-
-                    let t1 = t0.elapsed().as_nanos() as u64;
-                    timers.p1_load.fetch_add(t1, Ordering::Relaxed);
 
                     loaded_tx
                         .send(slot)
@@ -321,9 +286,7 @@ pub fn run_export(
         .name("processor".into())
         .spawn({
             let cancelled = cancelled.clone();
-            let timers = timers.clone();
             move || -> Result<()> {
-                // Pre-allocate the RGB working buffer ONCE for all frames
                 let mut rgb = vec![0.0f32; pixel_count * 3];
                 let demosaic = BilinearDemosaic::new(pattern);
 
@@ -332,7 +295,6 @@ pub fn run_export(
                         break;
                     }
 
-                    // --- Per-frame white balance from metadata ---
                     let as_shot = slot.as_shot_neutral;
                     let (r_gain, b_gain) = if as_shot[0] > 1e-6 && as_shot[1] > 1e-6 && as_shot[2] > 1e-6 {
                         (as_shot[1] / as_shot[0], as_shot[1] / as_shot[2])
@@ -349,20 +311,12 @@ pub fn run_export(
                     let output_matrix = if is_log { &target_xyz_to_rgb } else { &xyz_to_rec };
                     let fused = build_cat16_output_matrix(&cam_to_xyz, &scene_white_xyz, &D65_XYZ, output_matrix);
 
-                    // -- Phase 2: demosaic + normalize (into pre-allocated rgb) --
-                    let t1 = Instant::now();
                     demosaic.process_par_into(
                         &slot.bayer, stride_width, offset_x, offset_y,
                         active_width, active_height, &pattern, &mut rgb,
                     )?;
                     normalize_linear_f32(&mut rgb, black_level as f32, white_level as f32);
-                    let t2 = t1.elapsed().as_nanos() as u64;
-                    timers.p2_demosaic.fetch_add(t2, Ordering::Relaxed);
 
-                    // -- Phase 3: pixel processing (fused pass + OETF + byte conversion) --
-                    let t2_total = Instant::now();
-
-                    // WB gain → highlight clip → revert WB → single 3×3 matrix multiply
                     rgb.par_chunks_exact_mut(3).for_each(|chunk| {
                         let r = chunk[0] * r_gain;
                         let g = chunk[1];
@@ -387,7 +341,6 @@ pub fn run_export(
                         chunk[2] = out[2].max(0.0);
                     });
 
-                    // Apply OETF / log encoding
                     if is_log {
                         export_tf.process(&mut rgb);
                     } else {
@@ -397,7 +350,6 @@ pub fn run_export(
                         });
                     }
 
-                    // Convert f32 → u16 bytes (into pre-allocated frame_bytes)
                     slot.frame_bytes.par_chunks_exact_mut(6).enumerate().for_each(|(pi, out)| {
                         let base = pi * 3;
                         let ru = (rgb[base].clamp(0.0, 1.0) * 65535.0) as u16;
@@ -410,9 +362,6 @@ pub fn run_export(
                         out[4] = bu as u8;
                         out[5] = (bu >> 8) as u8;
                     });
-
-                    let t3 = t2_total.elapsed().as_nanos() as u64;
-                    timers.p3_process.fetch_add(t3, Ordering::Relaxed);
 
                     processed_tx
                         .send(slot)
@@ -428,7 +377,6 @@ pub fn run_export(
     // Stage 3 — Writer thread: drain processed frames to FFmpeg stdin
     // ==================================================================
     let writer_cancelled = cancelled.clone();
-    let writer_timers = timers.clone();
     let writer_handle = std::thread::Builder::new()
         .name("writer".into())
         .spawn(move || -> Result<()> {
@@ -439,10 +387,7 @@ pub fn run_export(
                     break;
                 }
 
-                let t3 = Instant::now();
                 encoder.push_frame(&slot.frame_bytes)?;
-                let t4 = t3.elapsed().as_nanos() as u64;
-                writer_timers.p4_push.fetch_add(t4, Ordering::Relaxed);
 
                 frames_written += 1;
                 on_progress(frames_written as f64 / total_frames as f64 * 100.0);
@@ -494,43 +439,11 @@ pub fn run_export(
         }
     }
 
-    // Log profile data
-    let p1 = timers.p1_load.load(Ordering::Relaxed);
-    let p2 = timers.p2_demosaic.load(Ordering::Relaxed);
-    let p3 = timers.p3_process.load(Ordering::Relaxed);
-    let p4 = timers.p4_push.load(Ordering::Relaxed);
-    log_profile(p1, p2, p3, p4, total_frames);
-
     match export_error {
         Some(_) if cancelled.load(Ordering::Relaxed) => {
             Err(anyhow!("Export cancelled by user"))
         }
         Some(e) => Err(e),
         None => Ok(()),
-    }
-}
-
-fn log_profile(p1: u64, p2: u64, p3: u64, p4: u64, frames: usize) {
-    let fmt_ns = |ns: u64| -> String {
-        if ns >= 1_000_000_000 {
-            format!("{:.3}s", ns as f64 / 1_000_000_000.0)
-        } else if ns >= 1_000_000 {
-            format!("{:.1}ms", ns as f64 / 1_000_000.0)
-        } else if ns >= 1_000 {
-            format!("{:.1}µs", ns as f64 / 1_000.0)
-        } else {
-            format!("{ns}ns")
-        }
-    };
-    let total = p1 + p2 + p3 + p4;
-    if let Ok(mut f) = fs::File::create("ffmpeg_debug.txt") {
-        let _ = writeln!(f, "=== Pipeline profile ({} frames) ===", frames);
-        let _ = writeln!(f, "Phase 1  load_frame + byte-swap : {:>12}  {:>5.0}%", fmt_ns(p1), p1 as f64 / total as f64 * 100.0);
-        let _ = writeln!(f, "Phase 2  demosaic + normalize   : {:>12}  {:>5.0}%", fmt_ns(p2), p2 as f64 / total as f64 * 100.0);
-        let _ = writeln!(f, "Phase 3  pixel processing       : {:>12}  {:>5.0}%", fmt_ns(p3), p3 as f64 / total as f64 * 100.0);
-        let _ = writeln!(f, "Phase 4  encoder.push_frame     : {:>12}  {:>5.0}%", fmt_ns(p4), p4 as f64 / total as f64 * 100.0);
-        let _ = writeln!(f, "──────────────────────────────────────────────");
-        let _ = writeln!(f, "Total                          : {:>12}", fmt_ns(total));
-        let _ = writeln!(f, "Per-frame (1/{} frames)         : {:>12}", frames, fmt_ns(total / frames as u64));
     }
 }

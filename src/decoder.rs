@@ -1,39 +1,31 @@
 use anyhow::{anyhow, Result};
-use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_int, c_void};
+use serde_json::Value;
 use std::path::Path;
-use std::ptr;
 
-#[repr(C)]
-pub struct McDecoder {
-    _private: [u8; 0],
+pub struct Decoder {
+    inner: motioncam_decoder::Decoder,
 }
 
-#[repr(C)]
-#[derive(Debug, Clone, Default)]
-pub struct McContainerMetadata {
-    pub width: u32,
-    pub height: u32,
-    pub white_level: f64,
-    pub black_level: [f64; 4],
-    pub black_level_count: c_int,
-    pub sensor_arrangement: [c_char; 8],
+#[derive(Debug, Clone)]
+pub struct ContainerMetadata {
     pub color_matrix1: [f32; 9],
     pub color_matrix2: [f32; 9],
     pub forward_matrix1: [f32; 9],
     pub forward_matrix2: [f32; 9],
-    pub calibration_illuminant1: i32,
-    pub calibration_illuminant2: i32,
     pub calibration_matrix1: [f32; 9],
     pub calibration_matrix2: [f32; 9],
+    pub calibration_illuminant1: i32,
+    pub calibration_illuminant2: i32,
     pub has_calibration_illuminants: bool,
-    pub audio_sample_rate_hz: c_int,
-    pub num_audio_channels: c_int,
+    pub white_level: f64,
+    pub black_level: [f64; 4],
+    pub black_level_count: i32,
+    pub audio_sample_rate_hz: i32,
+    pub num_audio_channels: i32,
 }
 
-#[repr(C)]
-#[derive(Debug, Clone, Default)]
-pub struct McFrameMetadata {
+#[derive(Debug, Clone)]
+pub struct FrameMetadata {
     pub width: u32,
     pub height: u32,
     pub timestamp_ns: i64,
@@ -44,119 +36,155 @@ pub struct McFrameMetadata {
     pub aperture: f32,
 }
 
-extern "C" {
-    fn decoder_create(path: *const c_char) -> *mut McDecoder;
-    fn decoder_destroy(decoder: *mut McDecoder);
-    fn decoder_get_container_metadata(decoder: *mut McDecoder, out: *mut McContainerMetadata) -> c_int;
-    fn decoder_get_frame_count(decoder: *mut McDecoder) -> i64;
-    fn decoder_get_frame_timestamps(decoder: *mut McDecoder, out_timestamps: *mut i64, capacity: i64) -> i64;
-    fn decoder_load_frame(
-        decoder: *mut McDecoder,
-        timestamp_ns: i64,
-        out_size: *mut u32,
-        out_meta: *mut McFrameMetadata,
-    ) -> *mut u8;
-    fn decoder_load_frame_metadata(
-        decoder: *mut McDecoder,
-        timestamp_ns: i64,
-        out_meta: *mut McFrameMetadata,
-    ) -> c_int;
-    fn decoder_load_audio(decoder: *mut McDecoder, out_sample_count: *mut u32) -> *mut i16;
-    fn decoder_free_buffer(ptr: *mut c_void);
-    fn decoder_last_error() -> *const c_char;
-}
-
-fn get_last_error() -> String {
-    unsafe {
-        let err_ptr = decoder_last_error();
-        if err_ptr.is_null() {
-            "Unknown C++ error".to_string()
-        } else {
-            CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
+fn json_to_matrix9(val: &Value, key: &str) -> [f32; 9] {
+    let mut result = [0.0f32; 9];
+    if let Some(arr) = val.get(key).and_then(|v| v.as_array()) {
+        for (i, item) in arr.iter().enumerate().take(9) {
+            if let Some(n) = item.as_f64() {
+                result[i] = n as f32;
+            }
         }
     }
+    result
 }
 
-pub struct Decoder {
-    handle: *mut McDecoder,
+fn json_to_black_level(val: &Value) -> ([f64; 4], i32) {
+    let mut result = [0.0f64; 4];
+    let mut count = 0i32;
+    if let Some(arr) = val.get("blackLevel").and_then(|v| v.as_array()) {
+        for (i, item) in arr.iter().enumerate().take(4) {
+            if let Some(n) = item.as_f64() {
+                result[i] = n;
+                count = (i + 1) as i32;
+            }
+        }
+    }
+    (result, count)
 }
 
-// Safe: Decoder is used from only one thread at a time (loader stage).
-unsafe impl Send for Decoder {}
+fn json_to_as_shot_neutral(val: &Value) -> [f32; 3] {
+    let mut result = [1.0f32; 3];
+    if let Some(arr) = val.get("asShotNeutral").and_then(|v| v.as_array()) {
+        for (i, item) in arr.iter().enumerate().take(3) {
+            if let Some(n) = item.as_f64() {
+                result[i] = n as f32;
+            }
+        }
+    }
+    result
+}
 
 impl Decoder {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let path_str = path.as_ref().to_string_lossy();
-        let c_path = CString::new(path_str.as_bytes())?;
-        let handle = unsafe { decoder_create(c_path.as_ptr()) };
-        if handle.is_null() {
-            return Err(anyhow!("Failed to open decoder: {}", get_last_error()));
-        }
-        Ok(Self { handle })
+        let inner = motioncam_decoder::Decoder::from_path(path)
+            .map_err(|e| anyhow!("Failed to open decoder: {}", e))?;
+        Ok(Self { inner })
     }
 
-    pub fn container_metadata(&self) -> Result<McContainerMetadata> {
-        let mut meta = McContainerMetadata::default();
-        let res = unsafe { decoder_get_container_metadata(self.handle, &mut meta) };
-        if res != 0 {
-            return Err(anyhow!("Failed to read container metadata: {}", get_last_error()));
-        }
-        Ok(meta)
+    pub fn container_metadata(&self) -> Result<ContainerMetadata> {
+        let meta = self.inner.container_metadata();
+
+        let color_matrix1 = json_to_matrix9(meta, "colorMatrix1");
+        let color_matrix2 = json_to_matrix9(meta, "colorMatrix2");
+        let forward_matrix1 = json_to_matrix9(meta, "forwardMatrix1");
+        let forward_matrix2 = json_to_matrix9(meta, "forwardMatrix2");
+        let calibration_matrix1 = json_to_matrix9(meta, "calibrationMatrix1");
+        let calibration_matrix2 = json_to_matrix9(meta, "calibrationMatrix2");
+
+        let illuminant1 = meta.get("calibrationIlluminant1").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+        let illuminant2 = meta.get("calibrationIlluminant2").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+
+        let white_level = meta.get("whiteLevel").and_then(|v| v.as_f64()).unwrap_or(16383.0);
+
+        let (black_level, black_level_count) = json_to_black_level(meta);
+
+        let audio_sample_rate = meta
+            .get("extraData")
+            .and_then(|e| e.get("audioSampleRate"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32;
+        let audio_channels = meta
+            .get("extraData")
+            .and_then(|e| e.get("audioChannels"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32;
+
+        Ok(ContainerMetadata {
+            color_matrix1,
+            color_matrix2,
+            forward_matrix1,
+            forward_matrix2,
+            calibration_matrix1,
+            calibration_matrix2,
+            calibration_illuminant1: illuminant1,
+            calibration_illuminant2: illuminant2,
+            has_calibration_illuminants: illuminant1 != 0 || illuminant2 != 0,
+            white_level,
+            black_level,
+            black_level_count,
+            audio_sample_rate_hz: audio_sample_rate,
+            num_audio_channels: audio_channels,
+        })
     }
 
     pub fn timestamps(&self) -> Result<Vec<i64>> {
-        let count = unsafe { decoder_get_frame_count(self.handle) };
-        if count < 0 {
-            return Err(anyhow!("Failed to get frame count: {}", get_last_error()));
-        }
-        let mut timestamps = vec![0i64; count as usize];
-        let written = unsafe {
-            decoder_get_frame_timestamps(self.handle, timestamps.as_mut_ptr(), count)
-        };
-        if written < 0 {
-            return Err(anyhow!("Failed to get timestamps: {}", get_last_error()));
-        }
-        timestamps.truncate(written as usize);
-        Ok(timestamps)
+        Ok(self.inner.frame_timestamps().collect())
     }
 
-    pub fn load_frame(&self, timestamp_ns: i64) -> Result<(Vec<u8>, McFrameMetadata)> {
-        let mut size: u32 = 0;
-        let mut meta = McFrameMetadata::default();
-        let ptr = unsafe { decoder_load_frame(self.handle, timestamp_ns, &mut size, &mut meta) };
-        if ptr.is_null() {
-            return Err(anyhow!("Failed to decode frame at ns {}: {}", timestamp_ns, get_last_error()));
-        }
-        let data = unsafe { std::slice::from_raw_parts(ptr, size as usize).to_vec() };
-        unsafe { decoder_free_buffer(ptr as *mut c_void) };
-        Ok((data, meta))
+    pub fn load_frame(&self, timestamp_ns: i64) -> Result<(Vec<u16>, FrameMetadata)> {
+        let (pixels, meta) = self.inner.load_frame(timestamp_ns)
+            .map_err(|e| anyhow!("Failed to decode frame at ns {}: {}", timestamp_ns, e))?;
+
+        let width = meta.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let height = meta.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let as_shot_neutral = json_to_as_shot_neutral(&meta);
+        let exposure_time = meta.get("exposureTime").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let iso = meta.get("iso").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        let focal_length = meta.get("focalLength").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        let aperture = meta.get("aperture").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+
+        Ok((pixels, FrameMetadata {
+            width,
+            height,
+            timestamp_ns,
+            as_shot_neutral,
+            exposure_time,
+            iso,
+            focal_length,
+            aperture,
+        }))
     }
 
-    pub fn load_frame_metadata(&self, timestamp_ns: i64) -> Result<McFrameMetadata> {
-        let mut meta = McFrameMetadata::default();
-        let res = unsafe { decoder_load_frame_metadata(self.handle, timestamp_ns, &mut meta) };
-        if res != 0 {
-            return Err(anyhow!("Failed to get metadata for frame at ns {}: {}", timestamp_ns, get_last_error()));
-        }
-        Ok(meta)
+    pub fn load_frame_metadata(&self, timestamp_ns: i64) -> Result<FrameMetadata> {
+        let meta = self.inner.load_frame_metadata(timestamp_ns)
+            .map_err(|e| anyhow!("Failed to get metadata for frame at ns {}: {}", timestamp_ns, e))?;
+
+        let width = meta.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let height = meta.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let as_shot_neutral = json_to_as_shot_neutral(&meta);
+        let exposure_time = meta.get("exposureTime").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let iso = meta.get("iso").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        let focal_length = meta.get("focalLength").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        let aperture = meta.get("aperture").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+
+        Ok(FrameMetadata {
+            width,
+            height,
+            timestamp_ns,
+            as_shot_neutral,
+            exposure_time,
+            iso,
+            focal_length,
+            aperture,
+        })
     }
 
     pub fn load_audio(&self) -> Result<Vec<i16>> {
-        let mut sample_count: u32 = 0;
-        let ptr = unsafe { decoder_load_audio(self.handle, &mut sample_count) };
-        if ptr.is_null() {
-            return Err(anyhow!("Failed to load audio: {}", get_last_error()));
-        }
-        let audio = unsafe { std::slice::from_raw_parts(ptr, sample_count as usize).to_vec() };
-        unsafe { decoder_free_buffer(ptr as *mut c_void) };
-        Ok(audio)
-    }
-}
-
-impl Drop for Decoder {
-    fn drop(&mut self) {
-        if !self.handle.is_null() {
-            unsafe { decoder_destroy(self.handle) };
-        }
+        let chunks = self.inner.load_audio()
+            .map_err(|e| anyhow!("Failed to load audio: {}", e))?;
+        let samples: Vec<i16> = chunks.into_iter()
+            .flat_map(|chunk| chunk.samples)
+            .collect();
+        Ok(samples)
     }
 }
