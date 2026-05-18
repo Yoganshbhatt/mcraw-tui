@@ -123,6 +123,16 @@ impl VideoEncoder {
         // Append dynamic extra args (profile, crf, preset, etc.)
         cmd.args(extra_args);
 
+        // For ProRes and DNxHR, inject an explicit format filter so FFmpeg
+        // does not choke on the rgb48le rawvideo input.  The filter converts
+        // to the encoder's native planar format before the encoder sees it.
+        match codec {
+            "prores_ks" | "prores_videotoolbox" | "dnxhd" => {
+                cmd.args(["-vf", &format!("format={}", pix_fmt)]);
+            }
+            _ => {}
+        }
+
         if codec == "libx264" {
             cmd.args(["-x264-params", "colorprim=bt709:transfer=bt709:colormatrix=bt709"]);
         } else if codec == "libx265" {

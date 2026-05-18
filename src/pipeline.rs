@@ -7,6 +7,7 @@ use crate::color::{
     ColorSpace, TransferFunction,
 };
 use crate::decoder::Decoder;
+use crate::dng_writer::DngWriter;
 use crate::encoder::VideoEncoder;
 use crate::export::{
     Av1Profile, CodecFamily, DnxhrProfile, H264Profile, HevcProfile,
@@ -74,6 +75,39 @@ pub fn get_ffmpeg_vui_tags(color_space: &ColorSpace, transfer: &TransferFunction
     };
 
     vec!["-color_primaries", primaries, "-color_trc", trc, "-colorspace", matrix]
+}
+
+// ---------------------------------------------------------------------------
+// CinemaDNG export (bypasses FFmpeg entirely)
+// ---------------------------------------------------------------------------
+
+pub fn export_cdng(
+    info: &McrawFileInfo,
+    output_dir: &str,
+    decoder: &Decoder,
+    timestamps: &[i64],
+    on_progress: Arc<dyn Fn(f64) + Send + Sync>,
+    cancelled: Arc<AtomicBool>,
+) -> Result<()> {
+    fs::create_dir_all(output_dir)?;
+
+    let total = timestamps.len();
+
+    for (i, ts) in timestamps.iter().enumerate() {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let (bayer, meta) = decoder.load_frame(*ts)?;
+
+        let writer = DngWriter::new(info, &bayer, meta.as_shot_neutral, i);
+        let path = writer.filename(output_dir);
+        writer.write_to_path(&path)?;
+
+        on_progress((i + 1) as f64 / total as f64 * 100.0);
+    }
+
+    Ok(())
 }
 
 pub fn run_naked(info: &McrawFileInfo, output_path: &str) -> Result<()> {
@@ -145,6 +179,11 @@ pub fn run_export(
 
     if timestamps.is_empty() {
         return Err(anyhow!("No frames found in file"));
+    }
+
+    // ----- CinemaDNG: bypass FFmpeg entirely, write raw DNG sequence -----
+    if codec_family == CodecFamily::CinemaDNG {
+        return export_cdng(&info, &output_path, &decoder, &timestamps, on_progress, cancelled);
     }
 
     let stride_width = info.width as u32;

@@ -328,15 +328,36 @@ impl App {
         }
 
         let input_path = std::path::Path::new(&info.path);
+        let parent = input_path.parent().unwrap_or_else(|| std::path::Path::new("."));
         let stem = input_path.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
-        let tf_label = self.export_transfer_function.name().replace([' ', '(', ')', '.'], "");
-        let cs_label = self.export_color_space.name().replace([' ', '(', ')', '.'], "");
-        let mut output_path = format!("{}_{}_{}.mp4", stem, tf_label, cs_label);
-        let mut suffix = 1;
-        while std::path::Path::new(&output_path).exists() {
-            output_path = format!("{}_{}_{}_{}.mp4", stem, tf_label, cs_label, suffix);
-            suffix += 1;
-        }
+
+        let output_path = if self.export_codec_family == CodecFamily::CinemaDNG {
+            let dir_name = format!("{}_cdng", stem);
+            let mut dir = parent.join(&dir_name);
+            let mut suffix = 1;
+            while dir.exists() {
+                dir = parent.join(format!("{}_{:02}", dir_name, suffix));
+                suffix += 1;
+            }
+            dir.to_string_lossy().to_string()
+        } else {
+            let ext = match self.export_codec_family {
+                CodecFamily::ProRes | CodecFamily::DNxHR => "mov",
+                CodecFamily::VP9 => "webm",
+                _ => "mp4",
+            };
+            let tf_label = self.export_transfer_function.name().replace([' ', '(', ')', '.'], "");
+            let cs_label = self.export_color_space.name().replace([' ', '(', ')', '.'], "");
+            let filename = format!("{}_{}_{}.{}", stem, tf_label, cs_label, ext);
+            let mut file = parent.join(&filename);
+            let mut suffix = 1;
+            while file.exists() {
+                let base = format!("{}_{}_{}_{}", stem, tf_label, cs_label, suffix);
+                file = parent.join(&base).with_extension(ext);
+                suffix += 1;
+            }
+            file.to_string_lossy().to_string()
+        };
         let cs = self.export_color_space;
         let tf = self.export_transfer_function;
         let cf = self.export_codec_family;
