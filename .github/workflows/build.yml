@@ -1,17 +1,21 @@
-name: Build macOS binaries
+name: Build binaries
 on:
-  push:
-    branches: [dev]
   workflow_dispatch:
 
 jobs:
   build:
     strategy:
       matrix:
-        target:
-          - aarch64-apple-darwin
-          - x86_64-apple-darwin
-    runs-on: macos-latest
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout mcraw-tui
         uses: actions/checkout@v4
@@ -32,12 +36,21 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
         working-directory: mcraw-tui
 
-      - name: Package binary
+      - name: Package (macOS / Linux)
+        if: runner.os != 'Windows'
         working-directory: mcraw-tui
         run: |
           cp target/${{ matrix.target }}/release/mcraw-tui mcraw-tui-${{ matrix.target }}
           chmod +x mcraw-tui-${{ matrix.target }}
           zip mcraw-tui-${{ matrix.target }}.zip mcraw-tui-${{ matrix.target }}
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: mcraw-tui
+        run: |
+          Copy-Item "target/${{ matrix.target }}/release/mcraw-tui.exe" -Destination "mcraw-tui-${{ matrix.target }}.exe"
+          Compress-Archive -Path "mcraw-tui-${{ matrix.target }}.exe" -DestinationPath "mcraw-tui-${{ matrix.target }}.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
