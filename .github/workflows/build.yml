@@ -33,6 +33,7 @@ jobs:
         working-directory: mcraw-tui
 
       - name: Package binary
+        working-directory: mcraw-tui
         run: |
           cp target/${{ matrix.target }}/release/mcraw-tui mcraw-tui-${{ matrix.target }}
           chmod +x mcraw-tui-${{ matrix.target }}
@@ -42,4 +43,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: mcraw-tui-${{ matrix.target }}
-          path: mcraw-tui-${{ matrix.target }}.zip
+          path: mcraw-tui/mcraw-tui-${{ matrix.target }}.zip
