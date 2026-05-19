@@ -34,7 +34,7 @@ rayon = "1.10"
 crossbeam-channel = "0.5"
 
 # Pure-Rust MotionCam decoder (replaces C++ FFI)
-motioncam-decoder = { path = "../motioncam-decoder-rust", default-features = false }
+motioncam-decoder = { path = "../motioncam-decoder-rust", features = ["parallel"] }
 
 # UUID for internal tracking
 uuid = { version = "1", features = ["v4"] }
