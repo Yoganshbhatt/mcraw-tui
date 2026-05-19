@@ -20,8 +20,9 @@ jobs:
 
       - name: Checkout motioncam-decoder-rust
         uses: actions/checkout@v4
-        repository: Yoganshbhatt/motioncam-decoder-rust
-        path: motioncam-decoder-rust
+        with:
+          repository: Yoganshbhatt/motioncam-decoder-rust
+          path: motioncam-decoder-rust
 
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
