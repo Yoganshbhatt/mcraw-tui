@@ -24,6 +24,12 @@ use crate::file::McrawFileInfo;
 use crate::file_browser::FileBrowser;
 use crate::ui;
 
+#[derive(Debug)]
+pub enum ExportEvent {
+    Progress(f64),
+    Done(Result<()>),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Screen {
     Browse,
@@ -46,8 +52,9 @@ pub struct App {
     pub list_state: ListState,
 
     pub is_exporting: bool,
+    pub export_cancelled: bool,
     pub export_progress: f64,
-    pub export_rx: Option<mpsc::Receiver<f64>>,
+    pub export_rx: Option<mpsc::Receiver<ExportEvent>>,
     pub cancel_token: Option<Arc<AtomicBool>>,
 
     // Persistent export settings (survive file loads)
@@ -102,12 +109,13 @@ impl App {
             list_state,
 
             is_exporting: false,
+            export_cancelled: false,
             export_progress: 0.0,
             export_rx: None,
             cancel_token: None,
 
             export_color_space: ColorSpace::Rec709,
-            export_transfer_function: TransferFunction::Rec709,
+            export_transfer_function: TransferFunction::Gamma24,
             export_codec_family: CodecFamily::HEVC,
             export_focus: ExportFocus::ColorSpace,
             export_start_time: None,
@@ -212,7 +220,6 @@ impl App {
             CodecFamily::H264 => self.h264_profile.is_8bit(),
             CodecFamily::AV1 => self.av1_profile.is_8bit(),
             CodecFamily::VP9 => self.vp9_profile.is_8bit(),
-            CodecFamily::CinemaDNG => false,
         }
     }
 
@@ -224,7 +231,6 @@ impl App {
             CodecFamily::H264 => self.h264_profile.name(),
             CodecFamily::AV1 => self.av1_profile.name(),
             CodecFamily::VP9 => self.vp9_profile.name(),
-            CodecFamily::CinemaDNG => "—",
         }
     }
 
@@ -304,14 +310,13 @@ impl App {
                 };
                 self.status_message = format!("Profile: {}", self.vp9_profile.name());
             }
-            CodecFamily::CinemaDNG => {
-                self.status_message = "cDNG has no profile".to_string();
-            }
         }
     }
 
     pub fn start_export(&mut self) {
         if self.is_exporting {
+            self.cancel_export();
+            self.status_message = "Export cancelled. Press V again to restart.".to_string();
             return;
         }
         let info = match self.file_info.clone() {
@@ -331,33 +336,22 @@ impl App {
         let parent = input_path.parent().unwrap_or_else(|| std::path::Path::new("."));
         let stem = input_path.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
 
-        let output_path = if self.export_codec_family == CodecFamily::CinemaDNG {
-            let dir_name = format!("{}_cdng", stem);
-            let mut dir = parent.join(&dir_name);
-            let mut suffix = 1;
-            while dir.exists() {
-                dir = parent.join(format!("{}_{:02}", dir_name, suffix));
-                suffix += 1;
-            }
-            dir.to_string_lossy().to_string()
-        } else {
-            let ext = match self.export_codec_family {
-                CodecFamily::ProRes | CodecFamily::DNxHR => "mov",
-                CodecFamily::VP9 => "webm",
-                _ => "mp4",
-            };
-            let tf_label = self.export_transfer_function.name().replace([' ', '(', ')', '.'], "");
-            let cs_label = self.export_color_space.name().replace([' ', '(', ')', '.'], "");
-            let filename = format!("{}_{}_{}.{}", stem, tf_label, cs_label, ext);
-            let mut file = parent.join(&filename);
-            let mut suffix = 1;
-            while file.exists() {
-                let base = format!("{}_{}_{}_{}", stem, tf_label, cs_label, suffix);
-                file = parent.join(&base).with_extension(ext);
-                suffix += 1;
-            }
-            file.to_string_lossy().to_string()
+        let ext = match self.export_codec_family {
+            CodecFamily::ProRes | CodecFamily::DNxHR => "mov",
+            CodecFamily::VP9 => "webm",
+            _ => "mp4",
         };
+        let tf_label = self.export_transfer_function.name().replace([' ', '(', ')', '.'], "");
+        let cs_label = self.export_color_space.name().replace([' ', '(', ')', '.'], "");
+        let filename = format!("{}_{}_{}.{}", stem, tf_label, cs_label, ext);
+        let mut file = parent.join(&filename);
+        let mut suffix = 1;
+        while file.exists() {
+            let base = format!("{}_{}_{}_{}", stem, tf_label, cs_label, suffix);
+            file = parent.join(&base).with_extension(ext);
+            suffix += 1;
+        }
+        let output_path = file.to_string_lossy().to_string();
         let cs = self.export_color_space;
         let tf = self.export_transfer_function;
         let cf = self.export_codec_family;
@@ -372,11 +366,12 @@ impl App {
         let av1_enc = self.hardware_caps.best_av1_encoder.clone();
 
         self.is_exporting = true;
+        self.export_cancelled = false;
         self.export_progress = 0.0;
         self.export_start_time = Some(Instant::now());
         let cancel_flag = Arc::new(AtomicBool::new(false));
         self.cancel_token = Some(cancel_flag.clone());
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel::<ExportEvent>();
         self.export_rx = Some(rx);
         self.status_message = format!(
             "Starting export: {} / {} via {} {} ...",
@@ -386,60 +381,89 @@ impl App {
             self.active_profile_name(),
         );
 
-        // Build an owned, thread-safe progress callback
         let progress_cb = {
             let prog_tx = tx.clone();
-            Arc::new(move |pct: f64| { let _ = prog_tx.send(pct); })
+            Arc::new(move |pct: f64| { let _ = prog_tx.send(ExportEvent::Progress(pct)); })
         };
 
         let rate_control = self.active_rate_control.clone();
 
         std::thread::spawn(move || {
-            let _result = crate::pipeline::run_export(
-                info,
-                output_path,
-                progress_cb,
-                cancel_flag,
-                cs, tf, cf, pp, dp, hp, h4p, ap, vp,
-                hevc_enc,
-                h264_enc,
-                av1_enc,
-                rate_control,
-            );
-            let _ = tx.send(100.0);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::pipeline::run_export(
+                    info,
+                    output_path,
+                    progress_cb,
+                    cancel_flag,
+                    cs, tf, cf, pp, dp, hp, h4p, ap, vp,
+                    hevc_enc,
+                    h264_enc,
+                    av1_enc,
+                    rate_control,
+                )
+            }));
+            match result {
+                Ok(export_result) => {
+                    let _ = tx.send(ExportEvent::Done(export_result));
+                }
+                Err(panic) => {
+                    log::error!("Export thread panicked: {:?}", panic);
+                    let _ = tx.send(ExportEvent::Done(Err(anyhow::anyhow!("Export thread panicked"))));
+                }
+            }
         });
     }
 
     pub fn cancel_export(&mut self) {
         if let Some(ref token) = self.cancel_token {
             token.store(true, Ordering::Relaxed);
+            self.export_cancelled = true;
             self.status_message = "Cancelling export...".to_string();
         }
     }
 
     pub fn poll_export(&mut self) {
-        if let Some(ref rx) = self.export_rx {
-            while let Ok(prog) = rx.try_recv() {
-                self.export_progress = prog;
-            }
-            if self.export_progress >= 100.0 {
-                self.is_exporting = false;
-                self.export_rx = None;
-                self.cancel_token = None;
-                if self.status_message == "Cancelling export..." {
-                    self.status_message = "Export cancelled".to_string();
-                } else {
-                    let elapsed = self.export_start_time
-                        .map(|t| t.elapsed())
-                        .unwrap_or_default();
-                    let mins = elapsed.as_secs() / 60;
-                    let secs = elapsed.as_secs() % 60;
-                    self.status_message = format!(
-                        "Video export completed ({:02}m {:02}s)", mins, secs
-                    );
+        let rx = match self.export_rx.take() {
+            Some(rx) => rx,
+            None => return,
+        };
+        let mut keep_rx = true;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                ExportEvent::Progress(pct) => {
+                    self.export_progress = pct;
                 }
-                self.export_start_time = None;
+                ExportEvent::Done(result) => {
+                    self.is_exporting = false;
+                    keep_rx = false;
+                    self.cancel_token = None;
+                    if self.export_cancelled {
+                        self.status_message = "Export cancelled".to_string();
+                        self.export_cancelled = false;
+                    } else {
+                        let elapsed = self.export_start_time
+                            .take()
+                            .map(|t| t.elapsed())
+                            .unwrap_or_default();
+                        let mins = elapsed.as_secs() / 60;
+                        let secs = elapsed.as_secs() % 60;
+                        match result {
+                            Ok(()) => {
+                                self.status_message = format!(
+                                    "Video export completed ({:02}m {:02}s)", mins, secs
+                                );
+                            }
+                            Err(e) => {
+                                self.status_message = format!("Export failed: {}", e);
+                            }
+                        }
+                    }
+                    self.export_start_time = None;
+                }
             }
+        }
+        if keep_rx {
+            self.export_rx = Some(rx);
         }
     }
 
@@ -541,9 +565,6 @@ pub async fn run(args: Cli) -> Result<()> {
                 anyhow::bail!("{}", e);
             }
             let format = match format.to_lowercase().as_str() {
-                "cdng" => OutputFormat::CDNG {
-                    sequence_dir: std::path::PathBuf::from(&output),
-                },
                 "dng" => OutputFormat::DNG {
                     output_path: std::path::PathBuf::from(&output),
                 },
@@ -589,15 +610,19 @@ pub async fn run(args: Cli) -> Result<()> {
 
     enable_raw_mode()?;
 
+    let event_loop_running = Arc::new(AtomicBool::new(true));
+    let elr = event_loop_running.clone();
+
     let (tx, rx) = mpsc::channel();
     tokio::spawn(async move {
-        event_loop(tx).await;
+        event_loop(tx, elr).await;
     });
 
     let encoder = Encoder::new();
 
     while app.running {
         app.poll_export();
+        app.browser.try_refresh();
 
         terminal.draw(|frame| ui::render(frame, &app))?;
 
@@ -608,6 +633,12 @@ pub async fn run(args: Cli) -> Result<()> {
         time::sleep(Duration::from_millis(33)).await;
     }
 
+    // Signal event loop to stop and drop the receiver so the sender unblocks.
+    event_loop_running.store(false, Ordering::Relaxed);
+    drop(rx);
+    // Brief yield so the event-loop task can observe the flag and exit.
+    tokio::task::yield_now().await;
+
     disable_raw_mode()?;
     terminal.show_cursor()?;
     crossterm::execute!(std::io::stdout(), LeaveAlternateScreen)?;
@@ -615,11 +646,13 @@ pub async fn run(args: Cli) -> Result<()> {
     Ok(())
 }
 
-async fn event_loop(tx: mpsc::Sender<Event>) {
-    loop {
+async fn event_loop(tx: mpsc::Sender<Event>, running: Arc<AtomicBool>) {
+    while running.load(Ordering::Relaxed) {
         if crossterm::event::poll(Duration::from_millis(16)).unwrap() {
             if let Ok(event) = crossterm::event::read() {
-                let _ = tx.send(event);
+                if tx.send(event).is_err() {
+                    break;
+                }
             }
         }
     }

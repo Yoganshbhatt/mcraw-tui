@@ -19,7 +19,7 @@ pub enum CliCommands {
         /// Path to the .mcraw file
         #[arg(short, long)]
         file: Option<String>,
-        /// Export format: cdng, dng, prores, h264, hevc
+        /// Export format: dng, prores, h264, hevc
         #[arg(short = 'F', long)]
         format: String,
         /// Output path or directory
@@ -69,7 +69,7 @@ impl Cli {
 
     /// Validate export format
     pub fn validate_export_format(format: &str) -> Result<(), String> {
-        let valid = ["cdng", "dng", "prores", "h264", "hevc"];
+        let valid = ["dng", "prores", "h264", "hevc"];
         let lower = format.to_lowercase();
         if valid.contains(&lower.as_str()) {
             Ok(())

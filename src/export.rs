@@ -6,7 +6,6 @@ pub enum CodecFamily {
     H264,
     AV1,
     VP9,
-    CinemaDNG,
 }
 
 impl CodecFamily {
@@ -18,7 +17,6 @@ impl CodecFamily {
             CodecFamily::H264 => "H.264",
             CodecFamily::AV1 => "AV1",
             CodecFamily::VP9 => "VP9",
-            CodecFamily::CinemaDNG => "cDNG",
         }
     }
 
@@ -30,7 +28,6 @@ impl CodecFamily {
             CodecFamily::H264,
             CodecFamily::AV1,
             CodecFamily::VP9,
-            CodecFamily::CinemaDNG,
         ]
     }
 
@@ -209,15 +206,12 @@ impl CodecFamily {
                 base_pix_fmt = "yuv420p10le";
                 base_extra = vec!["-crf", crf, "-b:v", "0"];
             }
-            CodecFamily::CinemaDNG => {
-                return ("", "", vec![]);
-            }
         }
 
         // Convert static extra args to owned Strings
         let mut extra: Vec<String> = base_extra.iter().map(|&s| s.to_string()).collect();
 
-        // Append rate-control flags for HEVC / H.264 / AV1 (not ProRes / DNxHR / VP9 / cDNG)
+        // Append rate-control flags for HEVC / H.264 / AV1 (not ProRes / DNxHR / VP9)
         match self {
             CodecFamily::HEVC => {
                 extra.extend(rate_control_args(rate_control, hevc_encoder));

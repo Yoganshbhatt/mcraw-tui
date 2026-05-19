@@ -213,6 +213,8 @@ pub enum TransferFunction {
     ACESCCT,
     PQ,
     HLG,
+    DaVinciIntermediate,
+    Gamma24,
 }
 
 impl TransferFunction {
@@ -228,6 +230,8 @@ impl TransferFunction {
             TransferFunction::ACESCCT => "ACES CCT",
             TransferFunction::PQ => "PQ (ST.2084)",
             TransferFunction::HLG => "HLG (BT.2100)",
+            TransferFunction::DaVinciIntermediate => "DaVinci Intermediate",
+            TransferFunction::Gamma24 => "Gamma 2.4",
         }
     }
 
@@ -360,6 +364,29 @@ impl TransferFunction {
                     };
                 });
             }
+
+            // DaVinci Intermediate OETF (colour-science / Blackmagic Design)
+            // DI_A=0.0075, DI_B=7.0, DI_C=0.07329248, DI_M=10.44426855, DI_LIN_CUT=0.00262409
+            // linear: V = x * DI_M
+            // log: V = DI_C * (log2(x + DI_A) + DI_B)
+            TransferFunction::DaVinciIntermediate => {
+                pixels.par_iter_mut().for_each(|v| {
+                    let x = *v;
+                    *v = if x <= 0.00262409_f32 {
+                        x * 10.44426855_f32
+                    } else {
+                        0.07329248_f32 * ((x + 0.0075_f32).log2() + 7.0_f32)
+                    };
+                });
+            }
+
+            // Gamma 2.4 (BT.1886) encoding OETF — pure power function
+            // V = x^(1/2.4)  for x >= 0
+            TransferFunction::Gamma24 => {
+                pixels.par_iter_mut().for_each(|v| {
+                    *v = v.max(0.0).powf(1.0 / 2.4);
+                });
+            }
         }
     }
 
@@ -376,6 +403,8 @@ impl TransferFunction {
             TransferFunction::ACESCCT,
             TransferFunction::PQ,
             TransferFunction::HLG,
+            TransferFunction::DaVinciIntermediate,
+            TransferFunction::Gamma24,
         ]
     }
 
@@ -395,13 +424,13 @@ impl TransferFunction {
 
     /// Returns true if this is a log encoding (anything other than Linear/Rec709).
     pub fn is_log_bypass(&self) -> bool {
-        !matches!(self, TransferFunction::Linear | TransferFunction::Rec709)
+        !matches!(self, TransferFunction::Linear | TransferFunction::Rec709 | TransferFunction::Gamma24)
     }
 
     /// Returns true if this transfer function requires 10-bit encoding to avoid banding.
-    /// Returns true for all log curves and HDR (PQ/HLG); false only for Linear and Rec709.
+    /// Returns true for all log curves and HDR (PQ/HLG); false only for Linear, Rec709, and Gamma24.
     pub fn requires_10bit(&self) -> bool {
-        !matches!(self, TransferFunction::Linear | TransferFunction::Rec709)
+        !matches!(self, TransferFunction::Linear | TransferFunction::Rec709 | TransferFunction::Gamma24)
     }
 }
 
@@ -1072,7 +1101,7 @@ impl ColorPipelineConfig {
         config.toe_power = 3.0;
         config.shoulder_power = 3.25;
         config.slope = 2.0;
-        config.working_mid_grey = 0.18;
+        config.working_mid_grey = 0.606060;
         config.log_output = false;
 
         Self {

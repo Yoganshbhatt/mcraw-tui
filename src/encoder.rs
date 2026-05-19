@@ -1,10 +1,9 @@
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 #[derive(Debug, Clone)]
 pub enum OutputFormat {
-    CDNG { sequence_dir: PathBuf },
     DNG { output_path: PathBuf },
     ProRes { output_path: PathBuf },
     H264 { output_path: PathBuf },
@@ -53,7 +52,6 @@ impl EncodeJob {
 
     pub fn format_label(&self) -> &'static str {
         match &self.format {
-            OutputFormat::CDNG { .. } => "cDNG",
             OutputFormat::DNG { .. } => "DNG",
             OutputFormat::ProRes { .. } => "ProRes",
             OutputFormat::H264 { .. } => "H.264",
@@ -63,7 +61,6 @@ impl EncodeJob {
 
     pub fn output_path(&self) -> Option<&PathBuf> {
         match &self.format {
-            OutputFormat::CDNG { sequence_dir } => Some(sequence_dir),
             OutputFormat::DNG { output_path } => Some(output_path),
             OutputFormat::ProRes { output_path } => Some(output_path),
             OutputFormat::H264 { output_path } => Some(output_path),
@@ -91,7 +88,7 @@ impl Encoder {
     }
 
     pub async fn list_supported_formats(&self) -> Vec<&'static str> {
-        vec!["cDNG", "DNG", "ProRes", "H.264", "HEVC"]
+        vec!["DNG", "ProRes", "H.264", "HEVC"]
     }
 }
 
@@ -103,10 +100,18 @@ impl Default for Encoder {
 
 pub struct VideoEncoder {
     child: Child,
+    audio_temp_path: Option<PathBuf>,
 }
 
 impl VideoEncoder {
-    pub fn new(output_path: &str, width: u32, height: u32, fps: f64, codec: &str, pix_fmt: &str, extra_args: &[String]) -> Result<Self> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        output_path: &str, width: u32, height: u32, fps: f64,
+        codec: &str, pix_fmt: &str, extra_args: &[String],
+        audio_temp_path: Option<&Path>,
+        audio_sample_rate: u32,
+        audio_channels: u16,
+    ) -> Result<Self> {
         const INPUT_PIX_FMT: &str = "rgb48le";
 
         let mut cmd = Command::new("ffmpeg");
@@ -116,6 +121,19 @@ impl VideoEncoder {
             "-s", &format!("{}x{}", width, height),
             "-r", &format!("{}", fps),
             "-i", "-",
+        ]);
+
+        // Add audio input from temp file if available
+        if let Some(audio_path) = audio_temp_path {
+            cmd.args([
+                "-f", "s16le",
+                "-ar", &audio_sample_rate.to_string(),
+                "-ac", &audio_channels.to_string(),
+                "-i", &audio_path.to_string_lossy(),
+            ]);
+        }
+
+        cmd.args([
             "-c:v", codec,
             "-pix_fmt", pix_fmt,
         ]);
@@ -141,6 +159,16 @@ impl VideoEncoder {
             cmd.args(["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]);
         }
 
+        // Add audio encoder if audio input is present
+        if audio_temp_path.is_some() {
+            let audio_codec = if output_path.to_lowercase().ends_with(".mov") {
+                "pcm_s16le"
+            } else {
+                "aac"
+            };
+            cmd.args(["-c:a", audio_codec]);
+        }
+
         cmd.arg("-y").arg(output_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -148,7 +176,7 @@ impl VideoEncoder {
 
         let child = cmd.spawn()?;
 
-        Ok(Self { child })
+        Ok(Self { child, audio_temp_path: audio_temp_path.map(|p| p.to_path_buf()) })
     }
 
     pub fn push_frame(&mut self, data: &[u8]) -> Result<()> {
@@ -171,6 +199,9 @@ impl Drop for VideoEncoder {
     fn drop(&mut self) {
         let _ = self.child.stdin.take();
         let _ = self.child.kill();
+        if let Some(ref path) = self.audio_temp_path {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -219,9 +250,6 @@ mod tests {
 
     #[test]
     fn test_format_labels() {
-        let cdng = OutputFormat::CDNG {
-            sequence_dir: PathBuf::from("/tmp/cdng"),
-        };
         let dng = OutputFormat::DNG {
             output_path: PathBuf::from("/tmp/dng"),
         };
@@ -238,17 +266,6 @@ mod tests {
         assert_eq!(
             EncodeJob {
                 id: "1".to_string(),
-                format: cdng.clone(),
-                status: EncodeStatus::Queued,
-                progress: 0.0,
-                error: None,
-            }
-            .format_label(),
-            "cDNG"
-        );
-        assert_eq!(
-            EncodeJob {
-                id: "2".to_string(),
                 format: dng,
                 status: EncodeStatus::Queued,
                 progress: 0.0,
@@ -259,7 +276,7 @@ mod tests {
         );
         assert_eq!(
             EncodeJob {
-                id: "3".to_string(),
+                id: "2".to_string(),
                 format: prores,
                 status: EncodeStatus::Queued,
                 progress: 0.0,
@@ -270,7 +287,7 @@ mod tests {
         );
         assert_eq!(
             EncodeJob {
-                id: "4".to_string(),
+                id: "3".to_string(),
                 format: h264,
                 status: EncodeStatus::Queued,
                 progress: 0.0,
@@ -281,7 +298,7 @@ mod tests {
         );
         assert_eq!(
             EncodeJob {
-                id: "5".to_string(),
+                id: "4".to_string(),
                 format: hevc,
                 status: EncodeStatus::Queued,
                 progress: 0.0,

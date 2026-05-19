@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use serde_json::Value;
+use std::io::Write;
 use std::path::Path;
 
 pub struct Decoder {
@@ -179,12 +180,18 @@ impl Decoder {
         })
     }
 
-    pub fn load_audio(&self) -> Result<Vec<i16>> {
+    /// Write all audio chunks to `writer` as raw s16le PCM, one chunk at a
+    /// time.  Never holds more than one chunk in memory — safe for long
+    /// recordings.  The caller should wrap the file in a `BufWriter` for
+    /// decent I/O coalescing.
+    pub fn write_audio_to<W: Write>(&self, writer: &mut W) -> Result<()> {
         let chunks = self.inner.load_audio()
             .map_err(|e| anyhow!("Failed to load audio: {}", e))?;
-        let samples: Vec<i16> = chunks.into_iter()
-            .flat_map(|chunk| chunk.samples)
-            .collect();
-        Ok(samples)
+        for chunk in chunks {
+            for &sample in &chunk.samples {
+                writer.write_all(&sample.to_le_bytes())?;
+            }
+        }
+        Ok(())
     }
 }

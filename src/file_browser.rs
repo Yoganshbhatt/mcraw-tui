@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use crate::file::McrawFileInfo;
 
@@ -36,7 +37,11 @@ pub struct FileBrowser {
     pub entries: Vec<FileEntry>,
     pub selected_index: usize,
     pub show_hidden: bool,
+    last_refresh: Instant,
 }
+
+/// How often (in seconds) the file browser re-lists the current directory.
+const REFRESH_INTERVAL_SECS: u64 = 2;
 
 impl FileBrowser {
     pub fn new() -> Self {
@@ -46,6 +51,7 @@ impl FileBrowser {
             entries: Self::list_dir(&current_path, false),
             selected_index: 0,
             show_hidden: false,
+            last_refresh: Instant::now(),
         }
     }
 
@@ -55,6 +61,7 @@ impl FileBrowser {
             entries: Self::list_dir(&path, false),
             selected_index: 0,
             show_hidden: false,
+            last_refresh: Instant::now(),
         }
     }
 
@@ -127,6 +134,28 @@ impl FileBrowser {
         self.show_hidden = !self.show_hidden;
         self.entries = Self::list_dir(&self.current_path, self.show_hidden);
         self.selected_index = 0;
+        self.last_refresh = Instant::now();
+    }
+
+    /// Re-read the current directory if enough time has passed since the last
+    /// refresh.  Preserves the selected index as much as possible across the
+    /// re-read (the index is clamped if the new entry list is shorter).
+    pub fn try_refresh(&mut self) {
+        let now = Instant::now();
+        if now.duration_since(self.last_refresh).as_secs() < REFRESH_INTERVAL_SECS {
+            return;
+        }
+        self.last_refresh = now;
+
+        // Remember the path of the currently selected entry so we can try to
+        // re-select it after the refresh.
+        let selected_path = self.entries.get(self.selected_index).map(|e| e.path.clone());
+
+        self.entries = Self::list_dir(&self.current_path, self.show_hidden);
+
+        self.selected_index = selected_path
+            .and_then(|p| self.entries.iter().position(|e| e.path == p))
+            .unwrap_or(0);
     }
 
     pub fn selected_entry(&self) -> Option<&FileEntry> {

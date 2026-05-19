@@ -1,3 +1,4 @@
+use crate::agx::{AgxConfig, AgxPipeline, Gamut, OutputTransfer, Transfer};
 use crate::color::{
     normalize_linear_f32, identity_ccm,
     mat_mul_vec3, camera_to_xyz_matrix, interpolate_matrix,
@@ -7,7 +8,6 @@ use crate::color::{
     ColorSpace, TransferFunction,
 };
 use crate::decoder::Decoder;
-use crate::dng_writer::DngWriter;
 use crate::encoder::VideoEncoder;
 use crate::export::{
     Av1Profile, CodecFamily, DnxhrProfile, H264Profile, HevcProfile,
@@ -18,7 +18,7 @@ use anyhow::{anyhow, Result};
 use crossbeam_channel::bounded;
 use rayon::prelude::*;
 use std::fs;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -71,44 +71,20 @@ pub fn get_ffmpeg_vui_tags(color_space: &ColorSpace, transfer: &TransferFunction
         TransferFunction::Linear => "linear",
         TransferFunction::SLog3 | TransferFunction::VLog
         | TransferFunction::ARRIlog3 | TransferFunction::CLog3
-        | TransferFunction::FLog2 | TransferFunction::ACESCCT => "bt709",
+        | TransferFunction::FLog2 | TransferFunction::ACESCCT
+        | TransferFunction::DaVinciIntermediate => "bt709",
+        TransferFunction::Gamma24 => "bt709",
     };
 
     vec!["-color_primaries", primaries, "-color_trc", trc, "-colorspace", matrix]
 }
 
 // ---------------------------------------------------------------------------
-// CinemaDNG export (bypasses FFmpeg entirely)
+// CinemaDNG export — COMING SOON
+// Future: export RAW video sequence with LJ92 lossless compression fully
+// compatible with DaVinci Resolve. Will add ProjFS (Windows), FUSE (Linux),
+// and the macOS equivalent for folder mounting alongside the export.
 // ---------------------------------------------------------------------------
-
-pub fn export_cdng(
-    info: &McrawFileInfo,
-    output_dir: &str,
-    decoder: &Decoder,
-    timestamps: &[i64],
-    on_progress: Arc<dyn Fn(f64) + Send + Sync>,
-    cancelled: Arc<AtomicBool>,
-) -> Result<()> {
-    fs::create_dir_all(output_dir)?;
-
-    let total = timestamps.len();
-
-    for (i, ts) in timestamps.iter().enumerate() {
-        if cancelled.load(Ordering::Relaxed) {
-            break;
-        }
-
-        let (bayer, meta) = decoder.load_frame(*ts)?;
-
-        let writer = DngWriter::new(info, &bayer, meta.as_shot_neutral, i);
-        let path = writer.filename(output_dir);
-        writer.write_to_path(&path)?;
-
-        on_progress((i + 1) as f64 / total as f64 * 100.0);
-    }
-
-    Ok(())
-}
 
 pub fn run_naked(info: &McrawFileInfo, output_path: &str) -> Result<()> {
     let decoder = Decoder::new(&info.path)?;
@@ -179,11 +155,6 @@ pub fn run_export(
 
     if timestamps.is_empty() {
         return Err(anyhow!("No frames found in file"));
-    }
-
-    // ----- CinemaDNG: bypass FFmpeg entirely, write raw DNG sequence -----
-    if codec_family == CodecFamily::CinemaDNG {
-        return export_cdng(&info, &output_path, &decoder, &timestamps, on_progress, cancelled);
     }
 
     let stride_width = info.width as u32;
@@ -260,9 +231,67 @@ pub fn run_export(
 
     let xyz_to_rec = xyz_to_rec709();
 
+    // -----------------------------------------------------------------
+    // Audio pipeline
+    //
+    // Data flow:
+    //   1. decoder.write_audio_to() writes each audio chunk as raw s16le
+    //      to a temp file on disk via BufWriter (never holds all samples
+    //      in memory — safe for hours-long recordings).
+    //   2. Temp file path passed to VideoEncoder, which adds a second
+    //      -i input to FFmpeg:  -f s16le -ar RATE -ac CH -i <tempfile>
+    //   3. FFmpeg muxes audio alongside video; encoder Drop cleans up
+    //
+    // Future: add a user toggle (App::export_audio_enabled) gating the
+    // entire block below.  The toggle lives at App level so it can be
+    // rendered in the Export screen.  When disabled, skip to
+    //   let audio_temp_path: Option<PathBuf> = None;
+    // -----------------------------------------------------------------
+    let audio_temp_path = if info.has_audio
+        && info.audio_sample_rate > 0
+        && info.audio_channels > 0
+    {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let temp_path = std::env::temp_dir().join(format!("mcraw_audio_{}.raw", ts));
+        match std::fs::File::create(&temp_path) {
+            Ok(file) => {
+                let mut writer = BufWriter::new(file);
+                match decoder.write_audio_to(&mut writer) {
+                    Ok(()) => {
+                        let _ = writer.flush();
+                        log::info!(
+                            "Audio streamed to temp file: {} Hz, {} ch -> {}",
+                            info.audio_sample_rate, info.audio_channels,
+                            temp_path.display()
+                        );
+                        Some(temp_path)
+                    }
+                    Err(e) => {
+                        // Clean up temp file on partial write
+                        let _ = std::fs::remove_file(&temp_path);
+                        log::warn!("Failed to write audio (export continues without audio): {}", e);
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("Failed to create audio temp file (export continues without audio): {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut encoder = VideoEncoder::new(
         &output_path, active_width, active_height, fps,
         codec_name, pix_fmt, &extra_args,
+        audio_temp_path.as_deref(),
+        info.audio_sample_rate,
+        info.audio_channels,
     )?;
 
     // ----------------------------------------------------------------
@@ -318,6 +347,22 @@ pub fn run_export(
             }
         })?;
 
+    // Pre-build AgX pipeline — disabled for now; will be re-added as a
+    // dedicated AgX section with full parameter control when preview is ready.
+    let use_agx = false;
+    let agx_pipeline = if use_agx {
+        let mut cfg = AgxConfig::default();
+        cfg.in_gamut = Gamut::Rec709;
+        cfg.in_transfer = Transfer::Linear;
+        cfg.working_curve = Transfer::AgxLogKraken;
+        cfg.out_gamut = Gamut::Rec709;
+        cfg.out_transfer = OutputTransfer::Bt1886InverseEotf;
+        cfg.log_output = false;
+        Some(AgxPipeline::new(cfg))
+    } else {
+        None
+    };
+
     // ==================================================================
     // Stage 2 — Processor thread: demosaic → color pipeline → OETF → u16
     // ==================================================================
@@ -356,31 +401,47 @@ pub fn run_export(
                     )?;
                     normalize_linear_f32(&mut rgb, black_level as f32, white_level as f32);
 
+                    let use_agx_frame = use_agx;
                     rgb.par_chunks_exact_mut(3).for_each(|chunk| {
                         let r = chunk[0] * r_gain;
                         let g = chunk[1];
                         let b = chunk[2] * b_gain;
 
-                        let max_val = r.max(g).max(b);
-                        let (r, g, b) = if max_val > 0.95f32 {
-                            let t = ((max_val - 0.95) / 0.05).min(1.0);
-                            (r + (max_val - r) * t,
-                             g + (max_val - g) * t,
-                             b + (max_val - b) * t)
+                        if use_agx_frame {
+                            // AgX will handle highlight roll-off and tone mapping;
+                            // just apply CAT16 white-balance adaptation and move on.
+                            let rr = r / r_gain;
+                            let bb = b / b_gain;
+                            let out = mat_mul_vec3(&fused, &[rr, g, bb]);
+                            chunk[0] = out[0].max(0.0);
+                            chunk[1] = out[1].max(0.0);
+                            chunk[2] = out[2].max(0.0);
                         } else {
-                            (r, g, b)
-                        };
+                            let max_val = r.max(g).max(b);
+                            let (r, g, b) = if max_val > 0.95f32 {
+                                let t = ((max_val - 0.95) / 0.05).min(1.0);
+                                (r + (max_val - r) * t,
+                                 g + (max_val - g) * t,
+                                 b + (max_val - b) * t)
+                            } else {
+                                (r, g, b)
+                            };
 
-                        let rr = r / r_gain;
-                        let bb = b / b_gain;
+                            let rr = r / r_gain;
+                            let bb = b / b_gain;
 
-                        let out = mat_mul_vec3(&fused, &[rr, g, bb]);
-                        chunk[0] = out[0].max(0.0);
-                        chunk[1] = out[1].max(0.0);
-                        chunk[2] = out[2].max(0.0);
+                            let out = mat_mul_vec3(&fused, &[rr, g, bb]);
+                            chunk[0] = out[0].max(0.0);
+                            chunk[1] = out[1].max(0.0);
+                            chunk[2] = out[2].max(0.0);
+                        }
                     });
 
-                    if is_log {
+                    if let Some(ref agx) = agx_pipeline {
+                        // Full AgX tone mapping pipeline: tone scale, gamut
+                        // compression, and BT.1886 gamma 2.4 output.
+                        agx.process_frame(&mut rgb);
+                    } else if is_log {
                         export_tf.process(&mut rgb);
                     } else {
                         rgb.par_iter_mut().for_each(|v| {
@@ -423,7 +484,10 @@ pub fn run_export(
 
             for slot in processed_rx {
                 if writer_cancelled.load(Ordering::Relaxed) {
-                    break;
+                    // Return slot to pool before exiting
+                    let _ = free_tx_writer.send(slot);
+                    // Skip finish() — encoder drops here, killing FFmpeg
+                    return Ok(());
                 }
 
                 encoder.push_frame(&slot.frame_bytes)?;
@@ -431,8 +495,13 @@ pub fn run_export(
                 frames_written += 1;
                 on_progress(frames_written as f64 / total_frames as f64 * 100.0);
 
-                // Return slot to the free pool for reuse by the loader
                 let _ = free_tx_writer.send(slot);
+            }
+
+            // Double-check cancel flag: processed_rx may have been dropped
+            // by the processor after the processor detected cancellation.
+            if writer_cancelled.load(Ordering::Relaxed) {
+                return Ok(());
             }
 
             encoder.finish()?;
@@ -476,6 +545,11 @@ pub fn run_export(
         Err(_) => {
             export_error.get_or_insert(anyhow!("Writer thread panicked"));
         }
+    }
+
+    // Clean up audio temp file (belt-and-suspenders with encoder Drop)
+    if let Some(ref audio_path) = audio_temp_path {
+        let _ = std::fs::remove_file(audio_path);
     }
 
     match export_error {

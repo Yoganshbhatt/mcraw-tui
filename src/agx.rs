@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 use std::f32::consts::PI;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,9 +168,9 @@ impl AgxPipeline {
 
         let mg = 0.5;
         let lmg = self.config.working_mid_grey;
-        rgb[0] = tone_scale(rgb[0], self.config.shoulder_power, self.config.toe_power, self.config.slope, lmg, mg);
-        rgb[1] = tone_scale(rgb[1], self.config.shoulder_power, self.config.toe_power, self.config.slope, lmg, mg);
-        rgb[2] = tone_scale(rgb[2], self.config.shoulder_power, self.config.toe_power, self.config.slope, lmg, mg);
+        rgb[0] = tone_scale(rgb[0], self.config.shoulder_power, self.config.toe_power, self.config.slope, lmg, mg, 1.0, 0.0);
+        rgb[1] = tone_scale(rgb[1], self.config.shoulder_power, self.config.toe_power, self.config.slope, lmg, mg, 1.0, 0.0);
+        rgb[2] = tone_scale(rgb[2], self.config.shoulder_power, self.config.toe_power, self.config.slope, lmg, mg, 1.0, 0.0);
 
         if self.config.log_output {
             return log_rgb;
@@ -178,6 +179,15 @@ impl AgxPipeline {
         rgb[0] = rgb[0].powf(2.2);
         rgb[1] = rgb[1].powf(2.2);
         rgb[2] = rgb[2].powf(2.2);
+
+        let lum = (rgb[0] + rgb[1] + rgb[2]) * (1.0 / 3.0);
+        let max_ch = rgb[0].max(rgb[1]).max(rgb[2]);
+        if max_ch > 0.85 {
+            let t = ((max_ch - 0.85) / 0.15).min(1.0);
+            rgb[0] = rgb[0] + (lum - rgb[0]) * t;
+            rgb[1] = rgb[1] + (lum - rgb[1]) * t;
+            rgb[2] = rgb[2] + (lum - rgb[2]) * t;
+        }
 
         rgb = mat_mul_vec3(&self.outset_mat, rgb);
 
@@ -193,12 +203,12 @@ impl AgxPipeline {
     }
 
     pub fn process_frame(&self, pixels: &mut [f32]) {
-        for chunk in pixels.chunks_exact_mut(3) {
+        pixels.par_chunks_exact_mut(3).for_each(|chunk| {
             let out = self.process_pixel(chunk[0], chunk[1], chunk[2]);
             chunk[0] = out[0];
             chunk[1] = out[1];
             chunk[2] = out[2];
-        }
+        });
     }
 
     pub fn config(&self) -> &AgxConfig {
@@ -462,13 +472,7 @@ fn log_to_lin(v: [f32; 3], tf: Transfer) -> [f32; 3] {
                 }
             }
             Transfer::AgxLogKraken => {
-                let mid = 0.18f32;
-                let slope = 1.0 / 0.18;
-                if x <= 0.0 {
-                    0.0
-                } else {
-                    mid * 2.0f32.powf((x - 0.5) * slope)
-                }
+                0.18 * 2.0f32.powf(x * 16.5 - 10.0)
             }
             Transfer::HLG => {
                 if x <= 0.5 {
@@ -613,12 +617,11 @@ fn lin_to_log(v: [f32; 3], tf: Transfer) -> [f32; 3] {
                 }
             }
             Transfer::AgxLogKraken => {
-                let mid = 0.18f32;
-                let slope = 1.0 / 0.18;
                 if x <= 0.0 {
                     0.0
                 } else {
-                    0.5 + (x / mid).log2() / slope
+                    let ev = (x / 0.18).log2().clamp(-10.0, 6.5);
+                    (ev + 10.0) / 16.5
                 }
             }
             Transfer::HLG => {
@@ -657,15 +660,28 @@ fn inverse_eotf(v: [f32; 3], gamma: f32) -> [f32; 3] {
 }
 
 #[inline]
-fn tone_scale(x: f32, shoulder: f32, toe: f32, slope: f32, lmg: f32, mg: f32) -> f32 {
-    if x <= 0.0 {
-        return 0.0;
-    }
-    let xn = x / lmg;
-    let c = xn.powf(slope);
-    let t = c / (1.0 + toe * c.powf(1.0 / toe));
-    let s = t / (1.0 + shoulder * t.powf(1.0 / shoulder));
-    s * mg
+fn spowf(a: f32, b: f32) -> f32 {
+    let s = if a > 0.0 { 1.0 } else if a < 0.0 { -1.0 } else { 0.0 };
+    s * a.abs().powf(b)
+}
+
+#[inline]
+fn tone_scale(x: f32, shoulder: f32, toe: f32, slope: f32, lmg: f32, mg: f32, s0: f32, t0: f32) -> f32 {
+    let ss = spowf(
+        (spowf(slope * (s0 - lmg) / (1.0 - mg), shoulder) - 1.0) * spowf(slope * (s0 - lmg), -shoulder),
+        -1.0 / shoulder,
+    );
+    let ms = slope * (x - lmg) / ss;
+    let fs = ms / spowf(1.0 + spowf(ms, shoulder), 1.0 / shoulder);
+
+    let ts = spowf(
+        (spowf(slope * (lmg - t0) / mg, toe) - 1.0) * spowf(slope * (lmg - t0), -toe),
+        -1.0 / toe,
+    );
+    let mr = slope * (x - lmg) / (-ts);
+    let ft = mr / spowf(1.0 + spowf(mr, toe), 1.0 / toe);
+
+    if x >= lmg { ss * fs + mg } else { -ts * ft + mg }
 }
 
 impl From<crate::color::TransferFunction> for Transfer {
@@ -681,6 +697,8 @@ impl From<crate::color::TransferFunction> for Transfer {
             crate::color::TransferFunction::ACESCCT => Transfer::AcesCct,
             crate::color::TransferFunction::HLG => Transfer::HLG,
             crate::color::TransferFunction::PQ => Transfer::PQ,
+            crate::color::TransferFunction::DaVinciIntermediate => Transfer::DaVinciIntermediate,
+            crate::color::TransferFunction::Gamma24 => Transfer::Linear,
         }
     }
 }
@@ -719,45 +737,27 @@ mod tests {
     }
 
     #[test]
-    fn test_process_pixel_identity() {
-        let mut cfg = AgxConfig::default();
-        cfg.inset_red = 0.0;
-        cfg.inset_green = 0.0;
-        cfg.inset_blue = 0.0;
-        cfg.in_transfer = Transfer::Linear;
-        cfg.working_curve = Transfer::Linear;
-        cfg.out_transfer = OutputTransfer::Linear;
-        cfg.log_output = false;
-        cfg.slope = 1.0;
-        cfg.toe_power = 0.0;
-        cfg.shoulder_power = 0.0;
+    fn test_mid_grey_pivot() {
+        let cfg = AgxConfig::default();
         let pipe = AgxPipeline::new(cfg);
-        let out = pipe.process_pixel(0.5, 0.5, 0.5);
-        let mid_scale = 0.5_f32 / 0.606060;
-        let expected = (0.5 * mid_scale).powf(2.2);
-        assert!((out[0] - expected).abs() < 0.01, "expected={}, got={}", expected, out[0]);
+        let out = pipe.process_pixel(0.18, 0.18, 0.18);
+        assert!((out[0] - 0.5).abs() < 0.01, "mid grey: expected ~0.5, got {}", out[0]);
     }
 
     #[test]
-    fn test_rec709_gamma_output() {
-        let mut cfg = AgxConfig::default();
-        cfg.inset_red = 0.0;
-        cfg.inset_green = 0.0;
-        cfg.inset_blue = 0.0;
-        cfg.in_transfer = Transfer::Linear;
-        cfg.working_curve = Transfer::Linear;
-        cfg.out_gamut = Gamut::Rec709;
-        cfg.out_transfer = OutputTransfer::SrgbInverseEotf;
-        cfg.toe_power = 0.0;
-        cfg.shoulder_power = 0.0;
-        cfg.slope = 1.0;
-
+    fn test_black_output() {
+        let cfg = AgxConfig::default();
         let pipe = AgxPipeline::new(cfg);
+        let out = pipe.process_pixel(0.0, 0.0, 0.0);
+        assert!(out[0] < 0.001, "black: expected near 0, got {}", out[0]);
+    }
 
-        let linear_in = 0.18;
-        let out = pipe.process_pixel(linear_in, linear_in, linear_in);
-
-        assert!((out[0] - linear_in * 0.5_f32 / 0.606060).abs() < 0.01, "expected={}, got={}", linear_in * 0.5_f32 / 0.606060, out[0]);
+    #[test]
+    fn test_white_clip() {
+        let cfg = AgxConfig::default();
+        let pipe = AgxPipeline::new(cfg);
+        let out = pipe.process_pixel(10.0, 10.0, 10.0);
+        assert!(out[0] < 1.0 && out[0] > 0.9, "white: expected near 1.0, got {}", out[0]);
     }
 
     #[test]
@@ -765,12 +765,6 @@ mod tests {
         let mut cfg = AgxConfig::default();
         cfg.in_gamut = Gamut::Rec2020;
         cfg.out_gamut = Gamut::Rec709;
-        cfg.in_transfer = Transfer::Linear;
-        cfg.working_curve = Transfer::Linear;
-        cfg.out_transfer = OutputTransfer::Linear;
-        cfg.toe_power = 0.0;
-        cfg.shoulder_power = 0.0;
-        cfg.slope = 1.0;
         
         let pipe = AgxPipeline::new(cfg);
         let out = pipe.process_pixel(0.5, 0.5, 0.5);

@@ -165,7 +165,6 @@ fn render_export_content(frame: &mut Frame, app: &App, area: Rect) {
     let show_rate = !matches!(app.export_codec_family,
         crate::export::CodecFamily::ProRes
         | crate::export::CodecFamily::DNxHR
-        | crate::export::CodecFamily::CinemaDNG
     );
     let vert = Layout::default()
         .direction(Direction::Vertical)
@@ -239,7 +238,7 @@ fn render_export_content(frame: &mut Frame, app: &App, area: Rect) {
 
     // --- Profile selector (dynamic based on active codec) ---
     let pr_focused = app.export_focus == ExportFocus::Profile;
-    let show_profile = !matches!(app.export_codec_family, crate::export::CodecFamily::CinemaDNG);
+    let show_profile = true;
     let profile_conflict = show_profile && app.export_transfer_function.requires_10bit() && app.active_profile_is_8bit();
     let pr_style = if pr_focused {
         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
