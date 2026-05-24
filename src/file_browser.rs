@@ -112,6 +112,7 @@ impl FileBrowser {
         if self.selected_index < self.entries.len() {
             let entry = &self.entries[self.selected_index];
             if entry.is_dir {
+                tracing::debug!("browser enter: navigating to {}", entry.path.display());
                 self.current_path = entry.path.clone();
                 self.entries = Self::list_dir(&self.current_path, self.show_hidden);
                 self.selected_index = 0;
@@ -123,6 +124,7 @@ impl FileBrowser {
         if self.selected_index < self.entries.len() {
             let entry = &self.entries[self.selected_index];
             if entry.name == ".." {
+                tracing::debug!("browser go_up: navigating to {}", entry.path.display());
                 self.current_path = entry.path.clone();
                 self.entries = Self::list_dir(&self.current_path, self.show_hidden);
                 self.selected_index = 0;
@@ -132,6 +134,7 @@ impl FileBrowser {
 
     pub fn toggle_hidden(&mut self) {
         self.show_hidden = !self.show_hidden;
+        tracing::debug!("browser toggle_hidden: show_hidden={}", self.show_hidden);
         self.entries = Self::list_dir(&self.current_path, self.show_hidden);
         self.selected_index = 0;
         self.last_refresh = Instant::now();

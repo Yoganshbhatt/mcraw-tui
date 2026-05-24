@@ -77,12 +77,19 @@ fn json_to_as_shot_neutral(val: &Value) -> [f32; 3] {
 
 impl Decoder {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path_str = path.as_ref().to_string_lossy().to_string();
+        tracing::debug!("decoder::new: {}", path_str);
         let inner = motioncam_decoder::Decoder::from_path(path)
-            .map_err(|e| anyhow!("Failed to open decoder: {}", e))?;
+            .map_err(|e| {
+                tracing::error!("decoder failed to open {}: {}", path_str, e);
+                anyhow!("Failed to open decoder: {}", e)
+            })?;
+        tracing::debug!("decoder opened successfully: {}", path_str);
         Ok(Self { inner })
     }
 
     pub fn container_metadata(&self) -> Result<ContainerMetadata> {
+        tracing::debug!("decoder::container_metadata");
         let meta = self.inner.container_metadata();
 
         let color_matrix1 = json_to_matrix9(meta, "colorMatrix1");
@@ -129,12 +136,17 @@ impl Decoder {
     }
 
     pub fn timestamps(&self) -> Result<Vec<i64>> {
-        Ok(self.inner.frame_timestamps().collect())
+        let ts = self.inner.frame_timestamps().collect::<Vec<_>>();
+        tracing::debug!("decoder::timestamps: {} frames", ts.len());
+        Ok(ts)
     }
 
     pub fn load_frame(&self, timestamp_ns: i64) -> Result<(Vec<u16>, FrameMetadata)> {
         let (pixels, meta) = self.inner.load_frame(timestamp_ns)
-            .map_err(|e| anyhow!("Failed to decode frame at ns {}: {}", timestamp_ns, e))?;
+            .map_err(|e| {
+                tracing::error!("failed to decode frame at ns {}: {}", timestamp_ns, e);
+                anyhow!("Failed to decode frame at ns {}: {}", timestamp_ns, e)
+            })?;
 
         let width = meta.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         let height = meta.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as u32;

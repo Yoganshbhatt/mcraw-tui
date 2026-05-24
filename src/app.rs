@@ -1,10 +1,10 @@
 use anyhow::Result;
 use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-    event::{Event, KeyEventKind},
+    event::{Event, KeyEventKind, EnableBracketedPaste, DisableBracketedPaste, EnableMouseCapture, DisableMouseCapture},
 };
+use percent_encoding::percent_decode_str;
 use ratatui::backend::CrosstermBackend;
-use ratatui::widgets::ListState;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tokio::time;
@@ -22,7 +22,53 @@ use crate::decoder::Decoder;
 use crate::encoder::{EncodeJob, EncodeStatus, Encoder, OutputFormat};
 use crate::file::McrawFileInfo;
 use crate::file_browser::FileBrowser;
-use crate::ui;
+use crate::ui::{self, ClickAction};
+
+// ---------------------------------------------------------------------------
+// Data types for the media pool / queue workflow
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct ImportedFile {
+    pub path: String,
+    pub info: McrawFileInfo,
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueStatus {
+    Waiting,
+    Rendering,
+    Completed,
+    Failed(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct QueuedFile {
+    pub path: String,
+    pub info: McrawFileInfo,
+    pub selected: bool,
+    pub status: QueueStatus,
+    pub progress: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusTarget {
+    MediaPool,
+    Queue,
+    ExportSettings,
+    Preview,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportPopupState {
+    Hidden,
+    DroppedFiles {
+        files: Vec<String>,
+        folder: String,
+        all_in_folder: Vec<String>,
+    },
+}
 
 #[derive(Debug)]
 pub enum ExportEvent {
@@ -49,7 +95,6 @@ pub struct App {
     pub show_help: bool,
     pub error: Option<String>,
     pub browser: FileBrowser,
-    pub list_state: ListState,
 
     pub is_exporting: bool,
     pub export_cancelled: bool,
@@ -57,14 +102,29 @@ pub struct App {
     pub export_rx: Option<mpsc::Receiver<ExportEvent>>,
     pub cancel_token: Option<Arc<AtomicBool>>,
 
-    // Persistent export settings (survive file loads)
+    // Which queue item is currently being rendered (for sequential batch)
+    pub current_rendering_index: Option<usize>,
+
+    // Export folder for the current session
+    pub export_folder: Option<std::path::PathBuf>,
+
+    // Favourite folders for quick browser navigation
+    pub favourite_folders: Vec<std::path::PathBuf>,
+
+    // Help overlay scroll position
+    pub help_scroll: u16,
+
+    // Culling mode flag
+    pub show_culling: bool,
+
+    // Persistent export settings
     pub export_color_space: ColorSpace,
     pub export_transfer_function: TransferFunction,
     pub export_codec_family: CodecFamily,
     pub export_focus: ExportFocus,
     pub export_start_time: Option<Instant>,
 
-    // Sticky per-codec profiles (NOT reset when switching codec family)
+    // Sticky per-codec profiles
     pub prores_profile: ProResProfile,
     pub dnxhr_profile: DnxhrProfile,
     pub hevc_profile: HevcProfile,
@@ -78,6 +138,46 @@ pub struct App {
     // Rate control
     pub active_rate_control: RateControl,
     pub is_editing_custom_rate: bool,
+
+    // Media pool / queue workflow
+    pub imported_files: Vec<ImportedFile>,
+    pub media_pool_index: usize,
+
+    pub queue: Vec<QueuedFile>,
+    pub queue_index: usize,
+
+    pub show_browser: bool,
+    pub import_popup: ImportPopupState,
+
+    pub focus_target: FocusTarget,
+
+    pub show_full_info: bool,
+
+    // Browser double-click detection
+    pub last_browser_click: Option<(Instant, usize)>,
+
+    // Drag-drop visual feedback
+    pub drop_highlight: Option<Instant>,
+
+    // Async drag-drop import state
+    pub drop_import_rx: Option<mpsc::Receiver<DropImportEvent>>,
+    pub drop_import_cancel: Option<Arc<AtomicBool>>,
+
+    // Drop preview overlay for visual feedback
+    pub drop_preview: Option<DropPreview>,
+}
+
+/// Event from async drag-drop import worker
+pub enum DropImportEvent {
+    FileReady { path: String, info: McrawFileInfo },
+    Failed { path: String, error: String },
+    Complete { imported: usize, failed: usize },
+}
+
+/// Visual preview of dropped files
+pub struct DropPreview {
+    pub files: Vec<String>,
+    pub start_time: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,8 +191,6 @@ pub enum ExportFocus {
 
 impl App {
     pub fn new() -> Self {
-        let mut list_state = ListState::default();
-        list_state.select(Some(0));
         let caps = probe_hardware();
         App {
             running: true,
@@ -102,11 +200,10 @@ impl App {
             frame_index: 0,
             frame_count: 0,
             encode_jobs: Vec::new(),
-            status_message: String::from("No file loaded"),
+            status_message: String::from("Ready | Drag-drop .mcraw files or press b to browse"),
             show_help: false,
             error: None,
             browser: FileBrowser::new(),
-            list_state,
 
             is_exporting: false,
             export_cancelled: false,
@@ -117,7 +214,7 @@ impl App {
             export_color_space: ColorSpace::Rec709,
             export_transfer_function: TransferFunction::Gamma24,
             export_codec_family: CodecFamily::HEVC,
-            export_focus: ExportFocus::ColorSpace,
+            export_focus: ExportFocus::CodecFamily,
             export_start_time: None,
 
             prores_profile: ProResProfile::HQ,
@@ -130,18 +227,39 @@ impl App {
             hardware_caps: caps,
             active_rate_control: RateControl::Lossless,
             is_editing_custom_rate: false,
+
+            imported_files: Vec::new(),
+            media_pool_index: 0,
+            queue: Vec::new(),
+            queue_index: 0,
+            show_browser: true,
+            current_rendering_index: None,
+            export_folder: None,
+            favourite_folders: Vec::new(),
+            help_scroll: 0,
+            show_culling: false,
+            import_popup: ImportPopupState::Hidden,
+            focus_target: FocusTarget::MediaPool,
+            show_full_info: false,
+            last_browser_click: None,
+            drop_highlight: None,
+            drop_import_rx: None,
+            drop_import_cancel: None,
+            drop_preview: None,
         }
     }
 
+    // -----------------------------------------------------------------------
+    // File loading
+    // -----------------------------------------------------------------------
+
     pub fn load_file(&mut self, path: String) {
+        tracing::info!("load_file: path={}", path);
         self.error = None;
-        self.frame_index = 0;
-        self.frame_count = 0;
-        self.file_info = None;
-        self.file_path = None;
         self.status_message = String::new();
         match McrawFileInfo::from_path(&path) {
             Ok(mut info) => {
+                tracing::debug!("file parsed: frames={} {}x{} fps={}", info.frame_count, info.width, info.height, info.fps);
                 if let Ok(decoder) = Decoder::new(&path) {
                     if let Ok(container_meta) = decoder.container_metadata() {
                         let as_f64 = |v: &[f32; 9]| -> [f64; 9] {
@@ -152,8 +270,6 @@ impl App {
                         let non_zero = |m: &[f32; 9]| m.iter().any(|&x| x != 0.0);
 
                         info.camera_metadata.color_matrix = Some(as_f64(&container_meta.color_matrix1));
-                        log::info!("color_matrix1 loaded from decoder container metadata");
-
                         if non_zero(&container_meta.color_matrix2) {
                             info.camera_metadata.color_matrix2 = Some(as_f64(&container_meta.color_matrix2));
                         }
@@ -170,11 +286,9 @@ impl App {
 
                         if container_meta.white_level > 0.0 {
                             info.white_level = container_meta.white_level;
-                            log::info!("White level from container metadata: {}", info.white_level);
                         }
                         if container_meta.black_level_count > 0 {
                             info.black_level = container_meta.black_level[0];
-                            log::info!("Black level from container metadata: {}", info.black_level);
                         }
                     }
                     if let Ok(timestamps) = decoder.timestamps() {
@@ -189,28 +303,494 @@ impl App {
                         if let Ok(first_frame_meta) = decoder.load_frame_metadata(timestamps[0]) {
                             info.width = first_frame_meta.width as u16;
                             info.height = first_frame_meta.height as u16;
-                            log::info!(
-                                "FFI metadata: {}x{}, fps={} loaded from per-frame metadata",
-                                first_frame_meta.width,
-                                first_frame_meta.height,
-                                info.fps
-                            );
                         }
                     }
                 }
+
                 self.file_info = Some(info.clone());
                 self.frame_count = info.frame_count as usize;
                 self.file_path = Some(path.clone());
-                self.status_message = format!("Loaded: {}", path);
-                log::info!("Loaded file info: {:?} ({} frames)", path, info.frame_count);
+
+                let already = self.imported_files.iter().any(|f| f.path == path);
+                if !already {
+                    self.imported_files.push(ImportedFile {
+                        path: path.clone(),
+                        info: info.clone(),
+                        selected: true,
+                    });
+                    self.media_pool_index = self.imported_files.len() - 1;
+                    tracing::info!("file added to media pool: index={}", self.media_pool_index);
+                } else {
+                    tracing::debug!("file already in media pool, skipping");
+                }
+
+                self.status_message = format!("Imported: {}", path);
+                tracing::info!("file loaded successfully: {}", path);
             }
             Err(e) => {
+                tracing::error!("failed to load file {}: {}", path, e);
                 self.error = Some(format!("Failed to load file: {}", e));
                 self.status_message = format!("Error: {}", e);
-                log::error!("Failed to load file {:?}: {}", path, e);
             }
         }
     }
+
+    /// Add multiple files to the media pool (used by drag-drop).
+    /// Returns (imported_count, failed_count).
+    pub fn load_files_batch(&mut self, paths: &[String]) -> (usize, usize) {
+        tracing::info!("load_files_batch: count={}", paths.len());
+        let mut imported = 0;
+        let mut failed = 0;
+        for path in paths {
+            self.error = None;
+            match McrawFileInfo::from_path(path) {
+                Ok(mut info) => {
+                    if let Ok(decoder) = Decoder::new(path) {
+                        if let Ok(container_meta) = decoder.container_metadata() {
+                            let as_f64 = |v: &[f32; 9]| -> [f64; 9] {
+                                let mut r = [0.0; 9];
+                                for (i, &x) in v.iter().enumerate() { r[i] = x as f64; }
+                                r
+                            };
+                            let non_zero = |m: &[f32; 9]| m.iter().any(|&x| x != 0.0);
+                            info.camera_metadata.color_matrix = Some(as_f64(&container_meta.color_matrix1));
+                            if non_zero(&container_meta.color_matrix2) {
+                                info.camera_metadata.color_matrix2 = Some(as_f64(&container_meta.color_matrix2));
+                            }
+                            if non_zero(&container_meta.forward_matrix1) {
+                                info.camera_metadata.forward_matrix1 = Some(as_f64(&container_meta.forward_matrix1));
+                            }
+                            if non_zero(&container_meta.forward_matrix2) {
+                                info.camera_metadata.forward_matrix2 = Some(as_f64(&container_meta.forward_matrix2));
+                            }
+                            if container_meta.has_calibration_illuminants {
+                                info.camera_metadata.calibration_illuminant1 = Some(container_meta.calibration_illuminant1);
+                                info.camera_metadata.calibration_illuminant2 = Some(container_meta.calibration_illuminant2);
+                            }
+                            if container_meta.white_level > 0.0 {
+                                info.white_level = container_meta.white_level;
+                            }
+                            if container_meta.black_level_count > 0 {
+                                info.black_level = container_meta.black_level[0];
+                            }
+                        }
+                        if let Ok(timestamps) = decoder.timestamps() {
+                            info.frame_count = timestamps.len() as u32;
+                            if timestamps.len() >= 2 {
+                                let duration_ns = timestamps[timestamps.len() - 1] - timestamps[0];
+                                if duration_ns > 0 {
+                                    let duration_in_seconds = duration_ns as f64 / 1_000_000_000.0;
+                                    info.fps = (info.frame_count.saturating_sub(1)) as f64 / duration_in_seconds;
+                                }
+                            }
+                            if let Ok(first_frame_meta) = decoder.load_frame_metadata(timestamps[0]) {
+                                info.width = first_frame_meta.width as u16;
+                                info.height = first_frame_meta.height as u16;
+                            }
+                        }
+                    }
+
+                    let already = self.imported_files.iter().any(|f| f.path == *path);
+                    if !already {
+                        self.imported_files.push(ImportedFile {
+                            path: path.clone(),
+                            info: info.clone(),
+                            selected: true,
+                        });
+                        imported += 1;
+                        tracing::debug!("batch imported: {} ({} total)", path, self.imported_files.len());
+                    }
+                }
+                Err(e) => {
+                    failed += 1;
+                    tracing::warn!("batch import failed for {}: {}", path, e);
+                }
+            }
+        }
+        // Select the first newly imported file
+        if imported > 0 && self.imported_files.len() > 0 {
+            self.media_pool_index = self.imported_files.len() - imported;
+            self.file_info = Some(self.imported_files[self.media_pool_index].info.clone());
+            self.file_path = Some(self.imported_files[self.media_pool_index].path.clone());
+            self.frame_count = self.imported_files[self.media_pool_index].info.frame_count as usize;
+        }
+        (imported, failed)
+    }
+
+    /// Start async import of dropped files on a background thread.
+    /// Returns immediately; results arrive via DropImportEvent channel.
+    pub fn start_async_import(&mut self, paths: Vec<String>) {
+        // Cancel any in-progress import
+        if let Some(cancel) = self.drop_import_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+
+        let (tx, rx) = mpsc::channel::<DropImportEvent>();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        self.drop_import_cancel = Some(cancel_flag.clone());
+        self.drop_import_rx = Some(rx);
+
+        // Show preview overlay
+        self.drop_preview = Some(DropPreview {
+            files: paths.iter()
+                .filter(|p| p.to_lowercase().ends_with(".mcraw"))
+                .map(|p| p.clone())
+                .collect(),
+            start_time: Instant::now(),
+        });
+
+        let total = paths.len();
+        self.status_message = format!("Importing {} file(s)...", total);
+
+        std::thread::spawn(move || {
+            let mut imported = 0;
+            let mut failed = 0;
+
+            for path in paths {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    tracing::info!("async drag-drop import cancelled");
+                    break;
+                }
+
+                let path_clone = path.clone();
+                match McrawFileInfo::from_path(&path) {
+                    Ok(mut info) => {
+                        // Enhance with decoder metadata (same as load_file)
+                        if let Ok(decoder) = Decoder::new(&path) {
+                            if let Ok(container_meta) = decoder.container_metadata() {
+                                let as_f64 = |v: &[f32; 9]| -> [f64; 9] {
+                                    let mut r = [0.0; 9];
+                                    for (i, &x) in v.iter().enumerate() { r[i] = x as f64; }
+                                    r
+                                };
+                                let non_zero = |m: &[f32; 9]| m.iter().any(|&x| x != 0.0);
+                                info.camera_metadata.color_matrix = Some(as_f64(&container_meta.color_matrix1));
+                                if non_zero(&container_meta.color_matrix2) {
+                                    info.camera_metadata.color_matrix2 = Some(as_f64(&container_meta.color_matrix2));
+                                }
+                                if non_zero(&container_meta.forward_matrix1) {
+                                    info.camera_metadata.forward_matrix1 = Some(as_f64(&container_meta.forward_matrix1));
+                                }
+                                if non_zero(&container_meta.forward_matrix2) {
+                                    info.camera_metadata.forward_matrix2 = Some(as_f64(&container_meta.forward_matrix2));
+                                }
+                                if container_meta.has_calibration_illuminants {
+                                    info.camera_metadata.calibration_illuminant1 = Some(container_meta.calibration_illuminant1);
+                                    info.camera_metadata.calibration_illuminant2 = Some(container_meta.calibration_illuminant2);
+                                }
+                                if container_meta.white_level > 0.0 {
+                                    info.white_level = container_meta.white_level;
+                                }
+                                if container_meta.black_level_count > 0 {
+                                    info.black_level = container_meta.black_level[0];
+                                }
+                            }
+                            if let Ok(timestamps) = decoder.timestamps() {
+                                info.frame_count = timestamps.len() as u32;
+                                if timestamps.len() >= 2 {
+                                    let duration_ns = timestamps[timestamps.len() - 1] - timestamps[0];
+                                    if duration_ns > 0 {
+                                        let duration_in_seconds = duration_ns as f64 / 1_000_000_000.0;
+                                        info.fps = (info.frame_count.saturating_sub(1)) as f64 / duration_in_seconds;
+                                    }
+                                }
+                                if let Ok(first_frame_meta) = decoder.load_frame_metadata(timestamps[0]) {
+                                    info.width = first_frame_meta.width as u16;
+                                    info.height = first_frame_meta.height as u16;
+                                }
+                            }
+                        }
+
+                        let _ = tx.send(DropImportEvent::FileReady { path: path_clone, info });
+                        imported += 1;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(DropImportEvent::Failed {
+                            path: path_clone,
+                            error: e.to_string(),
+                        });
+                        failed += 1;
+                        tracing::warn!("async drag-drop import failed: {}: {}", path, e);
+                    }
+                }
+            }
+
+            let _ = tx.send(DropImportEvent::Complete { imported, failed });
+        });
+    }
+
+    /// Poll for async drag-drop import results. Call every frame.
+    pub fn poll_drop_import(&mut self) {
+        let rx = match self.drop_import_rx.take() {
+            Some(rx) => rx,
+            None => return,
+        };
+
+        let mut keep_rx = true;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                DropImportEvent::FileReady { path, info } => {
+                    let already = self.imported_files.iter().any(|f| f.path == path);
+                    if !already {
+                        self.imported_files.push(ImportedFile {
+                            path: path.clone(),
+                            info: info.clone(),
+                            selected: true,
+                        });
+                        // Select the first imported file
+                        if self.imported_files.len() == 1 {
+                            self.media_pool_index = 0;
+                            self.file_info = Some(info.clone());
+                            self.file_path = Some(path.clone());
+                            self.frame_count = info.frame_count as usize;
+                        }
+                        tracing::debug!("async imported: {} ({} total)", path, self.imported_files.len());
+                    }
+                }
+                DropImportEvent::Failed { path, error } => {
+                    tracing::warn!("async import failed: {}: {}", path, error);
+                }
+                DropImportEvent::Complete { imported, failed } => {
+                    keep_rx = false;
+                    self.drop_import_cancel = None;
+                    if imported > 0 {
+                        self.media_pool_index = self.imported_files.len().saturating_sub(imported);
+                        if let Some(f) = self.imported_files.get(self.media_pool_index) {
+                            self.file_info = Some(f.info.clone());
+                            self.file_path = Some(f.path.clone());
+                            self.frame_count = f.info.frame_count as usize;
+                        }
+                    }
+                    if failed > 0 {
+                        self.status_message = format!("Imported {} file(s), {} failed", imported, failed);
+                    } else {
+                        self.status_message = format!("Imported {} file(s)", imported);
+                    }
+                    tracing::info!("async drag-drop import complete: {} imported, {} failed", imported, failed);
+                }
+            }
+        }
+
+        if keep_rx {
+            self.drop_import_rx = Some(rx);
+        }
+    }
+
+    pub fn load_all_in_folder(&mut self, dir: &std::path::Path) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            let mut mcraw_paths: Vec<String> = entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().map_or(false, |ext| ext == "mcraw"))
+                .map(|p| p.to_string_lossy().to_string())
+                .collect();
+            mcraw_paths.sort();
+            let count = mcraw_paths.len();
+            for path in mcraw_paths {
+                self.load_file(path);
+            }
+            if count > 0 {
+                self.status_message = format!("Imported {} .mcraw files from {}", count, dir.display());
+            } else {
+                self.status_message = format!("No .mcraw files found in {}", dir.display());
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Media pool helpers
+    // -----------------------------------------------------------------------
+
+    pub fn focused_file_info(&self) -> Option<&McrawFileInfo> {
+        self.imported_files.get(self.media_pool_index).map(|f| &f.info)
+    }
+
+    pub fn toggle_media_pool_selection(&mut self) {
+        if let Some(f) = self.imported_files.get_mut(self.media_pool_index) {
+            f.selected = !f.selected;
+        }
+    }
+
+    pub fn add_selected_to_queue(&mut self) {
+        let selected: Vec<ImportedFile> = self.imported_files.iter()
+            .filter(|f| f.selected)
+            .cloned()
+            .collect();
+        if selected.is_empty() {
+            self.status_message = "No files selected - use Space to select, then a to add".to_string();
+            return;
+        }
+        let count = selected.len();
+        for imp in &selected {
+            let already = self.queue.iter().any(|q| q.path == imp.path);
+            if !already {
+                self.queue.push(QueuedFile {
+                    path: imp.path.clone(),
+                    info: imp.info.clone(),
+                    selected: true,
+                    status: QueueStatus::Waiting,
+                    progress: 0.0,
+                });
+            }
+        }
+        self.status_message = format!("Added {} file(s) to render queue", count);
+    }
+
+    pub fn add_all_to_queue(&mut self) {
+        if self.imported_files.is_empty() {
+            self.status_message = "No files in media pool".to_string();
+            return;
+        }
+        let count = self.imported_files.len();
+        for imp in &self.imported_files {
+            let already = self.queue.iter().any(|q| q.path == imp.path);
+            if !already {
+                self.queue.push(QueuedFile {
+                    path: imp.path.clone(),
+                    info: imp.info.clone(),
+                    selected: true,
+                    status: QueueStatus::Waiting,
+                    progress: 0.0,
+                });
+            }
+        }
+        self.status_message = format!("Added all {} file(s) to render queue", count);
+    }
+
+    pub fn remove_from_media_pool(&mut self) {
+        if self.imported_files.is_empty() {
+            return;
+        }
+        let name = self.imported_files[self.media_pool_index]
+            .path
+            .split(std::path::MAIN_SEPARATOR)
+            .last()
+            .unwrap_or("unknown")
+            .to_string();
+        self.imported_files.remove(self.media_pool_index);
+        if self.media_pool_index >= self.imported_files.len() && self.imported_files.len() > 0 {
+            self.media_pool_index = self.imported_files.len() - 1;
+        }
+        self.status_message = format!("Removed {} from media pool", name);
+    }
+
+    // -----------------------------------------------------------------------
+    // Queue helpers
+    // -----------------------------------------------------------------------
+
+    pub fn toggle_queue_selection(&mut self) {
+        if let Some(q) = self.queue.get_mut(self.queue_index) {
+            q.selected = !q.selected;
+        }
+    }
+
+    pub fn remove_from_queue(&mut self) {
+        if self.queue.is_empty() {
+            return;
+        }
+        let has_selected = self.queue.iter().any(|q| q.selected);
+        if has_selected {
+            self.queue.retain(|q| !q.selected);
+            self.status_message = "Removed selected items from queue".to_string();
+        } else {
+            let name = self.queue[self.queue_index]
+                .path
+                .split(std::path::MAIN_SEPARATOR)
+                .last()
+                .unwrap_or("unknown")
+                .to_string();
+            self.queue.remove(self.queue_index);
+            if self.queue_index >= self.queue.len() && self.queue.len() > 0 {
+                self.queue_index = self.queue.len() - 1;
+            }
+            self.status_message = format!("Removed {} from queue", name);
+        }
+        if self.queue_index >= self.queue.len() && !self.queue.is_empty() {
+            self.queue_index = self.queue.len() - 1;
+        }
+    }
+
+    pub fn clear_completed_queue(&mut self) {
+        let before = self.queue.len();
+        self.queue.retain(|q| !matches!(q.status, QueueStatus::Completed | QueueStatus::Failed(_)));
+        let removed = before - self.queue.len();
+        if removed > 0 {
+            self.status_message = format!("Cleared {} completed/failed item(s)", removed);
+        } else {
+            self.status_message = "No completed/failed items to clear".to_string();
+        }
+        if self.queue_index >= self.queue.len() && !self.queue.is_empty() {
+            self.queue_index = self.queue.len() - 1;
+        }
+    }
+
+    pub fn render_selected(&mut self) {
+        let selected_indices: Vec<usize> = self.queue.iter()
+            .enumerate()
+            .filter(|(_, q)| q.selected)
+            .map(|(i, _)| i)
+            .collect();
+        if selected_indices.is_empty() {
+            self.status_message = "No items selected in queue - use Space to select".to_string();
+            return;
+        }
+        self.status_message = format!("Starting render of {} selected file(s)...", selected_indices.len());
+        // Start the first one
+        if let Some(&first_idx) = selected_indices.first() {
+            self.current_rendering_index = Some(first_idx);
+            let q = &self.queue[first_idx];
+            self.file_info = Some(q.info.clone());
+            self.file_path = Some(q.path.clone());
+            self.frame_count = q.info.frame_count as usize;
+            self.start_export();
+        }
+    }
+
+    pub fn render_all(&mut self) {
+        if self.queue.is_empty() {
+            self.status_message = "Queue is empty".to_string();
+            return;
+        }
+        self.status_message = format!("Starting render of all {} file(s)...", self.queue.len());
+        for q in &mut self.queue {
+            q.selected = true;
+        }
+        // Start from the first item
+        self.current_rendering_index = Some(0);
+        if let Some(q) = self.queue.first() {
+            self.file_info = Some(q.info.clone());
+            self.file_path = Some(q.path.clone());
+            self.frame_count = q.info.frame_count as usize;
+            self.start_export();
+        }
+    }
+
+    fn start_next_queued_render(&mut self) {
+        // Find the next selected queue item that's Waiting
+        if let Some(current) = self.current_rendering_index {
+            let next_idx = (current + 1..self.queue.len())
+                .find(|&i| self.queue[i].selected && self.queue[i].status == QueueStatus::Waiting);
+            if let Some(idx) = next_idx {
+                self.current_rendering_index = Some(idx);
+                self.queue[idx].status = QueueStatus::Rendering;
+                let q = &self.queue[idx];
+                self.file_info = Some(q.info.clone());
+                self.file_path = Some(q.path.clone());
+                self.frame_count = q.info.frame_count as usize;
+                self.start_export();
+            } else {
+                // No more items to render
+                self.current_rendering_index = None;
+                let done = self.queue.iter().filter(|q| q.selected && q.status == QueueStatus::Completed).count();
+                let total = self.queue.iter().filter(|q| q.selected).count();
+                self.status_message = format!("Batch render complete: {}/{} done", done, total);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Export profile helpers
+    // -----------------------------------------------------------------------
 
     pub fn active_profile_is_8bit(&self) -> bool {
         match self.export_codec_family {
@@ -240,81 +820,49 @@ impl App {
         self.status_message = format!("Rate: {}", self.active_rate_control.name());
     }
 
-    pub fn active_encoder_label(&self) -> String {
-        match self.export_codec_family {
-            CodecFamily::HEVC => format!(
-                "{} {}",
-                self.hevc_profile.name(),
-                self.hardware_caps.best_hevc_encoder,
-            ),
-            _ => self.active_profile_name().to_string(),
-        }
-    }
-
     pub fn cycle_codec(&mut self, forward: bool) {
         self.export_codec_family = if forward {
             self.export_codec_family.next()
         } else {
             self.export_codec_family.prev()
         };
+        self.export_focus = ExportFocus::CodecFamily;
         self.status_message = format!("Codec: {}", self.export_codec_family.name());
     }
 
     pub fn cycle_profile(&mut self, forward: bool) {
         match self.export_codec_family {
             CodecFamily::ProRes => {
-                self.prores_profile = if forward {
-                    self.prores_profile.next()
-                } else {
-                    self.prores_profile.prev()
-                };
+                self.prores_profile = if forward { self.prores_profile.next() } else { self.prores_profile.prev() };
                 self.status_message = format!("Profile: {}", self.prores_profile.name());
             }
             CodecFamily::DNxHR => {
-                self.dnxhr_profile = if forward {
-                    self.dnxhr_profile.next()
-                } else {
-                    self.dnxhr_profile.prev()
-                };
+                self.dnxhr_profile = if forward { self.dnxhr_profile.next() } else { self.dnxhr_profile.prev() };
                 self.status_message = format!("Profile: {}", self.dnxhr_profile.name());
             }
             CodecFamily::HEVC => {
-                self.hevc_profile = if forward {
-                    self.hevc_profile.next()
-                } else {
-                    self.hevc_profile.prev()
-                };
+                self.hevc_profile = if forward { self.hevc_profile.next() } else { self.hevc_profile.prev() };
                 self.status_message = format!("Profile: {}", self.hevc_profile.name());
             }
             CodecFamily::H264 => {
-                self.h264_profile = if forward {
-                    self.h264_profile.next()
-                } else {
-                    self.h264_profile.prev()
-                };
+                self.h264_profile = if forward { self.h264_profile.next() } else { self.h264_profile.prev() };
                 self.status_message = format!("Profile: {}", self.h264_profile.name());
             }
             CodecFamily::AV1 => {
-                self.av1_profile = if forward {
-                    self.av1_profile.next()
-                } else {
-                    self.av1_profile.prev()
-                };
+                self.av1_profile = if forward { self.av1_profile.next() } else { self.av1_profile.prev() };
                 self.status_message = format!("Profile: {}", self.av1_profile.name());
             }
             CodecFamily::VP9 => {
-                self.vp9_profile = if forward {
-                    self.vp9_profile.next()
-                } else {
-                    self.vp9_profile.prev()
-                };
+                self.vp9_profile = if forward { self.vp9_profile.next() } else { self.vp9_profile.prev() };
                 self.status_message = format!("Profile: {}", self.vp9_profile.name());
             }
         }
+        self.export_focus = ExportFocus::Profile;
     }
 
     pub fn start_export(&mut self) {
         if self.is_exporting {
+            tracing::info!("export cancelled by user (was already exporting)");
             self.cancel_export();
             self.status_message = "Export cancelled. Press V again to restart.".to_string();
             return;
@@ -322,13 +870,15 @@ impl App {
         let info = match self.file_info.clone() {
             Some(i) => i,
             None => {
+                tracing::warn!("start_export called with no file loaded");
                 self.status_message = "No file loaded".to_string();
                 return;
             }
         };
 
         if self.export_transfer_function.requires_10bit() && self.active_profile_is_8bit() {
-            self.status_message = "Status: Cannot export Log/HDR to 8-bit codec".to_string();
+            tracing::warn!("export blocked: log/HDR to 8-bit codec not supported");
+            self.status_message = "Cannot export Log/HDR to 8-bit codec".to_string();
             return;
         }
 
@@ -352,6 +902,9 @@ impl App {
             suffix += 1;
         }
         let output_path = file.to_string_lossy().to_string();
+        tracing::info!("export starting: output={} codec={} profile={} rate={}",
+            output_path, self.export_codec_family.name(),
+            self.active_profile_name(), self.active_rate_control.name());
         let cs = self.export_color_space;
         let tf = self.export_transfer_function;
         let cf = self.export_codec_family;
@@ -364,11 +917,18 @@ impl App {
         let hevc_enc = self.hardware_caps.best_hevc_encoder.clone();
         let h264_enc = self.hardware_caps.best_h264_encoder.clone();
         let av1_enc = self.hardware_caps.best_av1_encoder.clone();
+        let prores_enc = self.hardware_caps.best_prores_encoder.clone();
 
         self.is_exporting = true;
         self.export_cancelled = false;
         self.export_progress = 0.0;
         self.export_start_time = Some(Instant::now());
+        // Mark queue item as Rendering
+        if let Some(idx) = self.current_rendering_index {
+            if idx < self.queue.len() {
+                self.queue[idx].status = QueueStatus::Rendering;
+            }
+        }
         let cancel_flag = Arc::new(AtomicBool::new(false));
         self.cancel_token = Some(cancel_flag.clone());
         let (tx, rx) = mpsc::channel::<ExportEvent>();
@@ -391,14 +951,9 @@ impl App {
         std::thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 crate::pipeline::run_export(
-                    info,
-                    output_path,
-                    progress_cb,
-                    cancel_flag,
+                    info, output_path, progress_cb, cancel_flag,
                     cs, tf, cf, pp, dp, hp, h4p, ap, vp,
-                    hevc_enc,
-                    h264_enc,
-                    av1_enc,
+                    hevc_enc, h264_enc, av1_enc, prores_enc,
                     rate_control,
                 )
             }));
@@ -407,15 +962,59 @@ impl App {
                     let _ = tx.send(ExportEvent::Done(export_result));
                 }
                 Err(panic) => {
-                    log::error!("Export thread panicked: {:?}", panic);
+                    tracing::error!("export thread panicked: {:?}", panic);
                     let _ = tx.send(ExportEvent::Done(Err(anyhow::anyhow!("Export thread panicked"))));
                 }
             }
         });
     }
 
+    pub fn remove_selected_from_media_pool(&mut self) {
+        let has_selected = self.imported_files.iter().any(|f| f.selected);
+        if has_selected {
+            let count = self.imported_files.iter().filter(|f| f.selected).count();
+            self.imported_files.retain(|f| !f.selected);
+            if self.media_pool_index >= self.imported_files.len() && !self.imported_files.is_empty() {
+                self.media_pool_index = self.imported_files.len() - 1;
+            }
+            self.status_message = format!("Removed {} selected file(s) from media pool", count);
+        } else {
+            self.status_message = "No files selected - use Space to select".to_string();
+        }
+    }
+
+    pub fn set_export_folder(&mut self, folder: std::path::PathBuf) {
+        self.export_folder = Some(folder);
+        self.status_message = format!("Export folder set");
+    }
+
+    pub fn toggle_favourite_folder(&mut self, folder: std::path::PathBuf) {
+        if let Some(pos) = self.favourite_folders.iter().position(|f| f == &folder) {
+            self.favourite_folders.remove(pos);
+            self.status_message = "Removed from favourites".to_string();
+        } else {
+            self.favourite_folders.push(folder);
+            self.status_message = "Added to favourites".to_string();
+        }
+    }
+
+    pub fn import_selected_from_browser(&mut self) {
+        if let Some(entry) = self.browser.selected_entry() {
+            if entry.name.to_lowercase().ends_with(".mcraw") {
+                let path = entry.path.to_string_lossy().to_string();
+                self.load_file(path);
+                self.show_browser = false;
+            } else {
+                self.status_message = "Selected file is not a .mcraw file".to_string();
+            }
+        } else {
+            self.status_message = "No file selected in browser".to_string();
+        }
+    }
+
     pub fn cancel_export(&mut self) {
         if let Some(ref token) = self.cancel_token {
+            tracing::info!("export cancellation requested");
             token.store(true, Ordering::Relaxed);
             self.export_cancelled = true;
             self.status_message = "Cancelling export...".to_string();
@@ -432,14 +1031,36 @@ impl App {
             match event {
                 ExportEvent::Progress(pct) => {
                     self.export_progress = pct;
+                    if let Some(q) = self.queue.iter_mut().find(|q| matches!(q.status, QueueStatus::Rendering)) {
+                        q.progress = pct;
+                    }
                 }
                 ExportEvent::Done(result) => {
                     self.is_exporting = false;
                     keep_rx = false;
                     self.cancel_token = None;
+                    // Mark the currently rendering item
+                    if let Some(idx) = self.current_rendering_index {
+                        if idx < self.queue.len() {
+                            self.queue[idx].progress = 100.0;
+                            if self.export_cancelled {
+                                self.queue[idx].status = QueueStatus::Waiting;
+                            } else {
+                                match &result {
+                                    Ok(()) => {
+                                        self.queue[idx].status = QueueStatus::Completed;
+                                    }
+                                    Err(e) => {
+                                        self.queue[idx].status = QueueStatus::Failed(e.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if self.export_cancelled {
                         self.status_message = "Export cancelled".to_string();
                         self.export_cancelled = false;
+                        self.current_rendering_index = None;
                     } else {
                         let elapsed = self.export_start_time
                             .take()
@@ -449,14 +1070,18 @@ impl App {
                         let secs = elapsed.as_secs() % 60;
                         match result {
                             Ok(()) => {
+                                tracing::info!("export completed in {:02}m {:02}s", mins, secs);
                                 self.status_message = format!(
                                     "Video export completed ({:02}m {:02}s)", mins, secs
                                 );
                             }
                             Err(e) => {
+                                tracing::error!("export failed: {}", e);
                                 self.status_message = format!("Export failed: {}", e);
                             }
                         }
+                        // Auto-start next queued item
+                        self.start_next_queued_render();
                     }
                     self.export_start_time = None;
                 }
@@ -473,22 +1098,44 @@ impl App {
         self.status_message = "Export job added".to_string();
     }
 
+    // -----------------------------------------------------------------------
+    // Browser navigation
+    // -----------------------------------------------------------------------
+
     pub fn select_file(&mut self) {
         let entry_data = self.browser.selected_entry().map(|e| (e.is_dir, e.name.clone(), e.path.clone()));
         if let Some((is_dir, name, path)) = entry_data {
             if is_dir {
                 self.browser.enter();
-                self.list_state.select(Some(0));
                 self.status_message = format!("Entered: {}", name);
             } else if name.ends_with(".mcraw") {
                 let path_str = path.to_string_lossy().into_owned();
-                self.load_file(path_str);
-                if self.file_info.is_some() {
-                    self.screen = Screen::Info;
-                }
+                let folder = path.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+                let all_in_folder = self.scan_mcraw_files_in_folder(&folder);
+                self.import_popup = ImportPopupState::DroppedFiles {
+                    files: vec![path_str.clone()],
+                    folder,
+                    all_in_folder,
+                };
             } else {
                 self.status_message = format!("Cannot open: {} (not a .mcraw file)", name);
             }
+        }
+    }
+
+    /// Scan a folder for all .mcraw files and return sorted paths
+    pub fn scan_mcraw_files_in_folder(&self, folder: &str) -> Vec<String> {
+        if let Ok(entries) = std::fs::read_dir(folder) {
+            let mut files: Vec<String> = entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().map_or(false, |ext| ext.to_ascii_lowercase() == "mcraw"))
+                .map(|p| p.to_string_lossy().to_string())
+                .collect();
+            files.sort();
+            files
+        } else {
+            Vec::new()
         }
     }
 
@@ -496,18 +1143,194 @@ impl App {
         match direction {
             BrowserDirection::Up => {
                 self.browser.navigate_up();
-                self.list_state.select(Some(self.browser.selected_index));
             }
             BrowserDirection::Down => {
                 self.browser.navigate_down();
-                self.list_state.select(Some(self.browser.selected_index));
             }
             BrowserDirection::Enter => self.select_file(),
             BrowserDirection::GoUp => {
                 self.browser.go_up();
-                self.list_state.select(Some(0));
             }
             BrowserDirection::ToggleHidden => self.browser.toggle_hidden(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Focus cycling
+    // -----------------------------------------------------------------------
+
+    pub fn cycle_focus(&mut self) {
+        self.focus_target = match self.focus_target {
+            FocusTarget::MediaPool => FocusTarget::Preview,
+            FocusTarget::Preview => FocusTarget::ExportSettings,
+            FocusTarget::ExportSettings => FocusTarget::Queue,
+            FocusTarget::Queue => FocusTarget::MediaPool,
+        };
+        let label = match self.focus_target {
+            FocusTarget::MediaPool => "Media Pool",
+            FocusTarget::Preview => "Preview",
+            FocusTarget::ExportSettings => "Export Settings",
+            FocusTarget::Queue => "Render Queue",
+        };
+        self.status_message = format!("Focus: {}", label);
+    }
+
+    pub fn set_focus(&mut self, target: FocusTarget) {
+        self.focus_target = target;
+        let label = match target {
+            FocusTarget::MediaPool => "Media Pool",
+            FocusTarget::Preview => "Preview",
+            FocusTarget::ExportSettings => "Export Settings",
+            FocusTarget::Queue => "Render Queue",
+        };
+        self.status_message = format!("Focus: {}", label);
+    }
+
+}
+
+fn execute_click_action(app: &mut App, action: ClickAction) {
+    match action {
+        ClickAction::ToggleBrowser => {
+            app.show_browser = !app.show_browser;
+            app.status_message = if app.show_browser { "Browser shown" } else { "Browser hidden" }.to_string();
+        }
+        ClickAction::ToggleFileSelection(i) => {
+            if let Some(f) = app.imported_files.get_mut(i) {
+                f.selected = !f.selected;
+            }
+        }
+        ClickAction::ToggleQueueSelection(i) => {
+            if let Some(q) = app.queue.get_mut(i) {
+                q.selected = !q.selected;
+            }
+        }
+        ClickAction::SelectMediaPoolItem(i) => {
+            if i < app.imported_files.len() {
+                app.media_pool_index = i;
+                app.set_focus(FocusTarget::MediaPool);
+            }
+        }
+        ClickAction::SelectQueueItem(i) => {
+            if i < app.queue.len() {
+                app.queue_index = i;
+                app.set_focus(FocusTarget::Queue);
+            }
+        }
+        ClickAction::FocusMediaPool => {
+            app.set_focus(FocusTarget::MediaPool);
+        }
+        ClickAction::FocusQueue => {
+            app.set_focus(FocusTarget::Queue);
+        }
+        ClickAction::FocusExport => {
+            app.set_focus(FocusTarget::ExportSettings);
+        }
+        ClickAction::FocusPreview => {
+            app.set_focus(FocusTarget::Preview);
+        }
+        ClickAction::AddSelectedToQueue => app.add_selected_to_queue(),
+        ClickAction::AddAllToQueue => app.add_all_to_queue(),
+        ClickAction::RenderSelected => app.render_selected(),
+        ClickAction::RenderAll => app.render_all(),
+        ClickAction::ClearQueue => app.clear_completed_queue(),
+        ClickAction::CycleCodec => {
+            app.set_focus(FocusTarget::ExportSettings);
+            app.cycle_codec(true);
+        }
+        ClickAction::CycleGamut => {
+            app.set_focus(FocusTarget::ExportSettings);
+            app.export_focus = ExportFocus::ColorSpace;
+            app.export_color_space = app.export_color_space.next();
+            app.status_message = format!("Gamut: {}", app.export_color_space.name());
+        }
+        ClickAction::CycleTransfer => {
+            app.set_focus(FocusTarget::ExportSettings);
+            app.export_focus = ExportFocus::TransferFunction;
+            app.export_transfer_function = app.export_transfer_function.next();
+            app.status_message = format!("Transfer: {}", app.export_transfer_function.name());
+        }
+        ClickAction::CycleProfile => {
+            app.set_focus(FocusTarget::ExportSettings);
+            app.cycle_profile(true);
+        }
+        ClickAction::CycleRate => {
+            app.set_focus(FocusTarget::ExportSettings);
+            app.export_focus = ExportFocus::RateControl;
+            app.cycle_rate_control();
+        }
+        ClickAction::ImportOption1 => {
+            let files = if let ImportPopupState::DroppedFiles { files, .. } = &app.import_popup {
+                files.clone()
+            } else {
+                Vec::new()
+            };
+            if !files.is_empty() {
+                let count = files.len();
+                app.status_message = format!("Importing {} file(s)...", count);
+                let (imported, failed) = app.load_files_batch(&files);
+                if failed > 0 {
+                    app.status_message = format!("Imported {} file(s), {} failed", imported, failed);
+                } else {
+                    app.status_message = format!("Imported {} file(s)", imported);
+                }
+            }
+            app.import_popup = ImportPopupState::Hidden;
+            app.show_browser = false;
+        }
+        ClickAction::ImportOption2 => {
+            let all_in_folder = if let ImportPopupState::DroppedFiles { all_in_folder, .. } = &app.import_popup {
+                all_in_folder.clone()
+            } else {
+                Vec::new()
+            };
+            if !all_in_folder.is_empty() {
+                let count = all_in_folder.len();
+                app.status_message = format!("Importing all {} file(s) from folder...", count);
+                let (imported, failed) = app.load_files_batch(&all_in_folder);
+                if failed > 0 {
+                    app.status_message = format!("Imported {} file(s), {} failed", imported, failed);
+                } else {
+                    app.status_message = format!("Imported all {} file(s)", imported);
+                }
+            }
+            app.import_popup = ImportPopupState::Hidden;
+            app.show_browser = false;
+        }
+        ClickAction::ClosePopup => { app.import_popup = ImportPopupState::Hidden; }
+        ClickAction::ToggleHelp => { app.show_help = !app.show_help; }
+        ClickAction::BrowserNavigate(i) => {
+            let now = Instant::now();
+            let was_same = app.last_browser_click.as_ref().map(|&(_, idx)| idx == i).unwrap_or(false);
+            let is_double = app.last_browser_click.as_ref().map(|&(t, _)| now.duration_since(t).as_millis() < 400).unwrap_or(false);
+
+            app.browser.selected_index = i;
+
+            if was_same && is_double {
+                app.select_file();
+                app.last_browser_click = None;
+            } else {
+                app.last_browser_click = Some((now, i));
+            }
+        }
+        ClickAction::BrowserSelectAndEnter(i) => {
+            let now = Instant::now();
+            let was_same = app.last_browser_click.as_ref().map(|&(_, idx)| idx == i).unwrap_or(false);
+            let is_double = app.last_browser_click.as_ref().map(|&(t, _)| now.duration_since(t).as_millis() < 400).unwrap_or(false);
+
+            app.browser.selected_index = i;
+
+            if was_same && is_double {
+                app.select_file();
+                app.last_browser_click = None;
+            } else {
+                app.last_browser_click = Some((now, i));
+            }
+        }
+        ClickAction::BrowserEnter => {
+            app.navigate_browser(BrowserDirection::Enter);
+        }
+        ClickAction::BrowserGoUp => {
+            app.navigate_browser(BrowserDirection::GoUp);
         }
     }
 }
@@ -522,6 +1345,7 @@ pub enum BrowserDirection {
 
 pub async fn run(args: Cli) -> Result<()> {
     let mut app = App::new();
+    tracing::info!("app initialized: hardware_caps={:?}", app.hardware_caps);
 
     match args.resolve() {
         ResolvedCli::Command(CliCommands::Open { file }) => {
@@ -532,51 +1356,28 @@ pub async fn run(args: Cli) -> Result<()> {
         ResolvedCli::Command(CliCommands::Info { file }) => {
             let path = match file {
                 Some(p) => p,
-                None => {
-                    // eprintln!("Error: No file specified. Use: mcraw-tui info -f <path>");
-                    return Err(anyhow::anyhow!("No file specified"));
-                }
+                None => return Err(anyhow::anyhow!("No file specified")),
             };
             match McrawFileInfo::from_path(&path) {
                 Ok(mut info) => {
                     info.enhance_with_decoder();
-                    // let display = crate::metadata::format_metadata_for_display(&info);
-                    // for line in display {
-                    //     println!("{}", line);
-                    // }
                     return Ok(());
                 }
-                Err(e) => {
-                    // eprintln!("Error: {}", e);
-                    return Err(e);
-                }
+                Err(e) => return Err(e),
             }
         }
-        ResolvedCli::Command(CliCommands::Export {
-            file,
-            format,
-            output,
-        }) => {
+        ResolvedCli::Command(CliCommands::Export { file, format, output }) => {
             if file.is_none() {
-                // eprintln!("Error: No file specified. Use: mcraw-tui export -f <path>");
                 return Err(anyhow::anyhow!("No file specified"));
             }
             if let Err(e) = Cli::validate_export_format(&format) {
                 anyhow::bail!("{}", e);
             }
             let format = match format.to_lowercase().as_str() {
-                "dng" => OutputFormat::DNG {
-                    output_path: std::path::PathBuf::from(&output),
-                },
-                "prores" => OutputFormat::ProRes {
-                    output_path: std::path::PathBuf::from(&output),
-                },
-                "h264" => OutputFormat::H264 {
-                    output_path: std::path::PathBuf::from(&output),
-                },
-                "hevc" => OutputFormat::HEVC {
-                    output_path: std::path::PathBuf::from(&output),
-                },
+                "dng" => OutputFormat::DNG { output_path: std::path::PathBuf::from(&output) },
+                "prores" => OutputFormat::ProRes { output_path: std::path::PathBuf::from(&output) },
+                "h264" => OutputFormat::H264 { output_path: std::path::PathBuf::from(&output) },
+                "hevc" => OutputFormat::HEVC { output_path: std::path::PathBuf::from(&output) },
                 _ => anyhow::bail!("Invalid format: {}", format),
             };
 
@@ -585,14 +1386,8 @@ pub async fn run(args: Cli) -> Result<()> {
             job.status = EncodeStatus::Running;
 
             match encoder.start_job(job.clone()).await {
-                Ok(()) => {
-                    job.status = EncodeStatus::Completed;
-                    // println!("Export (stub) completed: {:?}", job.output_path().map(|p| p.to_string_lossy()));
-                }
-                Err(e) => {
-                    job.status = EncodeStatus::Failed(e.to_string());
-                    // eprintln!("Export failed: {}", e);
-                }
+                Ok(()) => { job.status = EncodeStatus::Completed; }
+                Err(e) => { job.status = EncodeStatus::Failed(e.to_string()); }
             }
             return Ok(());
         }
@@ -605,10 +1400,16 @@ pub async fn run(args: Cli) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
     terminal.clear()?;
-    crossterm::execute!(std::io::stdout(), EnterAlternateScreen)?;
+    crossterm::execute!(
+        std::io::stdout(),
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture,
+    )?;
     terminal.hide_cursor()?;
 
     enable_raw_mode()?;
+    tracing::info!("terminal initialized: alternate_screen, bracketed_paste, mouse_capture enabled");
 
     let event_loop_running = Arc::new(AtomicBool::new(true));
     let elr = event_loop_running.clone();
@@ -619,36 +1420,48 @@ pub async fn run(args: Cli) -> Result<()> {
     });
 
     let encoder = Encoder::new();
+    tracing::info!("entering main event loop");
 
     while app.running {
         app.poll_export();
+        app.poll_drop_import();
         app.browser.try_refresh();
 
-        terminal.draw(|frame| ui::render(frame, &app))?;
+        let mut click_regions = Vec::new();
+        terminal.draw(|frame| ui::render(frame, &app, &mut click_regions))?;
 
-        if let Ok(event) = rx.try_recv() {
-            handle_event(&mut app, event, &encoder).await;
+        // Drain ALL pending events each frame — critical for drag-drop where
+        // the terminal sends a burst of events that must be consumed together.
+        // Processing only one per frame causes input lag and wrong key events
+        // leaking through between paste characters.
+        while let Ok(event) = rx.try_recv() {
+            handle_event(&mut app, event, &encoder, &click_regions).await;
         }
 
-        time::sleep(Duration::from_millis(33)).await;
+        time::sleep(Duration::from_millis(16)).await;
     }
 
-    // Signal event loop to stop and drop the receiver so the sender unblocks.
     event_loop_running.store(false, Ordering::Relaxed);
     drop(rx);
-    // Brief yield so the event-loop task can observe the flag and exit.
     tokio::task::yield_now().await;
 
     disable_raw_mode()?;
     terminal.show_cursor()?;
-    crossterm::execute!(std::io::stdout(), LeaveAlternateScreen)?;
+    crossterm::execute!(
+        std::io::stdout(),
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+    )?;
+    tracing::info!("terminal shutdown: raw_mode disabled, screen restored");
 
     Ok(())
 }
 
 async fn event_loop(tx: mpsc::Sender<Event>, running: Arc<AtomicBool>) {
+    tracing::debug!("event_loop started");
     while running.load(Ordering::Relaxed) {
-        if crossterm::event::poll(Duration::from_millis(16)).unwrap() {
+        if crossterm::event::poll(Duration::from_millis(8)).unwrap() {
             if let Ok(event) = crossterm::event::read() {
                 if tx.send(event).is_err() {
                     break;
@@ -658,19 +1471,469 @@ async fn event_loop(tx: mpsc::Sender<Event>, running: Arc<AtomicBool>) {
     }
 }
 
-async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder) {
+// ---------------------------------------------------------------------------
+// Drag-drop path parsing helpers
+// ---------------------------------------------------------------------------
+
+/// Strip surrounding quotes from a path string (handles nested quotes).
+fn strip_surrounding_quotes(s: &str) -> String {
+    let s = s.trim();
+    if s.len() >= 2 {
+        let first = s.chars().next().unwrap();
+        let last = s.chars().last().unwrap();
+        if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+            return s[1..s.len() - 1].to_string();
+        }
+    }
+    s.to_string()
+}
+
+/// Expand ~ to home directory.
+fn expand_tilde(s: &str) -> String {
+    if s == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home.to_string_lossy().to_string();
+        }
+    }
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest).to_string_lossy().to_string();
+        }
+    }
+    s.to_string()
+}
+
+/// Decode file:// URIs to native paths.
+/// Handles file:///C:/... (Windows) and file:///home/... (Unix).
+fn decode_file_uri(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix("file:///") {
+        // file:///C:/path → C:/path (Windows) or file:///home → /home (Unix)
+        if cfg!(windows) && rest.len() >= 2 {
+            let chars: Vec<char> = rest.chars().collect();
+            if chars.len() >= 2 && chars[0].is_ascii_alphabetic() && chars[1] == ':' {
+                return rest.to_string();
+            }
+        }
+        // Unix: file:///home/user → /home/user
+        return format!("/{}", rest);
+    }
+    if let Some(rest) = s.strip_prefix("file://") {
+        // file://hostname/path (network paths) — strip hostname
+        if let Some(slash_pos) = rest.find('/') {
+            return rest[slash_pos..].to_string();
+        }
+        return rest.to_string();
+    }
+    s.to_string()
+}
+
+/// Percent-decode URI-encoded characters (e.g. %20 → space, %C3%A9 → é).
+fn percent_decode_path(s: &str) -> String {
+    if !s.contains('%') {
+        return s.to_string();
+    }
+    match percent_decode_str(s).decode_utf8() {
+        Ok(decoded) => decoded.into_owned(),
+        Err(_) => s.to_string(), // Fall back to original if decoding fails
+    }
+}
+
+/// Normalize path separators for the current platform.
+fn normalize_path(s: &str) -> String {
+    if cfg!(windows) {
+        // Preserve UNC paths (\\server\share)
+        if s.starts_with("\\\\") {
+            return s.to_string();
+        }
+        // Convert forward slashes to backslashes
+        s.replace('/', "\\")
+    } else {
+        s.to_string()
+    }
+}
+
+/// Validate and canonicalize a path. Returns None if path doesn't exist.
+fn validate_path(s: &str) -> Option<String> {
+    let path = std::path::Path::new(s);
+
+    // Check if path exists
+    if !path.exists() {
+        tracing::debug!("path validation: does not exist: {}", s);
+        return None;
+    }
+
+    // Try to canonicalize (resolves symlinks and normalizes)
+    // Fall back to original if canonicalization fails
+    match path.canonicalize() {
+        Ok(canonical) => Some(canonical.to_string_lossy().to_string()),
+        Err(_) => {
+            tracing::debug!("path validation: canonicalize failed, using original: {}", s);
+            Some(s.to_string())
+        }
+    }
+}
+
+async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_regions: &[ui::ClickRegion]) {
     match event {
+        // -------------------------------------------------------------------
+        // Drag & Drop: pasted file paths
+        // -------------------------------------------------------------------
+        Event::Paste(pasted) => {
+            tracing::trace!("drag-drop: raw pasted bytes={:?} len={}", pasted.as_bytes(), pasted.len());
+
+            let paths: Vec<String> = pasted
+                .lines()
+                .filter_map(|line| {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        return None;
+                    }
+
+                    // Strip surrounding quotes (handles "path with spaces")
+                    let stripped = strip_surrounding_quotes(line);
+
+                    // Expand ~ to home directory
+                    let expanded = expand_tilde(&stripped);
+
+                    // Decode file:// URI if present
+                    let decoded = decode_file_uri(&expanded);
+
+                    // Percent-decode URI-encoded characters (e.g. %20 → space, %C3%A9 → é)
+                    let percent_decoded = percent_decode_path(&decoded);
+
+                    // Platform-specific path normalization
+                    let normalized = normalize_path(&percent_decoded);
+
+                    // Validate path exists and canonicalize
+                    validate_path(&normalized)
+                })
+                .collect();
+
+            tracing::trace!("drag-drop: parsed {} paths: {:?}", paths.len(), paths);
+
+            if paths.is_empty() {
+                app.status_message = "Drag-drop: no valid paths received".to_string();
+                return;
+            }
+
+            // Separate .mcraw files and directories
+            let mut mcraw_files: Vec<String> = Vec::new();
+            let mut folders: Vec<String> = Vec::new();
+
+            for p in &paths {
+                let path = std::path::Path::new(p);
+                if path.is_dir() {
+                    folders.push(p.clone());
+                } else if p.to_lowercase().ends_with(".mcraw") {
+                    mcraw_files.push(p.clone());
+                }
+            }
+
+            // If folders were dropped, scan them for .mcraw files
+            for folder in &folders {
+                if let Ok(entries) = std::fs::read_dir(folder) {
+                    let mut files: Vec<String> = entries
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.path())
+                        .filter(|p| p.extension().map_or(false, |ext| ext.to_ascii_lowercase() == "mcraw"))
+                        .map(|p| p.to_string_lossy().to_string())
+                        .collect();
+                    files.sort();
+                    mcraw_files.extend(files);
+                }
+            }
+
+            // Deduplicate while preserving order
+            let mut seen = std::collections::HashSet::new();
+            mcraw_files.retain(|f| seen.insert(f.clone()));
+
+            tracing::info!("drag-drop: {} .mcraw files, {} folders", mcraw_files.len(), folders.len());
+
+            if mcraw_files.is_empty() {
+                app.status_message = "Drag-drop: no .mcraw files found in dropped items".to_string();
+                return;
+            }
+
+            // Trigger visual feedback
+            app.drop_highlight = Some(Instant::now());
+
+            // Smart import: instant for small batches, async for larger ones
+            // Threshold: <= 3 files = async (smooth UI), > 3 = popup for confirmation
+            const ASYNC_THRESHOLD: usize = 3;
+
+            if mcraw_files.len() <= ASYNC_THRESHOLD && folders.is_empty() {
+                // Small batch: use async import for smooth UI
+                app.start_async_import(mcraw_files);
+            } else {
+                // Large batch or folders: show import popup
+                // Check if single file is alone in its folder
+                if mcraw_files.len() == 1 {
+                    let file = &mcraw_files[0];
+                    let folder = std::path::Path::new(file)
+                        .parent()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|| ".".to_string());
+
+                    let all_in_folder: Vec<String> = if let Ok(entries) = std::fs::read_dir(&folder) {
+                        let mut files: Vec<String> = entries
+                            .filter_map(|e| e.ok())
+                            .map(|e| e.path())
+                            .filter(|p| p.extension().map_or(false, |ext| ext.to_ascii_lowercase() == "mcraw"))
+                            .map(|p| p.to_string_lossy().to_string())
+                            .collect();
+                        files.sort();
+                        files
+                    } else {
+                        Vec::new()
+                    };
+
+                    // Only skip popup if this is truly the only .mcraw in the folder
+                    if all_in_folder.len() == 1 {
+                        app.start_async_import(mcraw_files);
+                        return;
+                    }
+                }
+
+                // Determine the primary folder for the import popup
+                let folder = if !folders.is_empty() {
+                    folders[0].clone()
+                } else {
+                    std::path::Path::new(&mcraw_files[0])
+                        .parent()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|| ".".to_string())
+                };
+
+                // Scan ALL .mcraw files in the primary folder
+                let all_in_folder: Vec<String> = if let Ok(entries) = std::fs::read_dir(&folder) {
+                    let mut files: Vec<String> = entries
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.path())
+                        .filter(|p| p.extension().map_or(false, |ext| ext.to_ascii_lowercase() == "mcraw"))
+                        .map(|p| p.to_string_lossy().to_string())
+                        .collect();
+                    files.sort();
+                    files
+                } else {
+                    Vec::new()
+                };
+
+                // Show import popup
+                app.import_popup = ImportPopupState::DroppedFiles {
+                    files: mcraw_files,
+                    folder,
+                    all_in_folder,
+                };
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // Mouse events
+        // -------------------------------------------------------------------
+        Event::Mouse(mouse_event) => {
+            use crossterm::event::{MouseEventKind, MouseButton};
+
+            // Allow mouse on import popup (has its own click regions)
+            if app.import_popup != ImportPopupState::Hidden {
+                let col = mouse_event.column;
+                let row = mouse_event.row;
+                match mouse_event.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        for region in click_regions.iter().rev() {
+                            if col >= region.area.x && col < region.area.x + region.area.width
+                                && row >= region.area.y && row < region.area.y + region.area.height {
+                                match &region.action {
+                                    ClickAction::ImportOption1 | ClickAction::ImportOption2 => {
+                                        execute_click_action(app, region.action.clone());
+                                    }
+                                    _ => {}
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                return;
+            }
+
+            // Block mouse events when other overlays are active
+            if app.show_full_info || app.show_help {
+                return;
+            }
+
+            match mouse_event.kind {
+                MouseEventKind::ScrollUp => {
+                    if app.show_browser {
+                        if app.browser.selected_index > 0 { app.browser.selected_index -= 1; }
+                    } else {
+                        match app.focus_target {
+                            FocusTarget::MediaPool => { if app.media_pool_index > 0 { app.media_pool_index -= 1; } }
+                            FocusTarget::Queue => { if app.queue_index > 0 { app.queue_index -= 1; } }
+                            FocusTarget::ExportSettings => {
+                                // Cycle VALUES of the currently focused setting
+                                match app.export_focus {
+                                    ExportFocus::CodecFamily => app.cycle_codec(false),
+                                    ExportFocus::ColorSpace => {
+                                        app.export_color_space = app.export_color_space.prev();
+                                        app.status_message = format!("Gamut: {}", app.export_color_space.name());
+                                    }
+                                    ExportFocus::TransferFunction => {
+                                        app.export_transfer_function = app.export_transfer_function.prev();
+                                        app.status_message = format!("Transfer: {}", app.export_transfer_function.name());
+                                    }
+                                    ExportFocus::Profile => app.cycle_profile(false),
+                                    ExportFocus::RateControl => {
+                                        app.active_rate_control = app.active_rate_control.prev();
+                                        app.status_message = format!("Rate: {}", app.active_rate_control.name());
+                                    }
+                                }
+                            }
+                            FocusTarget::Preview => {}
+                        }
+                    }
+                }
+                MouseEventKind::ScrollDown => {
+                    if app.show_browser {
+                        let len = app.browser.entries.len();
+                        if len > 0 { app.browser.selected_index = (app.browser.selected_index + 1).min(len - 1); }
+                    } else {
+                        match app.focus_target {
+                            FocusTarget::MediaPool => {
+                                let len = app.imported_files.len();
+                                if len > 0 { app.media_pool_index = (app.media_pool_index + 1).min(len - 1); }
+                            }
+                            FocusTarget::Queue => {
+                                let len = app.queue.len();
+                                if len > 0 { app.queue_index = (app.queue_index + 1).min(len - 1); }
+                            }
+                            FocusTarget::ExportSettings => {
+                                // Cycle VALUES of the currently focused setting
+                                match app.export_focus {
+                                    ExportFocus::CodecFamily => app.cycle_codec(true),
+                                    ExportFocus::ColorSpace => {
+                                        app.export_color_space = app.export_color_space.next();
+                                        app.status_message = format!("Gamut: {}", app.export_color_space.name());
+                                    }
+                                    ExportFocus::TransferFunction => {
+                                        app.export_transfer_function = app.export_transfer_function.next();
+                                        app.status_message = format!("Transfer: {}", app.export_transfer_function.name());
+                                    }
+                                    ExportFocus::Profile => app.cycle_profile(true),
+                                    ExportFocus::RateControl => app.cycle_rate_control(),
+                                }
+                            }
+                            FocusTarget::Preview => {}
+                        }
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let col = mouse_event.column;
+                    let row = mouse_event.row;
+                    for region in click_regions.iter().rev() {
+                        if col >= region.area.x && col < region.area.x + region.area.width
+                            && row >= region.area.y && row < region.area.y + region.area.height {
+                            execute_click_action(app, region.action.clone());
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // Keyboard events
+        // -------------------------------------------------------------------
         Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
-            // Ctrl-C always quits
             if let crossterm::event::KeyCode::Char('c') = key_event.code {
                 if key_event.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+                    tracing::info!("ctrl+c received, quitting");
                     app.running = false;
                     return;
                 }
             }
 
+            tracing::debug!("key event: code={:?} modifiers={:?}", key_event.code, key_event.modifiers);
+
             // ----------------------------------------------------------------
-            // Custom rate-control inline editing — intercepts ALL keystrokes
+            // Import popup
+            // ----------------------------------------------------------------
+            if app.import_popup != ImportPopupState::Hidden {
+                let has_option2 = if let ImportPopupState::DroppedFiles { files, all_in_folder, .. } = &app.import_popup {
+                    all_in_folder.len() > files.len()
+                } else {
+                    false
+                };
+
+                match key_event.code {
+                    crossterm::event::KeyCode::Char('1') => {
+                        let files = if let ImportPopupState::DroppedFiles { files, .. } = &app.import_popup {
+                            files.clone()
+                        } else {
+                            Vec::new()
+                        };
+                        if !files.is_empty() {
+                            let count = files.len();
+                            app.status_message = format!("Importing {} file(s)...", count);
+                            let (imported, failed) = app.load_files_batch(&files);
+                            if failed > 0 {
+                                app.status_message = format!("Imported {} file(s), {} failed", imported, failed);
+                            } else {
+                                app.status_message = format!("Imported {} file(s)", imported);
+                            }
+                        }
+                        app.import_popup = ImportPopupState::Hidden;
+                        app.show_browser = false;
+                    }
+                    crossterm::event::KeyCode::Char('2') if has_option2 => {
+                        let all_in_folder = if let ImportPopupState::DroppedFiles { all_in_folder, .. } = &app.import_popup {
+                            all_in_folder.clone()
+                        } else {
+                            Vec::new()
+                        };
+                        if !all_in_folder.is_empty() {
+                            let count = all_in_folder.len();
+                            app.status_message = format!("Importing all {} file(s) from folder...", count);
+                            let (imported, failed) = app.load_files_batch(&all_in_folder);
+                            if failed > 0 {
+                                app.status_message = format!("Imported {} file(s), {} failed", imported, failed);
+                            } else {
+                                app.status_message = format!("Imported all {} file(s)", imported);
+                            }
+                        }
+                        app.import_popup = ImportPopupState::Hidden;
+                        app.show_browser = false;
+                    }
+                    crossterm::event::KeyCode::Enter => {
+                        let files = if let ImportPopupState::DroppedFiles { files, .. } = &app.import_popup {
+                            files.clone()
+                        } else {
+                            Vec::new()
+                        };
+                        if !files.is_empty() {
+                            let count = files.len();
+                            app.status_message = format!("Importing {} file(s)...", count);
+                            let (imported, failed) = app.load_files_batch(&files);
+                            if failed > 0 {
+                                app.status_message = format!("Imported {} file(s), {} failed", imported, failed);
+                            } else {
+                                app.status_message = format!("Imported {} file(s)", imported);
+                            }
+                        }
+                        app.import_popup = ImportPopupState::Hidden;
+                        app.show_browser = false;
+                    }
+                    crossterm::event::KeyCode::Esc => {
+                        app.import_popup = ImportPopupState::Hidden;
+                    }
+                    _ => {}
+                }
+                return;
+            }
+
+            // ----------------------------------------------------------------
+            // Custom rate inline editing
             // ----------------------------------------------------------------
             if app.is_editing_custom_rate {
                 match key_event.code {
@@ -706,80 +1969,108 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder) {
                     '?' => {
                         app.show_help = !app.show_help;
                     }
-                    'i' => {
-                        // When Custom rate is active on the Export screen, 'i' toggles edit mode
-                        if app.screen == Screen::Export
-                            && matches!(app.active_rate_control, RateControl::Custom(_))
-                        {
-                            app.is_editing_custom_rate = !app.is_editing_custom_rate;
-                            if app.is_editing_custom_rate {
-                                app.status_message = "Type a rate value (e.g. 20, 400M, 50000k). Press Enter to confirm, Esc to cancel.".to_string();
-                            }
-                        } else if app.file_info.is_some() {
-                            app.screen = Screen::Info;
-                        }
+                    'b' => {
+                        app.show_browser = !app.show_browser;
+                        app.status_message = if app.show_browser {
+                            "Browser shown"
+                        } else {
+                            "Browser hidden"
+                        }.to_string();
                     }
                     'e' => {
-                        app.screen = Screen::Export;
+                        app.set_focus(FocusTarget::ExportSettings);
                     }
-                    'b' => {
-                        app.screen = Screen::Browse;
+                    'a' => {
+                        app.add_selected_to_queue();
+                    }
+                    'A' => {
+                        app.add_all_to_queue();
+                    }
+                    'D' => {
+                        if app.focus_target == FocusTarget::MediaPool {
+                            app.remove_selected_from_media_pool();
+                        }
                     }
                     'd' => {
-                        app.screen = match app.screen {
-                            Screen::Browse => Screen::Info,
-                            Screen::Info => Screen::Browse,
-                            Screen::Export => Screen::Browse,
-                        };
-                    }
-                    's' => {
-                        app.status_message = "Settings (coming soon)".to_string();
+                        match app.focus_target {
+                            FocusTarget::MediaPool => app.remove_from_media_pool(),
+                            FocusTarget::Queue => app.remove_from_queue(),
+                            FocusTarget::ExportSettings => {}
+                            FocusTarget::Preview => {}
+                        }
                     }
                     'x' => {
-                        if app.is_exporting {
-                            app.cancel_export();
-                        }
+                        app.clear_completed_queue();
                     }
                     'v' => {
                         app.start_export();
                     }
+                    'R' => {
+                        app.render_all();
+                    }
+                    'r' => {
+                        if app.focus_target == FocusTarget::ExportSettings {
+                            app.export_focus = ExportFocus::RateControl;
+                            app.cycle_rate_control();
+                        }
+                    }
                     't' => {
-                        if app.screen == Screen::Export {
+                        if app.focus_target == FocusTarget::ExportSettings {
                             app.export_focus = ExportFocus::TransferFunction;
                             app.export_transfer_function = app.export_transfer_function.next();
                             app.status_message = format!("Transfer: {}", app.export_transfer_function.name());
                         }
                     }
                     'g' => {
-                        if app.screen == Screen::Export {
+                        if app.focus_target == FocusTarget::ExportSettings {
                             app.export_focus = ExportFocus::ColorSpace;
                             app.export_color_space = app.export_color_space.next();
                             app.status_message = format!("Gamut: {}", app.export_color_space.name());
                         }
                     }
                     'c' => {
-                        if app.screen == Screen::Export {
-                            app.export_focus = ExportFocus::CodecFamily;
+                        if app.focus_target == FocusTarget::ExportSettings {
                             app.cycle_codec(true);
                         }
                     }
+                    'o' => {
+                        if app.show_browser {
+                            app.set_export_folder(app.browser.current_path.clone());
+                        }
+                    }
+                    'F' => {
+                        if app.show_browser {
+                            app.toggle_favourite_folder(app.browser.current_path.clone());
+                        }
+                    }
+                    'i' => {
+                        if app.focus_target == FocusTarget::ExportSettings
+                            && matches!(app.active_rate_control, RateControl::Custom(_))
+                        {
+                            app.is_editing_custom_rate = !app.is_editing_custom_rate;
+                            if app.is_editing_custom_rate {
+                                app.status_message = "Type a rate value (e.g. 20, 400M, 50000k). Press Enter to confirm, Esc to cancel.".to_string();
+                            }
+                        } else {
+                            app.show_full_info = !app.show_full_info;
+                            if app.show_full_info {
+                                app.status_message = "Full file info shown (press i or Esc to close)".to_string();
+                            }
+                        }
+                    }
                     'p' => {
-                        if app.screen == Screen::Export {
-                            app.export_focus = ExportFocus::Profile;
+                        if app.focus_target == FocusTarget::ExportSettings {
                             app.cycle_profile(true);
                         }
                     }
-                    'r' => {
-                        if app.screen == Screen::Export {
-                            app.export_focus = ExportFocus::RateControl;
-                            app.cycle_rate_control();
-                        }
+                    's' => {
+                        app.status_message = "Settings (coming soon)".to_string();
                     }
                     'n' => {
-                        if let Some(ref info) = app.file_info {
+                        if let Some(info) = app.focused_file_info().cloned().or_else(|| app.file_info.clone()) {
                             let output_path = "naked_dump.raw";
                             app.status_message = "Starting naked raw dump...".to_string();
-                            match crate::pipeline::run_naked(info, output_path) {
+                            match crate::pipeline::run_naked(&info, output_path) {
                                 Ok(_) => {
                                     app.status_message = format!("Naked dump done: {}", output_path);
                                 }
@@ -790,8 +2081,29 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder) {
                         }
                     }
                     '.' => {
-                        if app.screen == Screen::Browse {
-                            app.navigate_browser(BrowserDirection::ToggleHidden);
+                        if app.show_browser {
+                            app.browser.toggle_hidden();
+                            app.status_message = if app.browser.show_hidden {
+                                "Showing hidden files"
+                            } else {
+                                "Hiding hidden files"
+                            }.to_string();
+                        }
+                    }
+                    'L' => {
+                        let folder = app.browser.current_path.clone();
+                        app.load_all_in_folder(&folder);
+                        app.show_browser = false;
+                    }
+                    'I' => {
+                        if app.show_browser {
+                            app.import_selected_from_browser();
+                        }
+                    }
+                    'C' => {
+                        if !app.imported_files.is_empty() {
+                            app.show_culling = !app.show_culling;
+                            app.status_message = if app.show_culling { "Culling mode" } else { "Normal mode" }.to_string();
                         }
                     }
                     _ => {}
@@ -803,37 +2115,31 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder) {
             // ----------------------------------------------------------------
             match key_event.code {
                 crossterm::event::KeyCode::Esc => {
-                    match app.screen {
-                        Screen::Browse => app.running = false,
-                        _ => app.screen = Screen::Browse,
+                    if app.import_popup != ImportPopupState::Hidden {
+                        app.import_popup = ImportPopupState::Hidden;
+                    } else if app.show_full_info {
+                        app.show_full_info = false;
+                    } else if app.show_browser {
+                        app.show_browser = false;
+                    } else if app.show_help {
+                        app.show_help = false;
+                    } else {
+                        app.running = false;
                     }
                 }
+                crossterm::event::KeyCode::Tab => {
+                    app.cycle_focus();
+                }
                 crossterm::event::KeyCode::Enter => {
-                    // Enter on Custom rate toggles editing
-                    if app.screen == Screen::Export
+                    if app.focus_target == FocusTarget::ExportSettings
                         && matches!(app.active_rate_control, RateControl::Custom(_))
                     {
                         app.is_editing_custom_rate = !app.is_editing_custom_rate;
                         if app.is_editing_custom_rate {
                             app.status_message = "Type a rate value. Enter to confirm, Esc to cancel.".to_string();
                         }
-                    } else {
-                        match app.screen {
-                            Screen::Browse => {
-                                app.navigate_browser(BrowserDirection::Enter);
-                            }
-                            Screen::Export => {
-                                if let Some(ref info) = app.file_info {
-                                    let format = OutputFormat::DNG {
-                                        output_path: std::path::PathBuf::from(
-                                            format!("/tmp/export_{}.dng", info.path.split('/').last().unwrap_or("file")),
-                                        ),
-                                    };
-                                    app.add_encode_job(format);
-                                }
-                            }
-                            Screen::Info => {}
-                        }
+                    } else if app.show_browser {
+                        app.navigate_browser(BrowserDirection::Enter);
                     }
                 }
                 crossterm::event::KeyCode::Right | crossterm::event::KeyCode::Char('l') => {
@@ -847,88 +2153,143 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder) {
                     }
                 }
                 crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
-                    if app.screen == Screen::Browse {
+                    if app.show_browser {
                         app.navigate_browser(BrowserDirection::Up);
-                    } else if app.screen == Screen::Export {
-                        match app.export_focus {
-                            ExportFocus::ColorSpace => {
-                                app.export_color_space = app.export_color_space.prev();
-                                app.status_message = format!("Gamut: {}", app.export_color_space.name());
+                    } else {
+                        match app.focus_target {
+                            FocusTarget::MediaPool => {
+                                if app.media_pool_index > 0 {
+                                    app.media_pool_index -= 1;
+                                }
                             }
-                            ExportFocus::TransferFunction => {
-                                app.export_transfer_function = app.export_transfer_function.prev();
-                                app.status_message = format!("Transfer: {}", app.export_transfer_function.name());
+                            FocusTarget::Queue => {
+                                if app.queue_index > 0 {
+                                    app.queue_index -= 1;
+                                }
                             }
-                            ExportFocus::CodecFamily => {
-                                app.cycle_codec(false);
+                            FocusTarget::ExportSettings => {
+                                app.export_focus = match app.export_focus {
+                                    ExportFocus::ColorSpace => ExportFocus::RateControl,
+                                    ExportFocus::TransferFunction => ExportFocus::ColorSpace,
+                                    ExportFocus::CodecFamily => ExportFocus::TransferFunction,
+                                    ExportFocus::Profile => ExportFocus::CodecFamily,
+                                    ExportFocus::RateControl => ExportFocus::Profile,
+                                };
                             }
-                            ExportFocus::Profile => {
-                                app.cycle_profile(false);
-                            }
-                            ExportFocus::RateControl => {
-                                app.cycle_rate_control();
-                            }
+                            FocusTarget::Preview => {}
                         }
                     }
                 }
                 crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
-                    if app.screen == Screen::Browse {
+                    if app.show_browser {
                         app.navigate_browser(BrowserDirection::Down);
-                    } else if app.screen == Screen::Export {
-                        match app.export_focus {
-                            ExportFocus::ColorSpace => {
-                                app.export_color_space = app.export_color_space.next();
-                                app.status_message = format!("Gamut: {}", app.export_color_space.name());
+                    } else {
+                        match app.focus_target {
+                            FocusTarget::MediaPool => {
+                                if app.media_pool_index + 1 < app.imported_files.len() {
+                                    app.media_pool_index += 1;
+                                }
                             }
-                            ExportFocus::TransferFunction => {
-                                app.export_transfer_function = app.export_transfer_function.next();
-                                app.status_message = format!("Transfer: {}", app.export_transfer_function.name());
+                            FocusTarget::Queue => {
+                                if app.queue_index + 1 < app.queue.len() {
+                                    app.queue_index += 1;
+                                }
                             }
-                            ExportFocus::CodecFamily => {
-                                app.cycle_codec(true);
+                            FocusTarget::ExportSettings => {
+                                app.export_focus = match app.export_focus {
+                                    ExportFocus::ColorSpace => ExportFocus::TransferFunction,
+                                    ExportFocus::TransferFunction => ExportFocus::CodecFamily,
+                                    ExportFocus::CodecFamily => ExportFocus::Profile,
+                                    ExportFocus::Profile => ExportFocus::RateControl,
+                                    ExportFocus::RateControl => ExportFocus::ColorSpace,
+                                };
                             }
-                            ExportFocus::Profile => {
-                                app.cycle_profile(true);
-                            }
-                            ExportFocus::RateControl => {
-                                app.cycle_rate_control();
-                            }
+                            FocusTarget::Preview => {}
+                        }
+                    }
+                }
+                crossterm::event::KeyCode::Char(' ') => {
+                    if app.show_browser {
+                        app.navigate_browser(BrowserDirection::Enter);
+                    } else {
+                        match app.focus_target {
+                            FocusTarget::MediaPool => app.toggle_media_pool_selection(),
+                            FocusTarget::Queue => app.toggle_queue_selection(),
+                            FocusTarget::ExportSettings => {}
+                            FocusTarget::Preview => {}
                         }
                     }
                 }
                 crossterm::event::KeyCode::PageUp => {
-                    if app.screen == Screen::Browse {
+                    if app.show_help {
+                        app.help_scroll = app.help_scroll.saturating_sub(10);
+                    } else if app.show_browser {
                         let entries_len = app.browser.entries.len();
                         if entries_len > 0 {
                             let new_index = app.browser.selected_index.saturating_sub(10.min(entries_len));
                             app.browser.selected_index = new_index;
-                            app.list_state.select(Some(new_index));
+                        }
+                    } else if app.focus_target == FocusTarget::MediaPool {
+                        let len = app.imported_files.len();
+                        if len > 0 {
+                            app.media_pool_index = app.media_pool_index.saturating_sub(10.min(len));
+                        }
+                    } else if app.focus_target == FocusTarget::Queue {
+                        let len = app.queue.len();
+                        if len > 0 {
+                            app.queue_index = app.queue_index.saturating_sub(10.min(len));
                         }
                     }
                 }
                 crossterm::event::KeyCode::PageDown => {
-                    if app.screen == Screen::Browse {
+                    if app.show_help {
+                        app.help_scroll = app.help_scroll.saturating_add(10);
+                    } else if app.show_browser {
                         let entries_len = app.browser.entries.len();
                         if entries_len > 0 {
                             let new_index = (app.browser.selected_index + 10).min(entries_len - 1);
                             app.browser.selected_index = new_index;
-                            app.list_state.select(Some(new_index));
+                        }
+                    } else if app.focus_target == FocusTarget::MediaPool {
+                        let len = app.imported_files.len();
+                        if len > 0 {
+                            app.media_pool_index = (app.media_pool_index + 10).min(len - 1);
+                        }
+                    } else if app.focus_target == FocusTarget::Queue {
+                        let len = app.queue.len();
+                        if len > 0 {
+                            app.queue_index = (app.queue_index + 10).min(len - 1);
                         }
                     }
                 }
                 crossterm::event::KeyCode::Home => {
-                    if app.screen == Screen::Browse {
+                    if app.show_browser {
                         app.browser.selected_index = 0;
-                        app.list_state.select(Some(0));
+                    } else if app.focus_target == FocusTarget::MediaPool {
+                        app.media_pool_index = 0;
+                    } else if app.focus_target == FocusTarget::Queue {
+                        app.queue_index = 0;
                     }
                 }
                 crossterm::event::KeyCode::End => {
-                    if app.screen == Screen::Browse {
+                    if app.show_browser {
                         let entries_len = app.browser.entries.len();
                         if entries_len > 0 {
                             app.browser.selected_index = entries_len - 1;
-                            app.list_state.select(Some(entries_len - 1));
                         }
+                    } else if app.focus_target == FocusTarget::MediaPool {
+                        if !app.imported_files.is_empty() {
+                            app.media_pool_index = app.imported_files.len() - 1;
+                        }
+                    } else if app.focus_target == FocusTarget::Queue {
+                        if !app.queue.is_empty() {
+                            app.queue_index = app.queue.len() - 1;
+                        }
+                    }
+                }
+                crossterm::event::KeyCode::Backspace => {
+                    if app.show_browser {
+                        app.navigate_browser(BrowserDirection::GoUp);
                     }
                 }
                 _ => {}

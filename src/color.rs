@@ -31,7 +31,7 @@ pub enum ColorSpace {
     FGamutC,
     DaVinciWideGamut,
     ACESAP1,
-    AppleDisplayP3,
+    DisplayP3,
 }
 
 impl ColorSpace {
@@ -51,7 +51,7 @@ impl ColorSpace {
             ColorSpace::FGamutC => "F-Gamut C",
             ColorSpace::DaVinciWideGamut => "DaVinci Wide Gamut",
             ColorSpace::ACESAP1 => "ACES AP1",
-            ColorSpace::AppleDisplayP3 => "Apple Display P3",
+            ColorSpace::DisplayP3 => "Display P3",
         }
     }
 
@@ -80,7 +80,7 @@ impl ColorSpace {
                     0.314, 0.351,
                 )
             }
-            ColorSpace::AppleDisplayP3 => {
+            ColorSpace::DisplayP3 => {
                 // Display P3: same primaries as DCI-P3 + D65 white
                 xyz_to_rgb_from_primaries(
                     0.680, 0.320, 0.265, 0.690, 0.150, 0.060,
@@ -182,7 +182,7 @@ impl ColorSpace {
             ColorSpace::FGamutC,
             ColorSpace::DaVinciWideGamut,
             ColorSpace::ACESAP1,
-            ColorSpace::AppleDisplayP3,
+            ColorSpace::DisplayP3,
         ]
     }
 
@@ -210,6 +210,8 @@ pub enum TransferFunction {
     ARRIlog3,
     CLog3,
     FLog2,
+    AppleLog,
+    AppleLog2,
     ACESCCT,
     PQ,
     HLG,
@@ -227,6 +229,8 @@ impl TransferFunction {
             TransferFunction::ARRIlog3 => "ARRI LogC3",
             TransferFunction::CLog3 => "C-Log3",
             TransferFunction::FLog2 => "F-Log2",
+            TransferFunction::AppleLog => "Apple Log",
+            TransferFunction::AppleLog2 => "Apple Log 2",
             TransferFunction::ACESCCT => "ACES CCT",
             TransferFunction::PQ => "PQ (ST.2084)",
             TransferFunction::HLG => "HLG (BT.2100)",
@@ -324,6 +328,30 @@ impl TransferFunction {
                 });
             }
 
+            // Apple Log (Apple Log Profile White Paper, September 2023)
+            // Uses Rec.2020 (BT.2020) primaries with D65 white point.
+            // Encoding: V = γ * log2(L + β) + δ  for L ≥ R_t
+            //           V = c * (L - R₀)²         for R₀ ≤ L < R_t
+            //           V = 0                     for L < R₀
+            TransferFunction::AppleLog | TransferFunction::AppleLog2 => {
+                pixels.par_iter_mut().for_each(|v| {
+                    let x = *v;
+                    const R0: f32 = -0.05641088;
+                    const RT: f32 = 0.01;
+                    const C: f32 = 47.28711236;
+                    const BETA: f32 = 0.00964052;
+                    const GAMMA: f32 = 0.08550479;
+                    const DELTA: f32 = 0.69336945;
+                    *v = if x < R0 {
+                        0.0
+                    } else if x < RT {
+                        C * (x - R0) * (x - R0)
+                    } else {
+                        GAMMA * (x + BETA).log2() + DELTA
+                    }
+                });
+            }
+
             // ACEScct (colour-science / Academy)
             // cut = 0.0078125, linear: V = 10.54023774*x + 0.07290553
             // log: V = (log2(x) + 9.72) / 17.52
@@ -400,6 +428,8 @@ impl TransferFunction {
             TransferFunction::ARRIlog3,
             TransferFunction::CLog3,
             TransferFunction::FLog2,
+            TransferFunction::AppleLog,
+            TransferFunction::AppleLog2,
             TransferFunction::ACESCCT,
             TransferFunction::PQ,
             TransferFunction::HLG,
@@ -1123,7 +1153,7 @@ impl ColorPipelineConfig {
         config.out_gamut = match gamut {
             ColorSpace::Rec709 => Gamut::Rec709,
             ColorSpace::Rec2020 => Gamut::Rec2020,
-            ColorSpace::DciP3 | ColorSpace::AppleDisplayP3 => Gamut::P3D65,
+            ColorSpace::DciP3 | ColorSpace::DisplayP3 => Gamut::P3D65,
             ColorSpace::SGamut3Cine => Gamut::SGamut3Cine,
             ColorSpace::SGamut3 => Gamut::SGamut3,
             ColorSpace::ARRIWideGamut3 | ColorSpace::ARRIWideGamut4 => Gamut::Awg3,

@@ -53,6 +53,7 @@ impl CodecFamily {
         hevc_encoder: &str,
         h264_encoder: &str,
         av1_encoder: &str,
+        prores_encoder: &str,
         prores: ProResProfile,
         dnxhr: DnxhrProfile,
         hevc: HevcProfile,
@@ -60,9 +61,9 @@ impl CodecFamily {
         av1: Av1Profile,
         vp9: Vp9Profile,
         rate_control: &RateControl,
-    ) -> (&'static str, &'static str, Vec<String>) {
-        let mut base_codec_name: &str = "";
-        let mut base_pix_fmt: &str = "";
+    ) -> (String, String, Vec<String>) {
+        let mut base_codec_name: String = String::new();
+        let mut base_pix_fmt: String = String::new();
         let mut base_extra: Vec<&'static str> = Vec::new();
 
         match self {
@@ -75,8 +76,8 @@ impl CodecFamily {
                     ProResProfile::P4444 => ("4", "yuva444p10le"),
                     ProResProfile::XQ4444 => ("5", "yuva444p12le"),
                 };
-                base_codec_name = "prores_ks";
-                base_pix_fmt = pix_fmt;
+                base_codec_name = prores_encoder.to_string();
+                base_pix_fmt = pix_fmt.to_string();
                 base_extra = vec!["-profile:v", profile_v];
             }
             CodecFamily::DNxHR => {
@@ -87,37 +88,38 @@ impl CodecFamily {
                     DnxhrProfile::HQX => ("dnxhr_hqx", "yuv422p10le"),
                     DnxhrProfile::P444 => ("dnxhr_444", "yuv444p10le"),
                 };
-                base_codec_name = "dnxhd";
-                base_pix_fmt = pix_fmt;
+                base_codec_name = "dnxhd".to_string();
+                base_pix_fmt = pix_fmt.to_string();
                 base_extra = vec!["-profile:v", profile_str];
             }
             CodecFamily::HEVC => {
                 match hevc_encoder {
                     "hevc_nvenc" => {
-                        base_codec_name = "hevc_nvenc";
-                        base_pix_fmt = "p010le";
+                        base_codec_name = "hevc_nvenc".to_string();
+                        base_pix_fmt = "p010le".to_string();
                         base_extra = vec!["-preset", "p6"];
                     }
                     "hevc_amf" => {
-                        base_codec_name = "hevc_amf";
-                        base_pix_fmt = "p010le";
+                        base_codec_name = "hevc_amf".to_string();
+                        base_pix_fmt = "p010le".to_string();
                         base_extra = vec!["-quality", "quality"];
                     }
                     "hevc_qsv" => {
-                        base_codec_name = "hevc_qsv";
-                        base_pix_fmt = "p010le";
+                        base_codec_name = "hevc_qsv".to_string();
+                        base_pix_fmt = "p010le".to_string();
                     }
                     "hevc_videotoolbox" => {
-                        base_codec_name = "hevc_videotoolbox";
-                        base_pix_fmt = "p010le";
+                        base_codec_name = "hevc_videotoolbox".to_string();
+                        base_pix_fmt = "p010le".to_string();
+                        base_extra = vec!["-realtime", "true"];
                     }
                     _ => {
                         let pix_fmt = match hevc {
                             HevcProfile::Main10_420 => "yuv420p10le",
                             HevcProfile::Main10_444 => "yuv444p10le",
                         };
-                        base_codec_name = "libx265";
-                        base_pix_fmt = pix_fmt;
+                        base_codec_name = "libx265".to_string();
+                        base_pix_fmt = pix_fmt.to_string();
                         base_extra = vec!["-pix_fmt", pix_fmt];
                     }
                 }
@@ -129,8 +131,8 @@ impl CodecFamily {
                             H264Profile::High_10bit => ("p010le", vec!["-preset", "p6", "-profile:v", "high10"]),
                             H264Profile::Main_8bit => ("yuv420p", vec!["-preset", "p6"]),
                         };
-                        base_codec_name = "h264_nvenc";
-                        base_pix_fmt = pf;
+                        base_codec_name = "h264_nvenc".to_string();
+                        base_pix_fmt = pf.to_string();
                         base_extra = ext;
                     }
                     "h264_amf" => {
@@ -138,8 +140,8 @@ impl CodecFamily {
                             H264Profile::High_10bit => ("p010le", vec!["-quality", "quality"]),
                             H264Profile::Main_8bit => ("yuv420p", vec!["-quality", "quality"]),
                         };
-                        base_codec_name = "h264_amf";
-                        base_pix_fmt = pf;
+                        base_codec_name = "h264_amf".to_string();
+                        base_pix_fmt = pf.to_string();
                         base_extra = ext;
                     }
                     "h264_qsv" => {
@@ -147,24 +149,25 @@ impl CodecFamily {
                             H264Profile::High_10bit => "p010le",
                             H264Profile::Main_8bit => "yuv420p",
                         };
-                        base_codec_name = "h264_qsv";
-                        base_pix_fmt = pf;
+                        base_codec_name = "h264_qsv".to_string();
+                        base_pix_fmt = pf.to_string();
                     }
                     "h264_videotoolbox" => {
                         let pf = match h264 {
                             H264Profile::High_10bit => "p010le",
                             H264Profile::Main_8bit => "yuv420p",
                         };
-                        base_codec_name = "h264_videotoolbox";
-                        base_pix_fmt = pf;
+                        base_codec_name = "h264_videotoolbox".to_string();
+                        base_pix_fmt = pf.to_string();
+                        base_extra = vec!["-realtime", "true"];
                     }
                     _ => {
                         let (pf, ext) = match h264 {
                             H264Profile::Main_8bit => ("yuv420p", vec!["-preset", "slow"]),
                             H264Profile::High_10bit => ("yuv422p10le", vec!["-preset", "slow"]),
                         };
-                        base_codec_name = "libx264";
-                        base_pix_fmt = pf;
+                        base_codec_name = "libx264".to_string();
+                        base_pix_fmt = pf.to_string();
                         base_extra = ext;
                     }
                 }
@@ -172,27 +175,27 @@ impl CodecFamily {
             CodecFamily::AV1 => {
                 match av1_encoder {
                     "av1_nvenc" => {
-                        base_codec_name = "av1_nvenc";
-                        base_pix_fmt = "p010le";
+                        base_codec_name = "av1_nvenc".to_string();
+                        base_pix_fmt = "p010le".to_string();
                         base_extra = vec!["-preset", "p6"];
                     }
                     "av1_amf" => {
-                        base_codec_name = "av1_amf";
-                        base_pix_fmt = "p010le";
+                        base_codec_name = "av1_amf".to_string();
+                        base_pix_fmt = "p010le".to_string();
                         base_extra = vec!["-quality", "quality"];
                     }
                     "av1_qsv" => {
-                        base_codec_name = "av1_qsv";
-                        base_pix_fmt = "p010le";
+                        base_codec_name = "av1_qsv".to_string();
+                        base_pix_fmt = "p010le".to_string();
                     }
                     "libsvtav1" => {
-                        base_codec_name = "libsvtav1";
-                        base_pix_fmt = "yuv420p10le";
+                        base_codec_name = "libsvtav1".to_string();
+                        base_pix_fmt = "yuv420p10le".to_string();
                         base_extra = vec!["-preset", "8"];
                     }
                     _ => {
-                        base_codec_name = "libaom-av1";
-                        base_pix_fmt = "yuv420p10le";
+                        base_codec_name = "libaom-av1".to_string();
+                        base_pix_fmt = "yuv420p10le".to_string();
                         base_extra = vec!["-cpu-used", "4"];
                     }
                 }
@@ -202,8 +205,8 @@ impl CodecFamily {
                     Vp9Profile::Profile2_420_10bit => "30",
                     Vp9Profile::Profile3_444_10bit => "30",
                 };
-                base_codec_name = "libvpx-vp9";
-                base_pix_fmt = "yuv420p10le";
+                base_codec_name = "libvpx-vp9".to_string();
+                base_pix_fmt = "yuv420p10le".to_string();
                 base_extra = vec!["-crf", crf, "-b:v", "0"];
             }
         }
@@ -224,6 +227,9 @@ impl CodecFamily {
             }
             _ => {}
         }
+
+        tracing::debug!("ffmpeg args: codec={} pix_fmt={} extra={:?}",
+            base_codec_name, base_pix_fmt, extra);
 
         (base_codec_name, base_pix_fmt, extra)
     }
@@ -500,6 +506,17 @@ impl RateControl {
             RateControl::Custom(_) => RateControl::Lossless,
         }
     }
+
+    pub fn prev(&self) -> Self {
+        match self {
+            RateControl::Lossless => RateControl::Custom(String::new()),
+            RateControl::High => RateControl::Lossless,
+            RateControl::Standard => RateControl::High,
+            RateControl::Master400M => RateControl::Standard,
+            RateControl::Standard150M => RateControl::Master400M,
+            RateControl::Custom(_) => RateControl::Standard150M,
+        }
+    }
 }
 
 /// Build the FFmpeg rate-control / quality arguments for a given encoder.
@@ -508,23 +525,31 @@ impl RateControl {
 /// * `codec_name` — the FFmpeg encoder name (used only for default fallback).
 pub fn rate_control_args(rc: &RateControl, encoder_name: &str) -> Vec<String> {
     let is_hw = !encoder_name.starts_with("lib");
+    let is_videotoolbox = encoder_name.ends_with("_videotoolbox");
     match rc {
         RateControl::Lossless => {
-            if is_hw {
+            if is_videotoolbox {
+                // VideoToolbox uses -quality for rate control
+                vec!["-quality".into(), "lossless".into()]
+            } else if is_hw {
                 vec!["-cq".into(), "16".into()]
             } else {
                 vec!["-crf".into(), "16".into()]
             }
         }
         RateControl::High => {
-            if is_hw {
+            if is_videotoolbox {
+                vec!["-quality".into(), "max".into()]
+            } else if is_hw {
                 vec!["-cq".into(), "20".into()]
             } else {
                 vec!["-crf".into(), "20".into()]
             }
         }
         RateControl::Standard => {
-            if is_hw {
+            if is_videotoolbox {
+                vec!["-quality".into(), "high".into()]
+            } else if is_hw {
                 vec!["-cq".into(), "24".into()]
             } else {
                 vec!["-crf".into(), "24".into()]
@@ -559,7 +584,9 @@ pub fn rate_control_args(rc: &RateControl, encoder_name: &str) -> Vec<String> {
                     val.clone(),
                 ]
             } else if val.parse::<f64>().is_ok() {
-                if is_hw {
+                if is_videotoolbox {
+                    vec!["-quality".into(), val.clone()]
+                } else if is_hw {
                     vec!["-cq".into(), val.clone()]
                 } else {
                     vec!["-crf".into(), val.clone()]

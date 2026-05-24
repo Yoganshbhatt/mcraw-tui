@@ -73,17 +73,17 @@ pub struct Encoder;
 
 impl Encoder {
     pub fn new() -> Self {
-        log::info!("Encoder stub initialized");
-        Encoder
+        tracing::info!("encoder stub initialized");
+        Encoder {}
     }
 
     pub async fn start_job(&self, job: EncodeJob) -> Result<()> {
-        log::info!("[Stub] Starting encode job: {} -> {:?}", job.id, job.format);
+        tracing::info!("[stub] starting encode job: {} -> {:?}", job.id, job.format);
         Ok(())
     }
 
     pub async fn cancel_job(&self, _job_id: &str) -> Result<()> {
-        log::info!("[Stub] Canceling encode job: {}", _job_id);
+        tracing::info!("[stub] canceling encode job: {}", _job_id);
         Ok(())
     }
 
@@ -141,11 +141,12 @@ impl VideoEncoder {
         // Append dynamic extra args (profile, crf, preset, etc.)
         cmd.args(extra_args);
 
-        // For ProRes and DNxHR, inject an explicit format filter so FFmpeg
-        // does not choke on the rgb48le rawvideo input.  The filter converts
-        // to the encoder's native planar format before the encoder sees it.
+        // For ProRes, DNxHR, and VideoToolbox encoders, inject an explicit format
+        // filter so FFmpeg does not choke on the rgb48le rawvideo input.
+        // VideoToolbox encoders require explicit format conversion from RGB to YUV.
         match codec {
-            "prores_ks" | "prores_videotoolbox" | "dnxhd" => {
+            "prores_ks" | "prores_videotoolbox" | "dnxhd"
+            | "hevc_videotoolbox" | "h264_videotoolbox" => {
                 cmd.args(["-vf", &format!("format={}", pix_fmt)]);
             }
             _ => {}
@@ -155,8 +156,6 @@ impl VideoEncoder {
             cmd.args(["-x264-params", "colorprim=bt709:transfer=bt709:colormatrix=bt709"]);
         } else if codec == "libx265" {
             cmd.args(["-x265-params", "colorprim=bt709:transfer=bt709:colormatrix=bt709"]);
-        } else if codec == "prores_ks" || codec == "prores_videotoolbox" {
-            cmd.args(["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]);
         }
 
         // Add audio encoder if audio input is present
@@ -175,6 +174,8 @@ impl VideoEncoder {
             .stderr(Stdio::null());
 
         let child = cmd.spawn()?;
+        tracing::info!("ffmpeg subprocess spawned: pid={} codec={} {}x{}@{}fps output={}",
+            child.id(), codec, width, height, fps, output_path);
 
         Ok(Self { child, audio_temp_path: audio_temp_path.map(|p| p.to_path_buf()) })
     }
@@ -182,6 +183,7 @@ impl VideoEncoder {
     pub fn push_frame(&mut self, data: &[u8]) -> Result<()> {
         use std::io::Write;
         let stdin = self.child.stdin.as_mut().ok_or_else(|| {
+            tracing::error!("ffmpeg stdin not available");
             anyhow::anyhow!("FFmpeg stdin not available")
         })?;
         stdin.write_all(data)?;
@@ -189,9 +191,24 @@ impl VideoEncoder {
     }
 
     pub fn finish(&mut self) -> Result<()> {
+        tracing::debug!("ffmpeg finish: closing stdin and waiting");
         drop(self.child.stdin.take());
-        self.child.wait()?;
+        let status = self.child.wait()?;
+        tracing::info!("ffmpeg subprocess exited: {}", status);
         Ok(())
+    }
+
+    /// Force-terminate the FFmpeg subprocess. Used during cancellation to
+    /// unblock a writer thread that may be stuck in `push_frame()`.
+    pub fn kill(&mut self) {
+        tracing::debug!("ffmpeg kill: terminating subprocess");
+        let _ = self.child.stdin.take();
+        let _ = self.child.kill();
+    }
+
+    /// Returns the OS process ID of the FFmpeg subprocess.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
     }
 }
 

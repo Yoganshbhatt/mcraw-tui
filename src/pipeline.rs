@@ -41,6 +41,7 @@ pub fn build_ffmpeg_codec_args(
     hevc_encoder: &str,
     h264_encoder: &str,
     av1_encoder: &str,
+    prores_encoder: &str,
     prores: ProResProfile,
     dnxhr: DnxhrProfile,
     hevc: HevcProfile,
@@ -48,15 +49,15 @@ pub fn build_ffmpeg_codec_args(
     av1: Av1Profile,
     vp9: Vp9Profile,
     rate_control: &RateControl,
-) -> (&'static str, &'static str, Vec<String>) {
-    family.to_ffmpeg_args(hevc_encoder, h264_encoder, av1_encoder, prores, dnxhr, hevc, h264, av1, vp9, rate_control)
+) -> (String, String, Vec<String>) {
+    family.to_ffmpeg_args(hevc_encoder, h264_encoder, av1_encoder, prores_encoder, prores, dnxhr, hevc, h264, av1, vp9, rate_control)
 }
 
 pub fn get_ffmpeg_vui_tags(color_space: &ColorSpace, transfer: &TransferFunction) -> Vec<&'static str> {
     let (primaries, matrix) = match color_space {
         ColorSpace::Rec709 | ColorSpace::Srgb => ("bt709", "bt709"),
         ColorSpace::Rec2020 => ("bt2020", "bt2020nc"),
-        ColorSpace::DciP3 | ColorSpace::AppleDisplayP3 => ("smpte432", "bt2020nc"),
+        ColorSpace::DciP3 | ColorSpace::DisplayP3 => ("smpte432", "bt2020nc"),
         ColorSpace::SGamut3Cine | ColorSpace::SGamut3
         | ColorSpace::ARRIWideGamut3 | ColorSpace::ARRIWideGamut4
         | ColorSpace::CanonCinemaGamut | ColorSpace::PanasonicVGamut
@@ -71,7 +72,8 @@ pub fn get_ffmpeg_vui_tags(color_space: &ColorSpace, transfer: &TransferFunction
         TransferFunction::Linear => "linear",
         TransferFunction::SLog3 | TransferFunction::VLog
         | TransferFunction::ARRIlog3 | TransferFunction::CLog3
-        | TransferFunction::FLog2 | TransferFunction::ACESCCT
+        | TransferFunction::FLog2 | TransferFunction::AppleLog
+        | TransferFunction::AppleLog2 | TransferFunction::ACESCCT
         | TransferFunction::DaVinciIntermediate => "bt709",
         TransferFunction::Gamma24 => "bt709",
     };
@@ -87,12 +89,15 @@ pub fn get_ffmpeg_vui_tags(color_space: &ColorSpace, transfer: &TransferFunction
 // ---------------------------------------------------------------------------
 
 pub fn run_naked(info: &McrawFileInfo, output_path: &str) -> Result<()> {
+    tracing::info!("run_naked: input={} output={}", info.path, output_path);
     let decoder = Decoder::new(&info.path)?;
     let timestamps = decoder.timestamps()?;
 
     if timestamps.is_empty() {
         return Err(anyhow!("No frames found in file"));
     }
+
+    tracing::debug!("run_naked: {} frames to dump", timestamps.len());
 
     let mut out_file = fs::File::create(output_path)?;
 
@@ -126,6 +131,7 @@ pub fn run(info: &McrawFileInfo, output_path: &str) -> Result<()> {
         "libx265".to_string(),
         "libx264".to_string(),
         "libaom-av1".to_string(),
+        "prores_ks".to_string(),
         RateControl::Lossless,
     )
 }
@@ -148,8 +154,11 @@ pub fn run_export(
     hevc_encoder: String,
     h264_encoder: String,
     av1_encoder: String,
+    prores_encoder: String,
     rate_control: RateControl,
 ) -> Result<()> {
+    tracing::info!("run_export: input={} output={} codec={} cs={} tf={}",
+        info.path, output_path, codec_family.name(), export_cs.name(), export_tf.name());
     let decoder = Decoder::new(&info.path)?;
     let timestamps = decoder.timestamps()?;
 
@@ -168,6 +177,8 @@ pub fn run_export(
     }
 
     let fps = if info.fps > 0.0 { info.fps } else { 25.0 };
+    tracing::info!("export config: {}x{} @ {}fps, {} frames, bayer={}",
+        active_width, active_height, fps, timestamps.len(), info.bayer_pattern.name());
 
     // --- Build Camera→XYZ matrix from available DNG matrices ---
     let cm1_f32: [f32; 9] = info.camera_metadata.color_matrix
@@ -220,7 +231,7 @@ pub fn run_export(
     let total_frames = timestamps.len();
 
     let (codec_name, pix_fmt, mut extra_args) = build_ffmpeg_codec_args(
-        codec_family, &hevc_encoder, &h264_encoder, &av1_encoder,
+        codec_family, &hevc_encoder, &h264_encoder, &av1_encoder, &prores_encoder,
         prores_profile, dnxhr_profile, hevc_profile,
         h264_profile, av1_profile, vp9_profile,
         &rate_control,
@@ -262,23 +273,22 @@ pub fn run_export(
                 match decoder.write_audio_to(&mut writer) {
                     Ok(()) => {
                         let _ = writer.flush();
-                        log::info!(
-                            "Audio streamed to temp file: {} Hz, {} ch -> {}",
+                        tracing::info!(
+                            "audio streamed to temp file: {} Hz, {} ch -> {}",
                             info.audio_sample_rate, info.audio_channels,
                             temp_path.display()
                         );
                         Some(temp_path)
                     }
                     Err(e) => {
-                        // Clean up temp file on partial write
                         let _ = std::fs::remove_file(&temp_path);
-                        log::warn!("Failed to write audio (export continues without audio): {}", e);
+                        tracing::warn!("failed to write audio (export continues without audio): {}", e);
                         None
                     }
                 }
             }
             Err(e) => {
-                log::warn!("Failed to create audio temp file (export continues without audio): {}", e);
+                tracing::warn!("failed to create audio temp file (export continues without audio): {}", e);
                 None
             }
         }
@@ -288,7 +298,7 @@ pub fn run_export(
 
     let mut encoder = VideoEncoder::new(
         &output_path, active_width, active_height, fps,
-        codec_name, pix_fmt, &extra_args,
+        &codec_name, &pix_fmt, &extra_args,
         audio_temp_path.as_deref(),
         info.audio_sample_rate,
         info.audio_channels,
@@ -477,6 +487,43 @@ pub fn run_export(
     // Stage 3 — Writer thread: drain processed frames to FFmpeg stdin
     // ==================================================================
     let writer_cancelled = cancelled.clone();
+
+    // Capture FFmpeg PID so a monitor thread can kill it on cancellation.
+    // This unblocks the writer thread if it is stuck inside push_frame().
+    let ffmpeg_pid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    ffmpeg_pid.store(encoder.pid(), Ordering::Relaxed);
+
+    // Spawn a cancellation monitor that force-kills FFmpeg when the user
+    // cancels.  Without this the writer thread can hang indefinitely on
+    // macOS (and occasionally Linux/Windows) because stdin.write_all() is
+    // a blocking call that never reaches the cancel-flag check.
+    let monitor_cancelled = cancelled.clone();
+    let monitor_pid = ffmpeg_pid.clone();
+    let _monitor_handle = std::thread::Builder::new()
+        .name("cancel_monitor".into())
+        .spawn(move || {
+            while !monitor_cancelled.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            // Cancel flag was set — kill FFmpeg to unblock the writer.
+            let pid = monitor_pid.load(Ordering::Relaxed);
+            if pid > 0 {
+                #[cfg(target_os = "windows")]
+                {
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/F", "/PID", &pid.to_string()])
+                        .output();
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let _ = std::process::Command::new("kill")
+                        .args(["-TERM", &pid.to_string()])
+                        .output();
+                }
+            }
+        })
+        .ok();
+
     let writer_handle = std::thread::Builder::new()
         .name("writer".into())
         .spawn(move || -> Result<()> {

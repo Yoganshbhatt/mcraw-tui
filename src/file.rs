@@ -231,6 +231,7 @@ pub struct McrawFileInfo {
 impl McrawFileInfo {
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
+        tracing::debug!("McrawFileInfo::from_path: {:?}", path);
         let metadata = fs::metadata(&path)
             .with_context(|| format!("Failed to read metadata for {:?}", path))?;
 
@@ -247,22 +248,23 @@ impl McrawFileInfo {
 
     pub fn enhance_with_decoder(&mut self) {
         let path = self.path.clone();
+        tracing::debug!("enhance_with_decoder: {}", path);
         let decoder_result = crate::decoder::Decoder::new(&path);
         let decoder = match decoder_result {
             Ok(d) => d,
             Err(e) => {
-                log::warn!("Failed to open decoder for {}: {}", path, e);
+                tracing::warn!("failed to open decoder for {}: {}", path, e);
                 return;
             }
         };
         if let Ok(container_meta) = decoder.container_metadata() {
             if container_meta.white_level > 0.0 {
                 self.white_level = container_meta.white_level;
-                log::info!("White level from container metadata: {}", self.white_level);
+                tracing::debug!("white_level from container: {}", self.white_level);
             }
             if container_meta.black_level_count > 0 {
                 self.black_level = container_meta.black_level[0];
-                log::info!("Black level from container metadata: {}", self.black_level);
+                tracing::debug!("black_level from container: {}", self.black_level);
             }
 
             let as_f64 = |v: &[f32; 9]| -> [f64; 9] {
@@ -292,11 +294,8 @@ impl McrawFileInfo {
             if container_meta.has_calibration_illuminants {
                 self.camera_metadata.calibration_illuminant1 = Some(container_meta.calibration_illuminant1);
                 self.camera_metadata.calibration_illuminant2 = Some(container_meta.calibration_illuminant2);
-                log::info!(
-                    "Calibration illuminants: illum1={}, illum2={}",
-                    container_meta.calibration_illuminant1,
-                    container_meta.calibration_illuminant2
-                );
+                tracing::debug!("calibration_illuminants: illum1={}, illum2={}",
+                    container_meta.calibration_illuminant1, container_meta.calibration_illuminant2);
             }
         }
         if let Ok(timestamps) = decoder.timestamps() {
@@ -309,31 +308,20 @@ impl McrawFileInfo {
                         self.fps = (self.frame_count.saturating_sub(1)) as f64 / duration_in_seconds;
                     }
                 }
-                log::info!(
-                    "Enhanced from timestamps: {} frames, {:.2} fps",
-                    self.frame_count,
-                    self.fps
-                );
+                tracing::debug!("enhanced from timestamps: {} frames, {:.2} fps", self.frame_count, self.fps);
             }
             if let Ok(first_frame_meta) = decoder.load_frame_metadata(timestamps[0]) {
                 if self.width == 0 || self.height == 0 {
                     self.width = first_frame_meta.width as u16;
                     self.height = first_frame_meta.height as u16;
-                    log::info!(
-                        "Enhanced from per-frame metadata: {}x{}",
-                        first_frame_meta.width,
-                        first_frame_meta.height
-                    );
+                    tracing::debug!("enhanced dimensions: {}x{}", first_frame_meta.width, first_frame_meta.height);
                 }
                 let n = first_frame_meta.as_shot_neutral;
                 if n[0] > 1e-6 && n[1] > 1e-6 && n[2] > 1e-6 {
                     let r_gain = n[1] / n[0];
                     let b_gain = n[1] / n[2];
                     self.camera_metadata.wb_multipliers = Some([r_gain, 1.0, b_gain]);
-                    log::info!(
-                        "White balance multipliers from as_shot_neutral [{:.4}, {:.4}, {:.4}]: R={:.3} G={:.3} B={:.3}",
-                        n[0], n[1], n[2], r_gain, 1.0, b_gain
-                    );
+                    tracing::debug!("wb_multipliers: R={:.3} G={:.3} B={:.3}", r_gain, 1.0, b_gain);
                 }
             }
         }
@@ -369,6 +357,7 @@ fn parse_motion_header(data: &[u8], path: &Path) -> Result<McrawFileInfo> {
     }
 
     let format_version = data[7] as u32;
+    tracing::debug!("parse_motion_header: version={} json_len={}", format_version, u32::from_le_bytes([data[12], data[13], data[14], data[15]]));
     let json_len = u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as usize;
     let json_start = 16;
     let json_end = json_start + json_len;
@@ -620,6 +609,7 @@ fn parse_header(data: &[u8], path: &Path) -> Result<McrawFileInfo> {
 
     // Check for "MOTION " magic header (new format with JSON metadata)
     if data.starts_with(b"MOTION ") {
+        tracing::debug!("detected MOTION format header");
         return parse_motion_header(data, path);
     }
 
@@ -636,6 +626,7 @@ fn parse_header(data: &[u8], path: &Path) -> Result<McrawFileInfo> {
             magic
         );
     }
+    tracing::debug!("detected MCRAW legacy format header");
 
     let format_version = u32::from_be_bytes([data[5], data[6], data[7], data[8]]);
     let frame_count = u32::from_be_bytes([data[9], data[10], data[11], data[12]]);

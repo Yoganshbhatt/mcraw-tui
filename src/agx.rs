@@ -1,3 +1,12 @@
+// AgX tone mapping pipeline, spectral gamut mapping, and log/linear transfer functions.
+// References:
+//   - AgX: Troy Sobotka / AgX project (MIT license)
+//   - Kraken: Jed Smith / Troy Sobotka
+//   - Apple Log: Apple Log Profile White Paper, September 2023
+//   - Various camera log curves: colour-science/colour (BSD-3-Clause),
+//     https://github.com/colour-science/colour
+//   - CAT16 chromatic adaptation: CIE TC 1-90 (2016)
+
 use rayon::prelude::*;
 use std::f32::consts::PI;
 
@@ -694,6 +703,7 @@ impl From<crate::color::TransferFunction> for Transfer {
             crate::color::TransferFunction::ARRIlog3 => Transfer::ArriLogC3,
             crate::color::TransferFunction::CLog3 => Transfer::CanonLog3,
             crate::color::TransferFunction::FLog2 => Transfer::FLog2,
+            crate::color::TransferFunction::AppleLog | crate::color::TransferFunction::AppleLog2 => Transfer::Linear,
             crate::color::TransferFunction::ACESCCT => Transfer::AcesCct,
             crate::color::TransferFunction::HLG => Transfer::HLG,
             crate::color::TransferFunction::PQ => Transfer::PQ,
@@ -720,7 +730,7 @@ impl From<crate::color::ColorSpace> for Gamut {
             crate::color::ColorSpace::FGamut => Gamut::Rwg,
             crate::color::ColorSpace::FGamutC => Gamut::Ap0,
             crate::color::ColorSpace::DaVinciWideGamut => Gamut::DaVinciWg,
-            crate::color::ColorSpace::AppleDisplayP3 => Gamut::P3D65,
+            crate::color::ColorSpace::DisplayP3 => Gamut::P3D65,
         }
     }
 }

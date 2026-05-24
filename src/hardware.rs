@@ -1,6 +1,7 @@
 use std::process::Command;
 
 /// Runtime-detected hardware capabilities for video encoding.
+#[derive(Debug)]
 pub struct HardwareCaps {
     /// Best available HEVC encoder name
     pub best_hevc_encoder: String,
@@ -16,6 +17,11 @@ pub struct HardwareCaps {
     pub best_av1_encoder: String,
     /// True if `best_av1_encoder` is a hardware accelerator
     pub av1_is_hw: bool,
+
+    /// Best available ProRes encoder name
+    pub best_prores_encoder: String,
+    /// True if `best_prores_encoder` is a hardware accelerator
+    pub prores_is_hw: bool,
 }
 
 /// Silently probe available FFmpeg HW encoders in priority order.
@@ -23,8 +29,14 @@ pub struct HardwareCaps {
 /// or ffmpeg is missing.
 pub fn probe_hardware() -> HardwareCaps {
     let output = match Command::new("ffmpeg").arg("-encoders").output() {
-        Ok(o) => o.stdout,
-        Err(_) => {
+        Ok(o) => {
+            // FFmpeg may print encoder info to stdout or stderr depending on build
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            format!("{}{}", stdout, stderr).into_bytes()
+        }
+        Err(e) => {
+            tracing::warn!("ffmpeg not found or failed to probe encoders: {}", e);
             return HardwareCaps {
                 best_hevc_encoder: "libx265".to_string(),
                 hevc_is_hw: false,
@@ -32,6 +44,8 @@ pub fn probe_hardware() -> HardwareCaps {
                 h264_is_hw: false,
                 best_av1_encoder: "libaom-av1".to_string(),
                 av1_is_hw: false,
+                best_prores_encoder: "prores_ks".to_string(),
+                prores_is_hw: false,
             };
         }
     };
@@ -55,6 +69,17 @@ pub fn probe_hardware() -> HardwareCaps {
         "libaom-av1",
     );
 
+    let (prores_enc, prores_hw) = probe_one(
+        &stdout,
+        &["prores_videotoolbox"],
+        "prores_ks",
+    );
+
+    tracing::info!(
+        "Encoder detection: HEVC={} (hw={}), H264={} (hw={}), AV1={} (hw={}), ProRes={} (hw={})",
+        hevc_enc, hevc_hw, h264_enc, h264_hw, av1_enc, av1_hw, prores_enc, prores_hw
+    );
+
     HardwareCaps {
         best_hevc_encoder: hevc_enc,
         hevc_is_hw: hevc_hw,
@@ -62,6 +87,8 @@ pub fn probe_hardware() -> HardwareCaps {
         h264_is_hw: h264_hw,
         best_av1_encoder: av1_enc,
         av1_is_hw: av1_hw,
+        best_prores_encoder: prores_enc,
+        prores_is_hw: prores_hw,
     }
 }
 
