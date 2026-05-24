@@ -5,6 +5,8 @@ use crossterm::{
 };
 use percent_encoding::percent_decode_str;
 use ratatui::backend::CrosstermBackend;
+use std::cell::Cell;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tokio::time;
@@ -165,6 +167,15 @@ pub struct App {
 
     // Drop preview overlay for visual feedback
     pub drop_preview: Option<DropPreview>,
+
+    // Persistent ListState offset for browser (prevents viewport jumping on click)
+    pub browser_scroll_offset: Cell<usize>,
+
+    // Pinned favourites bar toggle
+    pub show_favourites_bar: bool,
+
+    // Timestamp + index of last clicked favourite (for d-key removal)
+    pub last_clicked_favourite: Option<(Instant, usize)>,
 }
 
 /// Event from async drag-drop import worker
@@ -190,6 +201,36 @@ pub enum ExportFocus {
 }
 
 impl App {
+    fn favourites_file() -> Option<PathBuf> {
+        let mut dir = dirs::config_dir()?;
+        dir.push("mcraw-tui");
+        std::fs::create_dir_all(&dir).ok()?;
+        dir.push("favourites.json");
+        Some(dir)
+    }
+
+    fn load_favourites() -> Vec<PathBuf> {
+        let path = match Self::favourites_file() {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+        let data = match std::fs::read_to_string(&path) {
+            Ok(d) => d,
+            Err(_) => return Vec::new(),
+        };
+        serde_json::from_str(&data).unwrap_or_default()
+    }
+
+    fn save_favourites(&self) {
+        let path = match Self::favourites_file() {
+            Some(p) => p,
+            None => return,
+        };
+        if let Ok(data) = serde_json::to_string(&self.favourite_folders) {
+            let _ = std::fs::write(path, data);
+        }
+    }
+
     pub fn new() -> Self {
         let caps = probe_hardware();
         App {
@@ -235,7 +276,7 @@ impl App {
             show_browser: true,
             current_rendering_index: None,
             export_folder: None,
-            favourite_folders: Vec::new(),
+            favourite_folders: Self::load_favourites(),
             help_scroll: 0,
             show_culling: false,
             import_popup: ImportPopupState::Hidden,
@@ -246,6 +287,9 @@ impl App {
             drop_import_rx: None,
             drop_import_cancel: None,
             drop_preview: None,
+            browser_scroll_offset: Cell::new(0),
+            show_favourites_bar: true,
+            last_clicked_favourite: None,
         }
     }
 
@@ -883,7 +927,9 @@ impl App {
         }
 
         let input_path = std::path::Path::new(&info.path);
-        let parent = input_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let parent = self.export_folder.clone().unwrap_or_else(|| {
+            input_path.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf()
+        });
         let stem = input_path.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
 
         let ext = match self.export_codec_family {
@@ -988,7 +1034,7 @@ impl App {
         self.status_message = format!("Export folder set");
     }
 
-    pub fn toggle_favourite_folder(&mut self, folder: std::path::PathBuf) {
+    pub fn toggle_favourite_folder(&mut self, folder: PathBuf) {
         if let Some(pos) = self.favourite_folders.iter().position(|f| f == &folder) {
             self.favourite_folders.remove(pos);
             self.status_message = "Removed from favourites".to_string();
@@ -996,19 +1042,31 @@ impl App {
             self.favourite_folders.push(folder);
             self.status_message = "Added to favourites".to_string();
         }
+        self.save_favourites();
     }
 
     pub fn import_selected_from_browser(&mut self) {
-        if let Some(entry) = self.browser.selected_entry() {
-            if entry.name.to_lowercase().ends_with(".mcraw") {
-                let path = entry.path.to_string_lossy().to_string();
-                self.load_file(path);
-                self.show_browser = false;
-            } else {
-                self.status_message = "Selected file is not a .mcraw file".to_string();
-            }
+        let paths = self.browser.selected_mcraw_paths();
+        if paths.is_empty() {
+            self.status_message = "No .mcraw files selected in browser".to_string();
+            return;
+        }
+        let count = paths.len();
+        let (imported, failed) = self.load_files_batch(&paths);
+        let msg = if failed > 0 {
+            format!("Imported {} file(s), {} failed", imported, failed)
         } else {
-            self.status_message = "No file selected in browser".to_string();
+            format!("Imported {} file(s)", imported)
+        };
+        self.status_message = msg;
+        // Clear selection checkboxes on imported files
+        for entry in self.browser.entries.iter_mut() {
+            if entry.selected && entry.name.to_lowercase().ends_with(".mcraw") {
+                entry.selected = false;
+            }
+        }
+        if count > 0 {
+            self.show_browser = false;
         }
     }
 
@@ -1108,15 +1166,11 @@ impl App {
             if is_dir {
                 self.browser.enter();
                 self.status_message = format!("Entered: {}", name);
+                self.show_favourites_bar = false;
             } else if name.ends_with(".mcraw") {
-                let path_str = path.to_string_lossy().into_owned();
-                let folder = path.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-                let all_in_folder = self.scan_mcraw_files_in_folder(&folder);
-                self.import_popup = ImportPopupState::DroppedFiles {
-                    files: vec![path_str.clone()],
-                    folder,
-                    all_in_folder,
-                };
+                let path_str = path.to_string_lossy().to_string();
+                self.load_file(path_str);
+                self.show_browser = false;
             } else {
                 self.status_message = format!("Cannot open: {} (not a .mcraw file)", name);
             }
@@ -1150,6 +1204,7 @@ impl App {
             BrowserDirection::Enter => self.select_file(),
             BrowserDirection::GoUp => {
                 self.browser.go_up();
+                self.show_favourites_bar = false;
             }
             BrowserDirection::ToggleHidden => self.browser.toggle_hidden(),
         }
@@ -1230,6 +1285,14 @@ fn execute_click_action(app: &mut App, action: ClickAction) {
         }
         ClickAction::AddSelectedToQueue => app.add_selected_to_queue(),
         ClickAction::AddAllToQueue => app.add_all_to_queue(),
+        ClickAction::RemoveSelectedFromMediaPool => app.remove_selected_from_media_pool(),
+        ClickAction::ToggleBrowserSelection(i) => {
+            if let Some(entry) = app.browser.entries.get_mut(i) {
+                if entry.name.to_lowercase().ends_with(".mcraw") {
+                    entry.selected = !entry.selected;
+                }
+            }
+        }
         ClickAction::RenderSelected => app.render_selected(),
         ClickAction::RenderAll => app.render_all(),
         ClickAction::ClearQueue => app.clear_completed_queue(),
@@ -1259,42 +1322,48 @@ fn execute_click_action(app: &mut App, action: ClickAction) {
             app.cycle_rate_control();
         }
         ClickAction::ImportOption1 => {
-            let files = if let ImportPopupState::DroppedFiles { files, .. } = &app.import_popup {
-                files.clone()
-            } else {
-                Vec::new()
-            };
-            if !files.is_empty() {
-                let count = files.len();
-                app.status_message = format!("Importing {} file(s)...", count);
-                let (imported, failed) = app.load_files_batch(&files);
-                if failed > 0 {
-                    app.status_message = format!("Imported {} file(s), {} failed", imported, failed);
-                } else {
-                    app.status_message = format!("Imported {} file(s)", imported);
+            if app.import_popup != ImportPopupState::Hidden {
+                if let ImportPopupState::DroppedFiles { files, .. } = &app.import_popup {
+                    let files = files.clone();
+                    if !files.is_empty() {
+                        let count = files.len();
+                        app.status_message = format!("Importing {} file(s)...", count);
+                        let (imported, failed) = app.load_files_batch(&files);
+                        if failed > 0 {
+                            app.status_message = format!("Imported {} file(s), {} failed", imported, failed);
+                        } else {
+                            app.status_message = format!("Imported {} file(s)", imported);
+                        }
+                    }
+                    app.import_popup = ImportPopupState::Hidden;
+                    app.show_browser = false;
                 }
+            } else if app.show_browser {
+                app.import_selected_from_browser();
             }
-            app.import_popup = ImportPopupState::Hidden;
-            app.show_browser = false;
         }
         ClickAction::ImportOption2 => {
-            let all_in_folder = if let ImportPopupState::DroppedFiles { all_in_folder, .. } = &app.import_popup {
-                all_in_folder.clone()
-            } else {
-                Vec::new()
-            };
-            if !all_in_folder.is_empty() {
-                let count = all_in_folder.len();
-                app.status_message = format!("Importing all {} file(s) from folder...", count);
-                let (imported, failed) = app.load_files_batch(&all_in_folder);
-                if failed > 0 {
-                    app.status_message = format!("Imported {} file(s), {} failed", imported, failed);
-                } else {
-                    app.status_message = format!("Imported all {} file(s)", imported);
+            if app.import_popup != ImportPopupState::Hidden {
+                if let ImportPopupState::DroppedFiles { all_in_folder, .. } = &app.import_popup {
+                    let all_in_folder = all_in_folder.clone();
+                    if !all_in_folder.is_empty() {
+                        let count = all_in_folder.len();
+                        app.status_message = format!("Importing all {} file(s) from folder...", count);
+                        let (imported, failed) = app.load_files_batch(&all_in_folder);
+                        if failed > 0 {
+                            app.status_message = format!("Imported {} file(s), {} failed", imported, failed);
+                        } else {
+                            app.status_message = format!("Imported all {} file(s)", imported);
+                        }
+                    }
+                    app.import_popup = ImportPopupState::Hidden;
+                    app.show_browser = false;
                 }
+            } else if app.show_browser {
+                let folder = app.browser.current_path.clone();
+                app.load_all_in_folder(&folder);
+                app.show_browser = false;
             }
-            app.import_popup = ImportPopupState::Hidden;
-            app.show_browser = false;
         }
         ClickAction::ClosePopup => { app.import_popup = ImportPopupState::Hidden; }
         ClickAction::ToggleHelp => { app.show_help = !app.show_help; }
@@ -1331,6 +1400,16 @@ fn execute_click_action(app: &mut App, action: ClickAction) {
         }
         ClickAction::BrowserGoUp => {
             app.navigate_browser(BrowserDirection::GoUp);
+        }
+        ClickAction::FavouriteNavigate(i) => {
+            if i < app.favourite_folders.len() {
+                let path = app.favourite_folders[i].clone();
+                app.browser = FileBrowser::from_path(path);
+                app.browser_scroll_offset = Cell::new(0);
+                app.show_favourites_bar = false;
+                app.last_clicked_favourite = Some((Instant::now(), i));
+                app.status_message = "Navigated to favourite folder".to_string();
+            }
         }
     }
 }
@@ -1757,14 +1836,16 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                 return;
             }
 
-            // Block mouse events when other overlays are active
-            if app.show_full_info || app.show_help {
+            // Block mouse events when full info overlay is active
+            if app.show_full_info {
                 return;
             }
 
             match mouse_event.kind {
                 MouseEventKind::ScrollUp => {
-                    if app.show_browser {
+                    if app.show_help {
+                        app.help_scroll = app.help_scroll.saturating_sub(1);
+                    } else if app.show_browser {
                         if app.browser.selected_index > 0 { app.browser.selected_index -= 1; }
                     } else {
                         match app.focus_target {
@@ -1794,7 +1875,9 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                     }
                 }
                 MouseEventKind::ScrollDown => {
-                    if app.show_browser {
+                    if app.show_help {
+                        app.help_scroll = app.help_scroll.saturating_add(1);
+                    } else if app.show_browser {
                         let len = app.browser.entries.len();
                         if len > 0 { app.browser.selected_index = (app.browser.selected_index + 1).min(len - 1); }
                     } else {
@@ -1992,6 +2075,17 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                         }
                     }
                     'd' => {
+                        // Remove the last-clicked favourite (within 2 seconds)
+                        if app.show_browser && app.show_favourites_bar {
+                            if let Some((ts, idx)) = app.last_clicked_favourite.take() {
+                                if ts.elapsed() < Duration::from_secs(2) && idx < app.favourite_folders.len() {
+                                    app.favourite_folders.remove(idx);
+                                    app.status_message = "Removed from favourites".to_string();
+                                    app.save_favourites();
+                                    return;
+                                }
+                            }
+                        }
                         match app.focus_target {
                             FocusTarget::MediaPool => app.remove_from_media_pool(),
                             FocusTarget::Queue => app.remove_from_queue(),
@@ -2036,6 +2130,12 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                     'o' => {
                         if app.show_browser {
                             app.set_export_folder(app.browser.current_path.clone());
+                        }
+                    }
+                    'f' => {
+                        if app.show_browser {
+                            app.show_favourites_bar = !app.show_favourites_bar;
+                            app.status_message = if app.show_favourites_bar { "Favourites bar shown".to_string() } else { "Favourites bar hidden".to_string() };
                         }
                     }
                     'F' => {
@@ -2153,7 +2253,9 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                     }
                 }
                 crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
-                    if app.show_browser {
+                    if app.show_help {
+                        app.help_scroll = app.help_scroll.saturating_sub(1);
+                    } else if app.show_browser {
                         app.navigate_browser(BrowserDirection::Up);
                     } else {
                         match app.focus_target {
@@ -2181,7 +2283,9 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                     }
                 }
                 crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
-                    if app.show_browser {
+                    if app.show_help {
+                        app.help_scroll = app.help_scroll.saturating_add(1);
+                    } else if app.show_browser {
                         app.navigate_browser(BrowserDirection::Down);
                     } else {
                         match app.focus_target {
@@ -2210,7 +2314,7 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                 }
                 crossterm::event::KeyCode::Char(' ') => {
                     if app.show_browser {
-                        app.navigate_browser(BrowserDirection::Enter);
+                        app.browser.toggle_selection();
                     } else {
                         match app.focus_target {
                             FocusTarget::MediaPool => app.toggle_media_pool_selection(),

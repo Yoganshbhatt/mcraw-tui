@@ -11,6 +11,7 @@ pub struct FileEntry {
     pub is_dir: bool,
     pub size: u64,
     pub file_info: Option<McrawFileInfo>,
+    pub selected: bool,
 }
 
 impl FileEntry {
@@ -27,6 +28,7 @@ impl FileEntry {
             is_dir,
             size,
             file_info: None,
+            selected: false,
         }
     }
 }
@@ -76,6 +78,7 @@ impl FileBrowser {
                 is_dir: true,
                 size: 0,
                 file_info: None,
+                selected: false,
             });
         }
 
@@ -141,8 +144,8 @@ impl FileBrowser {
     }
 
     /// Re-read the current directory if enough time has passed since the last
-    /// refresh.  Preserves the selected index as much as possible across the
-    /// re-read (the index is clamped if the new entry list is shorter).
+    /// refresh.  Preserves the selected index and checkbox selection state
+    /// across the re-read.
     pub fn try_refresh(&mut self) {
         let now = Instant::now();
         if now.duration_since(self.last_refresh).as_secs() < REFRESH_INTERVAL_SECS {
@@ -150,11 +153,21 @@ impl FileBrowser {
         }
         self.last_refresh = now;
 
-        // Remember the path of the currently selected entry so we can try to
-        // re-select it after the refresh.
+        // Save selection state across refresh
+        let old_selections: std::collections::HashMap<std::path::PathBuf, bool> = self.entries.iter()
+            .filter(|e| e.selected)
+            .map(|e| (e.path.clone(), e.selected))
+            .collect();
         let selected_path = self.entries.get(self.selected_index).map(|e| e.path.clone());
 
         self.entries = Self::list_dir(&self.current_path, self.show_hidden);
+
+        // Restore checkbox selections
+        for entry in self.entries.iter_mut() {
+            if let Some(&sel) = old_selections.get(&entry.path) {
+                entry.selected = sel;
+            }
+        }
 
         self.selected_index = selected_path
             .and_then(|p| self.entries.iter().position(|e| e.path == p))
@@ -174,6 +187,31 @@ impl FileBrowser {
         self.current_path
             .to_string_lossy()
             .to_string()
+    }
+
+    pub fn toggle_selection(&mut self) {
+        if let Some(entry) = self.entries.get_mut(self.selected_index) {
+            if entry.name.to_lowercase().ends_with(".mcraw") {
+                entry.selected = !entry.selected;
+            }
+        }
+    }
+
+    /// Collect paths of all selected .mcraw files, or the cursor file if none selected
+    pub fn selected_mcraw_paths(&self) -> Vec<String> {
+        let checked: Vec<String> = self.entries.iter()
+            .filter(|e| e.selected && e.name.to_lowercase().ends_with(".mcraw"))
+            .map(|e| e.path.to_string_lossy().to_string())
+            .collect();
+        if !checked.is_empty() {
+            return checked;
+        }
+        // fallback: current entry if it's a .mcraw
+        self.selected_entry()
+            .filter(|e| e.name.to_lowercase().ends_with(".mcraw"))
+            .map(|e| e.path.to_string_lossy().to_string())
+            .into_iter()
+            .collect()
     }
 }
 

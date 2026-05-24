@@ -87,6 +87,9 @@ pub enum ClickAction {
     BrowserSelectAndEnter(usize),
     BrowserEnter,
     BrowserGoUp,
+    RemoveSelectedFromMediaPool,
+    ToggleBrowserSelection(usize),
+    FavouriteNavigate(usize),
 }
 
 // ---------------------------------------------------------------------------
@@ -354,7 +357,6 @@ fn render_culling_screen(frame: &mut Frame, area: Rect, app: &App, regions: &mut
 // ---------------------------------------------------------------------------
 
 fn render_browser_overlay(frame: &mut Frame, area: Rect, app: &App, regions: &mut Vec<ClickRegion>) {
-    // Account for header (3 lines) and status bar (2 lines) = 5 lines total
     let browser_area = Rect {
         x: area.x,
         y: area.y + 3,
@@ -366,34 +368,29 @@ fn render_browser_overlay(frame: &mut Frame, area: Rect, app: &App, regions: &mu
 
     let path_display = app.browser.current_path_display();
     let inner_h = browser_area.height.saturating_sub(2);
-
-    // Favourites section at the top (up to 3 visible)
-    if !app.favourite_folders.is_empty() && inner_h >= 5 {
-        let fav_y = browser_area.y + 1;
-        let mut fav_spans = vec![
-            Span::styled(" ★ FAV ", Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD)),
-        ];
-        for (i, f) in app.favourite_folders.iter().enumerate().take(3) {
-            let disp = f.file_name().map(|n| n.to_string_lossy()).unwrap_or_else(|| f.to_string_lossy());
-            fav_spans.push(Span::styled(format!(" [{}]{}", i + 1, disp), Style::default().fg(Color::Cyan)));
-        }
-        if app.favourite_folders.len() > 3 {
-            fav_spans.push(Span::styled(" ...", Style::default().fg(Color::DarkGray)));
-        }
-        frame.render_widget(Paragraph::new(Line::from(fav_spans)), Rect { x: browser_area.x + 1, y: fav_y, width: browser_area.width.saturating_sub(2), height: 1 });
-    }
+    let has_room_for_buttons = inner_h >= 3;
+    let bar_rows: u16 = if app.show_favourites_bar && !app.favourite_folders.is_empty() { 1 } else { 0 };
 
     let items: Vec<ListItem> = app.browser.entries.iter().enumerate().map(|(_i, entry)| {
-        let icon = if entry.is_dir { "D " } else { "F " };
+        let is_mcraw = entry.name.to_lowercase().ends_with(".mcraw");
+        let checkbox = if is_mcraw {
+            if entry.selected {
+                Span::styled("[*] ", Style::default().fg(Palette::CHECKED).add_modifier(Modifier::BOLD))
+            } else {
+                Span::styled("[ ] ", Style::default().fg(Palette::UNCHECKED))
+            }
+        } else {
+            Span::styled("    ", Style::default())
+        };
         let name_style = if entry.is_dir {
             Style::default().fg(Palette::BROWSER_DIR)
-        } else if entry.name.to_lowercase().ends_with(".mcraw") {
+        } else if is_mcraw {
             Style::default().fg(Palette::BROWSER_MCRAW)
         } else {
             Style::default().fg(Palette::BROWSER_OTHER)
         };
         let mut content = vec![
-            Span::styled(icon, Style::default().fg(Palette::LABEL)),
+            checkbox,
             Span::styled(&entry.name, name_style),
         ];
         if let Some(ref info) = entry.file_info {
@@ -418,38 +415,95 @@ fn render_browser_overlay(frame: &mut Frame, area: Rect, app: &App, regions: &mu
         )
         .highlight_symbol("> ");
 
-    let mut state = ListState::default();
+    let mut state = ListState::default()
+        .with_offset(app.browser_scroll_offset.get());
     state.select(Some(app.browser.selected_index));
     frame.render_stateful_widget(list, browser_area, &mut state);
+    app.browser_scroll_offset.set(state.offset());
 
-    // Calculate scroll offset: List widget scrolls so selected item is visible
-    let visible_start = if app.browser.selected_index >= inner_h as usize {
-        app.browser.selected_index - inner_h as usize + 1
-    } else {
-        0
-    };
+    // Button row at the bottom
+    if has_room_for_buttons {
+        let btn_y = browser_area.y + browser_area.height.saturating_sub(2);
+        let btn_row = Rect {
+            x: browser_area.x + 2,
+            y: btn_y,
+            width: browser_area.width.saturating_sub(4),
+            height: 1,
+        };
+        let import_btn = Rect { x: btn_row.x, y: btn_row.y, width: 16, height: 1 };
+        regions.push(ClickRegion { area: import_btn, action: ClickAction::ImportOption1 });
+        let all_btn = Rect { x: btn_row.x + 17, y: btn_row.y, width: 10, height: 1 };
+        regions.push(ClickRegion { area: all_btn, action: ClickAction::ImportOption2 });
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" [I] Import Sel ", Style::default().fg(Palette::BUTTON_FG).bg(Palette::BUTTON_BG).add_modifier(Modifier::BOLD)),
+                Span::raw(" "),
+                Span::styled(" [L] All ", Style::default().fg(Palette::BUTTON_FG).bg(Palette::BUTTON_BG).add_modifier(Modifier::BOLD)),
+            ])),
+            btn_row,
+        );
+    }
 
-    for i in 0..inner_h as usize {
-        let entry_index = visible_start + i;
+    // Pinned favourites bar (rendered AFTER the List so it appears on top)
+    if bar_rows > 0 {
+        let fav_y = browser_area.y + 1;
+        let mut x = browser_area.x + 2;
+        let star_style = Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled("★", star_style))),
+            Rect { x: browser_area.x + 1, y: fav_y, width: 1, height: 1 },
+        );
+        for (i, f) in app.favourite_folders.iter().enumerate() {
+            if x >= browser_area.x + browser_area.width.saturating_sub(3) {
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled("…", Style::default().fg(Color::DarkGray))),
+                ), Rect { x, y: fav_y, width: 1, height: 1 });
+                break;
+            }
+            let disp = f.file_name().map(|n| n.to_string_lossy()).unwrap_or_else(|| f.to_string_lossy());
+            let text = format!(" {} ", disp);
+            let item_style = Style::default().fg(Color::Cyan).bg(Palette::HIGHLIGHT_BG);
+            let item_area = Rect { x, y: fav_y, width: text.len() as u16, height: 1 };
+            frame.render_widget(Paragraph::new(Line::from(Span::styled(&text, item_style))), item_area);
+            regions.push(ClickRegion { area: item_area, action: ClickAction::FavouriteNavigate(i) });
+            x = x.saturating_add(text.len() as u16 + 1);
+        }
+    }
+
+    // Click regions for list items, shifted down by bar_rows.
+    // The button row occupies the last inner row (overlap handled by button priority).
+    let list_h = inner_h.saturating_sub(bar_rows) as usize;
+    let visible_start = app.browser_scroll_offset.get();
+
+    for i in 0..list_h {
+        let entry_index = visible_start + bar_rows as usize + i;
         if entry_index >= app.browser.entries.len() {
             break;
         }
+        let is_mcraw = app.browser.entries[entry_index].name.to_lowercase().ends_with(".mcraw");
+
+        if is_mcraw {
+            let cb_area = Rect {
+                x: browser_area.x + 2,
+                y: browser_area.y + 1 + bar_rows + i as u16,
+                width: 4,
+                height: 1,
+            };
+            regions.push(ClickRegion { area: cb_area, action: ClickAction::ToggleBrowserSelection(entry_index) });
+        }
+
         let row_area = Rect {
-            x: browser_area.x + 1,
-            y: browser_area.y + 1 + i as u16,
-            width: browser_area.width.saturating_sub(2),
+            x: browser_area.x + 6,
+            y: browser_area.y + 1 + bar_rows + i as u16,
+            width: browser_area.width.saturating_sub(7),
             height: 1,
         };
-        let entry = &app.browser.entries[entry_index];
-        let action = if entry.name.to_lowercase().ends_with(".mcraw") {
+        let action = if is_mcraw {
             ClickAction::BrowserSelectAndEnter(entry_index)
         } else {
             ClickAction::BrowserNavigate(entry_index)
         };
-        regions.push(ClickRegion {
-            area: row_area,
-            action,
-        });
+        regions.push(ClickRegion { area: row_area, action });
     }
 }
 
@@ -540,11 +594,16 @@ fn render_media_pool(frame: &mut Frame, app: &App, area: Rect, regions: &mut Vec
             let add_all_btn = Rect { x: btn_row.x + 13, y: btn_row.y, width: 10, height: 1 };
             regions.push(ClickRegion { area: add_all_btn, action: ClickAction::AddAllToQueue });
 
+            let del_btn = Rect { x: btn_row.x + 24, y: btn_row.y, width: 10, height: 1 };
+            regions.push(ClickRegion { area: del_btn, action: ClickAction::RemoveSelectedFromMediaPool });
+
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled(" [a] Add ", Style::default().fg(Palette::BUTTON_FG).bg(Palette::BUTTON_BG).add_modifier(Modifier::BOLD)),
                     Span::raw(" "),
                     Span::styled(" [A] All ", Style::default().fg(Palette::BUTTON_FG).bg(Palette::BUTTON_BG).add_modifier(Modifier::BOLD)),
+                    Span::raw(" "),
+                    Span::styled(" [D] Del ", Style::default().fg(Palette::BUTTON_FG).bg(Palette::BUTTON_BG).add_modifier(Modifier::BOLD)),
                 ])),
                 btn_row,
             );
@@ -953,6 +1012,8 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect, regions: &mut Vec<Cli
         Span::styled(" Culling  ", Style::default().fg(Color::White)),
     ];
     if app.show_browser {
+        hints.push(Span::styled("[I]", Style::default().fg(Palette::STATUS_KEY)));
+        hints.push(Span::styled(" Import  ", Style::default().fg(Color::White)));
         hints.push(Span::styled("[L]", Style::default().fg(Palette::STATUS_KEY)));
         hints.push(Span::styled(" Load All  ", Style::default().fg(Color::White)));
         hints.push(Span::styled("[o]", Style::default().fg(Palette::STATUS_KEY)));
@@ -1429,11 +1490,11 @@ fn render_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::styled("  i          Edit custom rate (when export focused)", Style::default().fg(Palette::VALUE))),
         Line::from(""),
         Line::from(Span::styled("  Browser", Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD))),
-        Line::from(Span::styled("  Click      Select item", Style::default().fg(Palette::VALUE))),
-        Line::from(Span::styled("  Dbl-click  Open selected file/folder", Style::default().fg(Palette::VALUE))),
+        Line::from(Span::styled("  Click/Dbl  Select/Open file/folder", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  Enter      Open selected file/folder", Style::default().fg(Palette::VALUE))),
-        Line::from(Span::styled("  L          Load all .mcraw in current folder", Style::default().fg(Palette::VALUE))),
-        Line::from(Span::styled("  I          Import selected .mcraw from browser", Style::default().fg(Palette::VALUE))),
+        Line::from(Span::styled("  Space      Toggle selection checkbox", Style::default().fg(Palette::VALUE))),
+        Line::from(Span::styled("  I          Import selected .mcraw", Style::default().fg(Palette::VALUE))),
+        Line::from(Span::styled("  L          Load all .mcraw in folder", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  o          Set export folder to browser path", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  F          Toggle favourite folder", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  .          Toggle hidden files", Style::default().fg(Palette::VALUE))),
@@ -1454,7 +1515,7 @@ fn render_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         Line::from(Span::styled("  Logs: stored in app data directory, auto-cleaned after 7 days", Style::default().fg(Color::DarkGray))),
         Line::from(Span::styled("  Drag & drop .mcraw files onto the terminal to import", Style::default().fg(Color::DarkGray))),
-        Line::from(Span::styled("  PageUp/Dn  Scroll this help", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled("  ↑/↓, PageUp/Dn, Scroll wheel  Scroll this help", Style::default().fg(Color::DarkGray))),
     ];
 
     let inner_h = popup_area.height.saturating_sub(2) as usize;
