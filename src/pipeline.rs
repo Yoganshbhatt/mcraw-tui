@@ -1,8 +1,8 @@
 use crate::agx::{AgxConfig, AgxPipeline, Gamut, OutputTransfer, Transfer};
 use crate::color::{
     normalize_linear_f32, identity_ccm,
-    mat_mul_vec3, camera_to_xyz_matrix, interpolate_matrix,
-    build_cat16_output_matrix,
+    mat_mul_vec3, mat_mul_3x3, camera_to_xyz_matrix, interpolate_matrix,
+    build_cat16_output_matrix, xyz_from_chromaticities,
     D65_XYZ, xyz_to_rec709,
     BilinearDemosaic,
     ColorSpace, TransferFunction,
@@ -14,6 +14,7 @@ use crate::export::{
     ProResProfile, RateControl, Vp9Profile,
 };
 use crate::file::McrawFileInfo;
+use crate::gpu;
 use anyhow::{anyhow, Result};
 use crossbeam_channel::bounded;
 use rayon::prelude::*;
@@ -180,19 +181,18 @@ pub fn run_export(
     tracing::info!("export config: {}x{} @ {}fps, {} frames, bayer={}",
         active_width, active_height, fps, timestamps.len(), info.bayer_pattern.name());
 
-    // --- Build Camera→XYZ matrix from available DNG matrices ---
-    let cm1_f32: [f32; 9] = info.camera_metadata.color_matrix
-        .map(|cm| {
-            let mut ccm = [0.0f32; 9];
-            for (i, v) in cm.iter().enumerate() { ccm[i] = *v as f32; }
-            ccm
-        })
-        .unwrap_or_else(identity_ccm);
+    // --- Build Forward Matrix (Camera→XYZ) from available DNG matrices ---
+    // ForwardMatrix is the correct way to convert camera RGB to XYZ
+    let fm1_f32: Option<[f32; 9]> = info.camera_metadata.forward_matrix1.map(|fm| {
+        let mut f = [0.0f32; 9];
+        for (i, v) in fm.iter().enumerate() { f[i] = *v as f32; }
+        f
+    });
 
-    let cm2_f32: Option<[f32; 9]> = info.camera_metadata.color_matrix2.map(|cm| {
-        let mut ccm = [0.0f32; 9];
-        for (i, v) in cm.iter().enumerate() { ccm[i] = *v as f32; }
-        ccm
+    let fm2_f32: Option<[f32; 9]> = info.camera_metadata.forward_matrix2.map(|fm| {
+        let mut f = [0.0f32; 9];
+        for (i, v) in fm.iter().enumerate() { f[i] = *v as f32; }
+        f
     });
 
     let cal1_f32: Option<[f32; 9]> = info.camera_metadata.calibration_matrix1.map(|cm| {
@@ -206,24 +206,48 @@ pub fn run_export(
         ccm
     });
 
-    let cam_to_xyz: [f32; 9] = match (cm2_f32, cal1_f32, cal2_f32) {
-        (Some(ref cm2), Some(ref c1), Some(ref c2)) => {
-            let raw_cm1 = camera_to_xyz_matrix(&cm1_f32, Some(c1));
-            let raw_cm2 = camera_to_xyz_matrix(cm2, Some(c2));
-            interpolate_matrix(&raw_cm1, &raw_cm2, 0.5)
+    // Build Camera→XYZ matrix using ForwardMatrix approach
+    // NOTE: ForwardMatrix1 is already D50-adapted and includes calibration baked in.
+    // DO NOT multiply by calibration matrices again - that would be double-calibration.
+    // See DNG spec: ForwardMatrix1 = ColorMatrix1^(-1) × CalMatrix1^(-1)
+    let cam_to_xyz: [f32; 9] = match (fm1_f32, fm2_f32, cal1_f32, cal2_f32) {
+        (Some(ref fm1), Some(ref fm2), Some(ref c1), Some(ref c2)) => {
+            // Apply calibration FIRST (cal * fm), not fm * cal
+            let eff_fm1 = mat_mul_3x3(c1, fm1);
+            let eff_fm2 = mat_mul_3x3(c2, fm2);
+            interpolate_matrix(&eff_fm1, &eff_fm2, 0.5)
         }
-        (Some(ref cm2), _, _) => {
-            let raw_cm1 = camera_to_xyz_matrix(&cm1_f32, None);
-            let raw_cm2 = camera_to_xyz_matrix(cm2, None);
-            interpolate_matrix(&raw_cm1, &raw_cm2, 0.5)
+        (Some(ref fm1), Some(ref fm2), _, _) => {
+            interpolate_matrix(fm1, fm2, 0.5)
+        }
+        (Some(ref fm1), None, Some(ref c1), None) => {
+            // Apply calibration FIRST
+            mat_mul_3x3(c1, fm1)
+        }
+        (Some(ref fm1), None, None, None) => {
+            *fm1
         }
         _ => {
+            // Fallback to ColorMatrix if no ForwardMatrix available
+            let cm1_f32: [f32; 9] = info.camera_metadata.color_matrix
+                .map(|cm| {
+                    let mut ccm = [0.0f32; 9];
+                    for (i, v) in cm.iter().enumerate() { ccm[i] = *v as f32; }
+                    ccm
+                })
+                .unwrap_or_else(identity_ccm);
             camera_to_xyz_matrix(&cm1_f32, None)
         }
     };
 
+    // For scene-referred professional codecs (ProRes, DNxHR, HEVC) that will be graded later,
+    // we use a SIMPLE Camera→Output matrix WITHOUT CAT16 adaptation.
+    // CAT16 should be applied during GRADING in Davinci Resolve, not baked into the encode.
+    // This preserves the scene colorimetry for maximum flexibility in post.
+    let xyz_to_output = export_cs.get_xyz_to_rgb_matrix();
+    let cam_to_output = mat_mul_3x3(&xyz_to_output, &cam_to_xyz);
+
     let is_log = export_tf.is_log_bypass();
-    let target_xyz_to_rgb = export_cs.get_xyz_to_rgb_matrix();
 
     let pattern = info.bayer_pattern;
     let black_level = info.black_level;
@@ -325,6 +349,42 @@ pub fn run_export(
 
     let free_tx_writer = free_tx.clone();
 
+    // ----------------------------------------------------------------
+    // Initialize GPU RCD pipeline (best-effort, fallback to CPU on failure)
+    // ----------------------------------------------------------------
+    let filters = pattern.to_dcraw_filters();
+    let mut rcd_pipeline: Option<gpu::RcdPipeline> = None;
+    // For debug diagnostics
+    // Diagnostics: write path info to file alongside export output
+    use std::io::Write;
+    let diag_dir = std::path::Path::new(&output_path).parent().unwrap_or(std::path::Path::new(".")).to_owned();
+    let diag_path = diag_dir.join("rcd_diag.txt");
+    let mut diag_file = std::fs::File::create(&diag_path).ok();
+    macro_rules! diag { ($($arg:tt)*) => { if let Some(ref mut f) = diag_file { let _ = writeln!(f, $($arg)*); } }; }
+    diag!("active={}x{} stride={} offset={},{} bl={} wl={}", active_width, active_height, stride_width, offset_x, offset_y, black_level, white_level);
+    diag!("pattern={:?} filters=0x{:08x}", pattern, filters);
+    diag!("GPU init...");
+    match pollster::block_on(gpu::GpuContext::new()) {
+        Ok(ctx) => {
+            let ctx = std::sync::Arc::new(ctx);
+            match gpu::RcdPipeline::new(ctx, active_width, active_height) {
+                Ok(pipeline) => {
+                    diag!("GPU RCD pipeline OK");
+                    tracing::info!("GPU RCD pipeline initialized ({}x{})", active_width, active_height);
+                    rcd_pipeline = Some(pipeline);
+                }
+                Err(e) => {
+                    diag!("GPU RCD FAILED: {}", e);
+                    tracing::warn!("Failed to create RCD pipeline: {} — falling back to CPU demosaic", e);
+                }
+            }
+        }
+        Err(e) => {
+            diag!("No GPU adapter: {}", e);
+            tracing::warn!("No GPU adapter found: {} — falling back to CPU demosaic", e);
+        }
+    }
+
     // ==================================================================
     // Stage 1 — Loader thread: raw frame I/O
     // ==================================================================
@@ -333,6 +393,9 @@ pub fn run_export(
         .spawn({
             let cancelled = cancelled.clone();
             move || -> Result<()> {
+                let mut t_load_us: f64 = 0.0;
+                let mut frame_count: u64 = 0;
+
                 for ts in &timestamps {
                     if cancelled.load(Ordering::Relaxed) {
                         break;
@@ -342,7 +405,9 @@ pub fn run_export(
                         .recv()
                         .map_err(|_| anyhow!("Loader: free pool closed prematurely"))?;
 
+                    let t0 = std::time::Instant::now();
                     let (bayer, frame_meta) = decoder.load_frame(*ts)?;
+                    t_load_us += t0.elapsed().as_secs_f64() * 1e6;
 
                     slot.bayer = bayer;
                     slot.as_shot_neutral = frame_meta.as_shot_neutral;
@@ -350,6 +415,24 @@ pub fn run_export(
                     loaded_tx
                         .send(slot)
                         .map_err(|_| anyhow!("Loader: processor channel closed"))?;
+
+                    frame_count += 1;
+                }
+
+                if frame_count > 0 {
+                    let avg_load = t_load_us / frame_count as f64;
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let msg = format!("[{}] loader  {:>4} frames: load={:.1}us  per-frame\n", ts, frame_count, avg_load);
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("timing_results.txt")
+                    {
+                        let _ = std::io::Write::write_all(&mut f, msg.as_bytes());
+                    }
                 }
 
                 drop(loaded_tx);
@@ -374,7 +457,7 @@ pub fn run_export(
     };
 
     // ==================================================================
-    // Stage 2 — Processor thread: demosaic → color pipeline → OETF → u16
+    // Stage 2 — Processor thread: GPU RCD → CPU fallback → color → OETF
     // ==================================================================
     let processor_handle = std::thread::Builder::new()
         .name("processor".into())
@@ -384,98 +467,215 @@ pub fn run_export(
                 let mut rgb = vec![0.0f32; pixel_count * 3];
                 let demosaic = BilinearDemosaic::new(pattern);
 
+                let mut prev_as_shot: Option<[f32; 3]> = None;
+                let mut wb_change_count = 0u64;
+
+                // Accumulated microsecond counters for benchmarking
+                let mut t_demosaic_us: f64 = 0.0;
+                let mut t_normalize_us: f64 = 0.0;
+                let mut t_color_us: f64 = 0.0;
+                let mut t_convert_us: f64 = 0.0;
+                let mut t_proc_total_us: f64 = 0.0;
+                let mut frame_count: u64 = 0;
+
                 for mut slot in loaded_rx {
                     if cancelled.load(Ordering::Relaxed) {
                         break;
                     }
 
+                    let t_frame_start = std::time::Instant::now();
+                    frame_count += 1;
+                    
+                    // Clear frame buffer to prevent stale data from previous frames
+                    slot.frame_bytes.fill(0);
+                    
                     let as_shot = slot.as_shot_neutral;
-                    let (r_gain, b_gain) = if as_shot[0] > 1e-6 && as_shot[1] > 1e-6 && as_shot[2] > 1e-6 {
-                        (as_shot[1] / as_shot[0], as_shot[1] / as_shot[2])
+                    let wb_r_debug = if as_shot[0] > 1e-6 && as_shot[1] > 1e-6 {
+                        as_shot[1] / as_shot[0]
                     } else {
-                        (1.0, 1.0)
+                        1.0
                     };
-
-                    let scene_white_xyz: [f32; 3] = if as_shot[0] > 1e-6 && as_shot[1] > 1e-6 && as_shot[2] > 1e-6 {
-                        mat_mul_vec3(&cam_to_xyz, &as_shot)
+                    let wb_b_debug = if as_shot[2] > 1e-6 && as_shot[1] > 1e-6 {
+                        as_shot[1] / as_shot[2]
                     } else {
-                        [D65_XYZ[0], D65_XYZ[1], D65_XYZ[2]]
+                        1.0
                     };
-
-                    let output_matrix = if is_log { &target_xyz_to_rgb } else { &xyz_to_rec };
-                    let fused = build_cat16_output_matrix(&cam_to_xyz, &scene_white_xyz, &D65_XYZ, output_matrix);
-
-                    demosaic.process_par_into(
-                        &slot.bayer, stride_width, offset_x, offset_y,
-                        active_width, active_height, &pattern, &mut rgb,
-                    )?;
-                    normalize_linear_f32(&mut rgb, black_level as f32, white_level as f32);
-
-                    let use_agx_frame = use_agx;
-                    rgb.par_chunks_exact_mut(3).for_each(|chunk| {
-                        let r = chunk[0] * r_gain;
-                        let g = chunk[1];
-                        let b = chunk[2] * b_gain;
-
-                        if use_agx_frame {
-                            // AgX will handle highlight roll-off and tone mapping;
-                            // just apply CAT16 white-balance adaptation and move on.
-                            let rr = r / r_gain;
-                            let bb = b / b_gain;
-                            let out = mat_mul_vec3(&fused, &[rr, g, bb]);
-                            chunk[0] = out[0].max(0.0);
-                            chunk[1] = out[1].max(0.0);
-                            chunk[2] = out[2].max(0.0);
-                        } else {
-                            let max_val = r.max(g).max(b);
-                            let (r, g, b) = if max_val > 0.95f32 {
-                                let t = ((max_val - 0.95) / 0.05).min(1.0);
-                                (r + (max_val - r) * t,
-                                 g + (max_val - g) * t,
-                                 b + (max_val - b) * t)
-                            } else {
-                                (r, g, b)
-                            };
-
-                            let rr = r / r_gain;
-                            let bb = b / b_gain;
-
-                            let out = mat_mul_vec3(&fused, &[rr, g, bb]);
-                            chunk[0] = out[0].max(0.0);
-                            chunk[1] = out[1].max(0.0);
-                            chunk[2] = out[2].max(0.0);
+                    if let Some(prev) = prev_as_shot {
+                        let delta_r = (as_shot[0] - prev[0]).abs();
+                        let delta_b = (as_shot[2] - prev[2]).abs();
+                        if delta_r > 0.05 || delta_b > 0.05 {
+                            wb_change_count += 1;
+                            tracing::warn!(
+                                "Frame {}: WB shift detected - ΔR={:.3}, ΔB={:.3} (may cause color flicker)",
+                                frame_count, delta_r, delta_b
+                            );
                         }
-                    });
+                    }
+                    prev_as_shot = Some(as_shot);
 
-                    if let Some(ref agx) = agx_pipeline {
-                        // Full AgX tone mapping pipeline: tone scale, gamut
-                        // compression, and BT.1886 gamma 2.4 output.
-                        agx.process_frame(&mut rgb);
-                    } else if is_log {
-                        export_tf.process(&mut rgb);
-                    } else {
-                        rgb.par_iter_mut().for_each(|v| {
-                            if *v < 0.0 { *v = 0.0; }
-                            *v = if *v < 0.018 { 4.5 * *v } else { 1.099 * v.powf(0.45) - 0.099 };
-                        });
+                    // Use the pre-computed Camera→Output matrix with CAT16 adaptation
+                    // WB multipliers will be applied in the shader
+                    let fused = cam_to_output;
+
+                    if frame_count == 1 {
+                        let _ = std::fs::write("wb_debug.txt",
+                            format!("Frame 1 WB: as_shot=[{:.4}, {:.4}, {:.4}] wb_r={:.4} wb_b={:.4}\n\
+ cam_to_output matrix:\n  [{:.4}, {:.4}, {:.4}]\n  [{:.4}, {:.4}, {:.4}]\n  [{:.5}, {:.5}, {:.5}]\n",
+                                as_shot[0], as_shot[1], as_shot[2], wb_r_debug, wb_b_debug,
+                                fused[0], fused[1], fused[2],
+                                fused[3], fused[4], fused[5],
+                                fused[6], fused[7], fused[8]));
                     }
 
-                    slot.frame_bytes.par_chunks_exact_mut(6).enumerate().for_each(|(pi, out)| {
-                        let base = pi * 3;
-                        let ru = (rgb[base].clamp(0.0, 1.0) * 65535.0) as u16;
-                        let gu = (rgb[base + 1].clamp(0.0, 1.0) * 65535.0) as u16;
-                        let bu = (rgb[base + 2].clamp(0.0, 1.0) * 65535.0) as u16;
-                        out[0] = ru as u8;
-                        out[1] = (ru >> 8) as u8;
-                        out[2] = gu as u8;
-                        out[3] = (gu >> 8) as u8;
-                        out[4] = bu as u8;
-                        out[5] = (bu >> 8) as u8;
-                    });
+                    // Try GPU RCD (full color pipeline on-GPU, returns packed u8 RGB)
+                    let t0 = std::time::Instant::now();
+                    let gpu_ok = if let Some(ref mut pipeline) = rcd_pipeline {
+                        match pipeline.process(&slot.bayer, filters, black_level as f32, white_level as f32, stride_width, offset_x, offset_y, &fused, &slot.as_shot_neutral) {
+                            Ok(packed) => {
+                                t_demosaic_us += t0.elapsed().as_secs_f64() * 1e6;
+                                // Unpack packed u32 → u16 LE frame_bytes
+                                slot.frame_bytes.par_chunks_exact_mut(6).enumerate().for_each(|(pi, out)| {
+                                    let p = packed[pi];
+                                    let r = (p & 0xFF) as u16 * 257;
+                                    let g = ((p >> 8) & 0xFF) as u16 * 257;
+                                    let b = ((p >> 16) & 0xFF) as u16 * 257;
+                                    out[0] = r as u8;
+                                    out[1] = (r >> 8) as u8;
+                                    out[2] = g as u8;
+                                    out[3] = (g >> 8) as u8;
+                                    out[4] = b as u8;
+                                    out[5] = (b >> 8) as u8;
+                                });
+                                true
+                            }
+                            Err(e) => {
+                                diag!("GPU RCD process FAILED: {} — falling back to CPU", e);
+                                tracing::warn!("GPU RCD failed for frame: {} — falling back to CPU", e);
+                                false
+                            }
+                        }
+                    } else {
+                        diag!("GPU RCD not available — using CPU bilinear");
+                        false
+                    };
+
+                    if !gpu_ok {
+                        let t_cpu = std::time::Instant::now();
+                        demosaic.process_par_into(
+                            &slot.bayer, stride_width, offset_x, offset_y,
+                            active_width, active_height, &pattern, &mut rgb,
+                        )?;
+                        t_demosaic_us += t_cpu.elapsed().as_secs_f64() * 1e6;
+                        let t1 = std::time::Instant::now();
+                        normalize_linear_f32(&mut rgb, black_level as f32, white_level as f32);
+                        t_normalize_us += t1.elapsed().as_secs_f64() * 1e6;
+
+                        let wb_r = if as_shot[0] > 1e-6 && as_shot[1] > 1e-6 {
+                            as_shot[1] / as_shot[0]
+                        } else {
+                            1.0
+                        };
+                        let wb_b = if as_shot[2] > 1e-6 && as_shot[1] > 1e-6 {
+                            as_shot[1] / as_shot[2]
+                        } else {
+                            1.0
+                        };
+
+                        let use_agx_frame = use_agx;
+                        let t2 = std::time::Instant::now();
+                        rgb.par_chunks_exact_mut(3).for_each(|chunk| {
+                            if use_agx_frame {
+                                let rr = chunk[0];
+                                let gg = chunk[1];
+                                let bb = chunk[2];
+                                let out = mat_mul_vec3(&fused, &[rr, gg, bb]);
+                                chunk[0] = out[0].max(0.0);
+                                chunk[1] = out[1].max(0.0);
+                                chunk[2] = out[2].max(0.0);
+                            } else {
+                                let raw_r = chunk[0];
+                                let raw_g = chunk[1];
+                                let raw_b = chunk[2];
+
+                                // Apply White Balance gains
+                                let rw = raw_r * wb_r;
+                                let gw = raw_g;
+                                let bw = raw_b * wb_b;
+
+                                // Apply combined matrix (ForwardMatrix + CAT16 + OutputMatrix)
+                                let out = mat_mul_vec3(&fused, &[rw, gw, bw]);
+                                chunk[0] = out[0].max(0.0);
+                                chunk[1] = out[1].max(0.0);
+                                chunk[2] = out[2].max(0.0);
+                            }
+                        });
+
+                        if let Some(ref agx) = agx_pipeline {
+                            agx.process_frame(&mut rgb);
+                        } else if is_log {
+                            export_tf.process(&mut rgb);
+                        } else {
+                            rgb.par_iter_mut().for_each(|v| {
+                                if *v < 0.0 { *v = 0.0; }
+                                *v = if *v < 0.018 { 4.5 * *v } else { 1.099 * v.powf(0.45) - 0.099 };
+                            });
+                        }
+                        t_color_us += t2.elapsed().as_secs_f64() * 1e6;
+
+                        let t3 = std::time::Instant::now();
+                        slot.frame_bytes.par_chunks_exact_mut(6).enumerate().for_each(|(pi, out)| {
+                            let base = pi * 3;
+                            let ru = (rgb[base].clamp(0.0, 1.0) * 65535.0) as u16;
+                            let gu = (rgb[base + 1].clamp(0.0, 1.0) * 65535.0) as u16;
+                            let bu = (rgb[base + 2].clamp(0.0, 1.0) * 65535.0) as u16;
+                            out[0] = ru as u8;
+                            out[1] = (ru >> 8) as u8;
+                            out[2] = gu as u8;
+                            out[3] = (gu >> 8) as u8;
+                            out[4] = bu as u8;
+                            out[5] = (bu >> 8) as u8;
+                        });
+                        t_convert_us += t3.elapsed().as_secs_f64() * 1e6;
+                    }
+
+                    t_proc_total_us += t_frame_start.elapsed().as_secs_f64() * 1e6;
 
                     processed_tx
                         .send(slot)
                         .map_err(|_| anyhow!("Processor: writer channel closed"))?;
+                }
+
+                if frame_count > 0 {
+                    let avg_demosaic = t_demosaic_us / frame_count as f64;
+                    let avg_normalize = t_normalize_us / frame_count as f64;
+                    let avg_color = t_color_us / frame_count as f64;
+                    let avg_convert = t_convert_us / frame_count as f64;
+                    let avg_proc = t_proc_total_us / frame_count as f64;
+                    let avg_sub = avg_demosaic + avg_normalize + avg_color + avg_convert;
+                    let fps = 1e6 / avg_proc.max(1.0);
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let msg = format!(
+                        "[{}] proc     {:>4} frames: demosaic={:.1}us  normalize={:.1}us  color={:.1}us  convert={:.1}us  subtotal={:.1}us  wall={:.1}us ({:.1} fps)\n",
+                        ts, frame_count, avg_demosaic, avg_normalize, avg_color, avg_convert, avg_sub, avg_proc, fps,
+                    );
+                    tracing::info!("{}", msg.trim());
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("timing_results.txt")
+                    {
+                        let _ = std::io::Write::write_all(&mut f, msg.as_bytes());
+                    }
+                    
+                    if wb_change_count > 0 {
+                        tracing::warn!(
+                            "Color stability report: {} frames had WB shifts >5% - this may cause visible color flicker during playback",
+                            wb_change_count
+                        );
+                    }
                 }
 
                 drop(processed_tx);
@@ -528,6 +728,7 @@ pub fn run_export(
         .name("writer".into())
         .spawn(move || -> Result<()> {
             let mut frames_written: usize = 0;
+            let mut t_write_us: f64 = 0.0;
 
             for slot in processed_rx {
                 if writer_cancelled.load(Ordering::Relaxed) {
@@ -537,12 +738,31 @@ pub fn run_export(
                     return Ok(());
                 }
 
+                let t0 = std::time::Instant::now();
                 encoder.push_frame(&slot.frame_bytes)?;
+                t_write_us += t0.elapsed().as_secs_f64() * 1e6;
 
                 frames_written += 1;
                 on_progress(frames_written as f64 / total_frames as f64 * 100.0);
 
                 let _ = free_tx_writer.send(slot);
+            }
+
+            if frames_written > 0 {
+                let avg_write = t_write_us / frames_written as f64;
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let msg = format!("[{}] writer  {:>4} frames: push={:.1}us  per-frame\n",
+                    ts, frames_written, avg_write);
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("timing_results.txt")
+                {
+                    let _ = std::io::Write::write_all(&mut f, msg.as_bytes());
+                }
             }
 
             // Double-check cancel flag: processed_rx may have been dropped
