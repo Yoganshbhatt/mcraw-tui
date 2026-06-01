@@ -4,6 +4,8 @@ mod cli;
 mod color;
 mod decoder;
 mod dng_writer;
+mod gpu;
+
 mod encoder;
 mod error;
 mod export;

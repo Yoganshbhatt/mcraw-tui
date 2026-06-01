@@ -78,6 +78,22 @@ pub enum ExportEvent {
     Done(Result<()>),
 }
 
+/// Snapshot of the most recently finished export. Kept so the UI can show a
+/// post-render summary (codec, settings, elapsed time, output path, etc.)
+/// instead of immediately reverting to the preview panel.
+#[derive(Debug, Clone)]
+pub struct ExportSummary {
+    pub output_path: String,
+    pub codec_label: String,
+    pub profile_label: String,
+    pub color_space: String,
+    pub transfer: String,
+    pub rate_control: String,
+    pub frame_count: usize,
+    pub elapsed: Duration,
+    pub result: Result<(), String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Screen {
     Browse,
@@ -103,6 +119,15 @@ pub struct App {
     pub export_progress: f64,
     pub export_rx: Option<mpsc::Receiver<ExportEvent>>,
     pub cancel_token: Option<Arc<AtomicBool>>,
+
+    /// Snapshot of the most-recent finished export — drives the post-render
+    /// summary panel. Cleared when the user starts a new export.
+    pub last_export_summary: Option<ExportSummary>,
+
+    /// Settings captured at `start_export` time so `poll_export` can build
+    /// an accurate `ExportSummary` even if the user has since cycled the
+    /// export-settings panel to different values.
+    pub pending_export_summary: Option<ExportSummary>,
 
     // Which queue item is currently being rendered (for sequential batch)
     pub current_rendering_index: Option<usize>,
@@ -251,6 +276,8 @@ impl App {
             export_progress: 0.0,
             export_rx: None,
             cancel_token: None,
+            last_export_summary: None,
+            pending_export_summary: None,
 
             export_color_space: ColorSpace::Rec709,
             export_transfer_function: TransferFunction::Gamma24,
@@ -261,7 +288,7 @@ impl App {
             prores_profile: ProResProfile::HQ,
             dnxhr_profile: DnxhrProfile::HQX,
             hevc_profile: HevcProfile::Main10_420,
-            h264_profile: H264Profile::Main_8bit,
+            h264_profile: H264Profile::Main8bit,
             av1_profile: Av1Profile::Profile0_420_10bit,
             vp9_profile: Vp9Profile::Profile2_420_10bit,
 
@@ -969,6 +996,24 @@ impl App {
         self.export_cancelled = false;
         self.export_progress = 0.0;
         self.export_start_time = Some(Instant::now());
+        // Starting a fresh export — drop any previous summary so the UI
+        // switches from the post-render panel back to the live progress
+        // panel.
+        self.last_export_summary = None;
+        // Capture the settings that this export was launched with so the
+        // summary stays accurate even if the user cycles the export-settings
+        // panel mid-render.
+        self.pending_export_summary = Some(ExportSummary {
+            output_path: output_path.clone(),
+            codec_label: cf.name().to_string(),
+            profile_label: self.active_profile_name().to_string(),
+            color_space: cs.name().to_string(),
+            transfer: tf.name().to_string(),
+            rate_control: self.active_rate_control.name(),
+            frame_count: info.frame_count as usize,
+            elapsed: Duration::default(),
+            result: Ok(()),
+        });
         // Mark queue item as Rendering
         if let Some(idx) = self.current_rendering_index {
             if idx < self.queue.len() {
@@ -1097,6 +1142,10 @@ impl App {
                     self.is_exporting = false;
                     keep_rx = false;
                     self.cancel_token = None;
+                    let elapsed = self.export_start_time
+                        .take()
+                        .map(|t| t.elapsed())
+                        .unwrap_or_default();
                     // Mark the currently rendering item
                     if let Some(idx) = self.current_rendering_index {
                         if idx < self.queue.len() {
@@ -1115,15 +1164,26 @@ impl App {
                             }
                         }
                     }
+                    // Build the post-render summary. Always shown (success,
+                    // failure, or cancellation) so the user can see what
+                    // ran and for how long.
+                    if let Some(mut summary) = self.pending_export_summary.take() {
+                        summary.elapsed = elapsed;
+                        summary.result = if self.export_cancelled {
+                            Err("Cancelled by user".to_string())
+                        } else {
+                            match &result {
+                                Ok(()) => Ok(()),
+                                Err(e) => Err(e.to_string()),
+                            }
+                        };
+                        self.last_export_summary = Some(summary);
+                    }
                     if self.export_cancelled {
                         self.status_message = "Export cancelled".to_string();
                         self.export_cancelled = false;
                         self.current_rendering_index = None;
                     } else {
-                        let elapsed = self.export_start_time
-                            .take()
-                            .map(|t| t.elapsed())
-                            .unwrap_or_default();
                         let mins = elapsed.as_secs() / 60;
                         let secs = elapsed.as_secs() % 60;
                         match result {
@@ -1936,6 +1996,17 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                     return;
                 }
             }
+            // Ctrl+X cancels an in-progress export. Outside of an export it
+            // is a no-op so it never accidentally trashes the queue.
+            if let crossterm::event::KeyCode::Char('x') = key_event.code {
+                if key_event.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+                    if app.is_exporting {
+                        tracing::info!("ctrl+x received, cancelling export");
+                        app.cancel_export();
+                    }
+                    return;
+                }
+            }
 
             tracing::debug!("key event: code={:?} modifiers={:?}", key_event.code, key_event.modifiers);
 
@@ -2094,10 +2165,23 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                         }
                     }
                     'x' => {
-                        app.clear_completed_queue();
+                        // When an export is running, `x` (and Ctrl+X) cancel it.
+                        // Otherwise it clears completed/failed items from the queue.
+                        if app.is_exporting {
+                            app.cancel_export();
+                        } else {
+                            app.clear_completed_queue();
+                        }
+                    }
+                    'X' => {
+                        if app.is_exporting {
+                            app.cancel_export();
+                        } else {
+                            app.clear_completed_queue();
+                        }
                     }
                     'v' => {
-                        app.start_export();
+                        app.render_selected();
                     }
                     'R' => {
                         app.render_all();

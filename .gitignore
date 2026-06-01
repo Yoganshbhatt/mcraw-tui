@@ -23,3 +23,11 @@ Cargo.lock
 # OS
 .DS_Store
 Thumbs.db
+
+# Debug artifacts
+References/
+timing_results.txt
+wb_debug.txt
+ffmpeg_debug.txt
+rcd_diag.txt
+desktop.ini

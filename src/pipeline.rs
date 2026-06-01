@@ -1,19 +1,13 @@
-use crate::agx::{AgxConfig, AgxPipeline, Gamut, OutputTransfer, Transfer};
 use crate::color::{
-    normalize_linear_f32, identity_ccm,
-    mat_mul_vec3, camera_to_xyz_matrix, interpolate_matrix,
-    build_cat16_output_matrix,
-    D65_XYZ, xyz_to_rec709,
-    BilinearDemosaic,
-    ColorSpace, TransferFunction,
+    normalize_linear_f32, identity_ccm, mat_mul_vec3, mat_mul_3x3, camera_to_xyz_matrix, interpolate_matrix,
+    BilinearDemosaic, ColorSpace, TransferFunction, build_bradford_matrix, D65_XYZ,
+    forward_to_camera_xyz, detect_camera_to_xyz,
 };
 use crate::decoder::Decoder;
 use crate::encoder::VideoEncoder;
-use crate::export::{
-    Av1Profile, CodecFamily, DnxhrProfile, H264Profile, HevcProfile,
-    ProResProfile, RateControl, Vp9Profile,
-};
+use crate::export::{Av1Profile, CodecFamily, DnxhrProfile, H264Profile, HevcProfile, ProResProfile, RateControl, Vp9Profile};
 use crate::file::McrawFileInfo;
+use crate::gpu;
 use anyhow::{anyhow, Result};
 use crossbeam_channel::bounded;
 use rayon::prelude::*;
@@ -22,588 +16,369 @@ use std::io::{BufWriter, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Number of frame slots in the producer-consumer pool.
 const PIPELINE_DEPTH: usize = 3;
+struct FrameSlot { bayer: Vec<u16>, frame_bytes: Vec<u8>, as_shot_neutral: [f32; 3] }
 
-/// A pre-allocated buffer slot that circulates through the pipeline stages.
-struct FrameSlot {
-    bayer: Vec<u16>,
-    frame_bytes: Vec<u8>,
-    as_shot_neutral: [f32; 3],
-}
-
-/// Build FFmpeg codec arguments.
-/// Delegates to `CodecFamily::to_ffmpeg_args` which independently resolves
-/// the codec family, the user-chosen profile, and the runtime-detected
-/// encoder names.
-pub fn build_ffmpeg_codec_args(
-    family: CodecFamily,
-    hevc_encoder: &str,
-    h264_encoder: &str,
-    av1_encoder: &str,
-    prores_encoder: &str,
-    prores: ProResProfile,
-    dnxhr: DnxhrProfile,
-    hevc: HevcProfile,
-    h264: H264Profile,
-    av1: Av1Profile,
-    vp9: Vp9Profile,
-    rate_control: &RateControl,
-) -> (String, String, Vec<String>) {
+pub fn build_ffmpeg_codec_args(family: CodecFamily, hevc_encoder: &str, h264_encoder: &str, av1_encoder: &str, prores_encoder: &str, prores: ProResProfile, dnxhr: DnxhrProfile, hevc: HevcProfile, h264: H264Profile, av1: Av1Profile, vp9: Vp9Profile, rate_control: &RateControl) -> (String, String, Vec<String>) {
     family.to_ffmpeg_args(hevc_encoder, h264_encoder, av1_encoder, prores_encoder, prores, dnxhr, hevc, h264, av1, vp9, rate_control)
 }
 
+/// Map our `ColorSpace` / `TransferFunction` to **valid** FFmpeg VUI codes.
+///
+/// FFmpeg only accepts a fixed enum of ITU-R / SMPTE color tags. Camera-vendor
+/// gamuts (S-Gamut3, ARRI WG, V-Gamut, etc.) have no standard code, so we
+/// signal `bt2020` (the closest superset wide-gamut tag) for primaries and
+/// `bt2020nc` for the matrix coefficients. Log curves with no standard TRC
+/// code are signalled as `unknown` — downstream tools should rely on the
+/// filename / sidecar to identify the actual curve.
+///
+/// Returning an empty vec is also valid (FFmpeg will simply omit VUI tags),
+/// but we always emit something so the bitstream is self-describing.
 pub fn get_ffmpeg_vui_tags(color_space: &ColorSpace, transfer: &TransferFunction) -> Vec<&'static str> {
     let (primaries, matrix) = match color_space {
         ColorSpace::Rec709 | ColorSpace::Srgb => ("bt709", "bt709"),
         ColorSpace::Rec2020 => ("bt2020", "bt2020nc"),
-        ColorSpace::DciP3 | ColorSpace::DisplayP3 => ("smpte432", "bt2020nc"),
-        ColorSpace::SGamut3Cine | ColorSpace::SGamut3
-        | ColorSpace::ARRIWideGamut3 | ColorSpace::ARRIWideGamut4
-        | ColorSpace::CanonCinemaGamut | ColorSpace::PanasonicVGamut
-        | ColorSpace::FGamut | ColorSpace::FGamutC
-        | ColorSpace::DaVinciWideGamut | ColorSpace::ACESAP1 => ("bt2020", "bt2020nc"),
+        ColorSpace::DciP3 => ("smpte431", "bt2020nc"),
+        ColorSpace::DisplayP3 => ("smpte432", "bt2020nc"),
+        // Camera-vendor wide gamuts: no standard FFmpeg tag exists.
+        // Signal the closest superset (bt2020) so the bitstream is at least
+        // syntactically valid and decoders treat it as wide-gamut content.
+        ColorSpace::FGamut
+        | ColorSpace::FGamutC
+        | ColorSpace::SGamut3
+        | ColorSpace::SGamut3Cine
+        | ColorSpace::ARRIWideGamut3
+        | ColorSpace::ARRIWideGamut4
+        | ColorSpace::CanonCinemaGamut
+        | ColorSpace::PanasonicVGamut
+        | ColorSpace::DaVinciWideGamut
+        | ColorSpace::ACESAP1 => ("bt2020", "bt2020nc"),
     };
-
     let trc = match transfer {
         TransferFunction::Rec709 => "bt709",
+        // Display gamma 2.4 has no dedicated FFmpeg code; bt709 is the
+        // standard display-referred tag and is the safest choice.
+        TransferFunction::Gamma24 => "bt709",
         TransferFunction::HLG => "arib-std-b67",
         TransferFunction::PQ => "smpte2084",
         TransferFunction::Linear => "linear",
-        TransferFunction::SLog3 | TransferFunction::VLog
-        | TransferFunction::ARRIlog3 | TransferFunction::CLog3
-        | TransferFunction::FLog2 | TransferFunction::AppleLog
-        | TransferFunction::AppleLog2 | TransferFunction::ACESCCT
-        | TransferFunction::DaVinciIntermediate => "bt709",
-        TransferFunction::Gamma24 => "bt709",
+        // Camera log curves (S-Log3, V-Log, ARRI LogC3, C-Log3, F-Log2,
+        // Apple Log, ACEScct, DaVinci Intermediate) have no standard
+        // FFmpeg/ITU TRC code. `unknown` tells decoders not to attempt
+        // any inverse-OETF — the metadata / filename identifies the curve.
+        _ => "unknown",
     };
-
     vec!["-color_primaries", primaries, "-color_trc", trc, "-colorspace", matrix]
 }
 
-// ---------------------------------------------------------------------------
-// CinemaDNG export — COMING SOON
-// Future: export RAW video sequence with LJ92 lossless compression fully
-// compatible with DaVinci Resolve. Will add ProjFS (Windows), FUSE (Linux),
-// and the macOS equivalent for folder mounting alongside the export.
-// ---------------------------------------------------------------------------
-
 pub fn run_naked(info: &McrawFileInfo, output_path: &str) -> Result<()> {
     tracing::info!("run_naked: input={} output={}", info.path, output_path);
-    let decoder = Decoder::new(&info.path)?;
-    let timestamps = decoder.timestamps()?;
-
-    if timestamps.is_empty() {
-        return Err(anyhow!("No frames found in file"));
-    }
-
-    tracing::debug!("run_naked: {} frames to dump", timestamps.len());
-
+    let decoder = Decoder::new(&info.path)?; let timestamps = decoder.timestamps()?;
+    if timestamps.is_empty() { return Err(anyhow!("No frames found in file")); }
     let mut out_file = fs::File::create(output_path)?;
-
-    for ts in &timestamps {
-        let (bayer, _meta) = decoder.load_frame(*ts)?;
-
-        for &v in &bayer {
-            out_file.write_all(&v.to_le_bytes())?;
-        }
-    }
-
+    for ts in &timestamps { let (bayer, _meta) = decoder.load_frame(*ts)?; for &v in &bayer { out_file.write_all(&v.to_le_bytes())?; } }
     Ok(())
 }
 
 pub fn run(info: &McrawFileInfo, output_path: &str) -> Result<()> {
     let never_cancel = Arc::new(AtomicBool::new(false));
-    run_export(
-        info.clone(),
-        output_path.to_string(),
-        Arc::new(|_| {}),
-        never_cancel,
-        ColorSpace::Rec709,
-        TransferFunction::Rec709,
-        CodecFamily::ProRes,
-        ProResProfile::HQ,
-        DnxhrProfile::HQX,
-        HevcProfile::Main10_420,
-        H264Profile::Main_8bit,
-        Av1Profile::Profile0_420_10bit,
-        Vp9Profile::Profile2_420_10bit,
-        "libx265".to_string(),
-        "libx264".to_string(),
-        "libaom-av1".to_string(),
-        "prores_ks".to_string(),
-        RateControl::Lossless,
-    )
+    run_export(info.clone(), output_path.to_string(), Arc::new(|_| {}), never_cancel, ColorSpace::Rec709, TransferFunction::Rec709, CodecFamily::ProRes, ProResProfile::HQ, DnxhrProfile::HQX, HevcProfile::Main10_420, H264Profile::Main8bit, Av1Profile::Profile0_420_10bit, Vp9Profile::Profile2_420_10bit, "libx265".to_string(), "libx264".to_string(), "libaom-av1".to_string(), "prores_ks".to_string(), RateControl::Lossless)
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn run_export(
-    info: McrawFileInfo,
-    output_path: String,
-    on_progress: Arc<dyn Fn(f64) + Send + Sync>,
-    cancelled: Arc<AtomicBool>,
-    export_cs: ColorSpace,
-    export_tf: TransferFunction,
-    codec_family: CodecFamily,
-    prores_profile: ProResProfile,
-    dnxhr_profile: DnxhrProfile,
-    hevc_profile: HevcProfile,
-    h264_profile: H264Profile,
-    av1_profile: Av1Profile,
-    vp9_profile: Vp9Profile,
-    hevc_encoder: String,
-    h264_encoder: String,
-    av1_encoder: String,
-    prores_encoder: String,
-    rate_control: RateControl,
-) -> Result<()> {
-    tracing::info!("run_export: input={} output={} codec={} cs={} tf={}",
-        info.path, output_path, codec_family.name(), export_cs.name(), export_tf.name());
-    let decoder = Decoder::new(&info.path)?;
-    let timestamps = decoder.timestamps()?;
-
-    if timestamps.is_empty() {
-        return Err(anyhow!("No frames found in file"));
-    }
-
-    let stride_width = info.width as u32;
-    let offset_x = info.active_offset_x as u32;
-    let offset_y = info.active_offset_y as u32;
+pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn Fn(f64) + Send + Sync>, cancelled: Arc<AtomicBool>, export_cs: ColorSpace, export_tf: TransferFunction, codec_family: CodecFamily, prores_profile: ProResProfile, dnxhr_profile: DnxhrProfile, hevc_profile: HevcProfile, h264_profile: H264Profile, av1_profile: Av1Profile, vp9_profile: Vp9Profile, hevc_encoder: String, h264_encoder: String, av1_encoder: String, prores_encoder: String, rate_control: RateControl) -> Result<()> {
+    tracing::info!("run_export: input={} output={} codec={} cs={} tf={}", info.path, output_path, codec_family.name(), export_cs.name(), export_tf.name());
+    let decoder = Decoder::new(&info.path)?; let timestamps = decoder.timestamps()?;
+    if timestamps.is_empty() { return Err(anyhow!("No frames found in file")); }
+    let stride_width = info.width as u32; let offset_x = info.active_offset_x as u32; let offset_y = info.active_offset_y as u32;
     let active_width = if info.active_width > 0 { info.active_width as u32 } else { stride_width };
     let active_height = if info.active_height > 0 { info.active_height as u32 } else { info.height as u32 };
-
-    if active_width == 0 || active_height == 0 {
-        return Err(anyhow!("Invalid active dimensions: {}x{}", active_width, active_height));
-    }
-
+    if active_width == 0 || active_height == 0 { return Err(anyhow!("Invalid active dimensions")); }
     let fps = if info.fps > 0.0 { info.fps } else { 25.0 };
-    tracing::info!("export config: {}x{} @ {}fps, {} frames, bayer={}",
-        active_width, active_height, fps, timestamps.len(), info.bayer_pattern.name());
-
-    // --- Build Camera→XYZ matrix from available DNG matrices ---
-    let cm1_f32: [f32; 9] = info.camera_metadata.color_matrix
-        .map(|cm| {
-            let mut ccm = [0.0f32; 9];
-            for (i, v) in cm.iter().enumerate() { ccm[i] = *v as f32; }
-            ccm
-        })
-        .unwrap_or_else(identity_ccm);
-
-    let cm2_f32: Option<[f32; 9]> = info.camera_metadata.color_matrix2.map(|cm| {
-        let mut ccm = [0.0f32; 9];
-        for (i, v) in cm.iter().enumerate() { ccm[i] = *v as f32; }
-        ccm
-    });
-
-    let cal1_f32: Option<[f32; 9]> = info.camera_metadata.calibration_matrix1.map(|cm| {
-        let mut ccm = [0.0f32; 9];
-        for (i, v) in cm.iter().enumerate() { ccm[i] = *v as f32; }
-        ccm
-    });
-    let cal2_f32: Option<[f32; 9]> = info.camera_metadata.calibration_matrix2.map(|cm| {
-        let mut ccm = [0.0f32; 9];
-        for (i, v) in cm.iter().enumerate() { ccm[i] = *v as f32; }
-        ccm
-    });
-
-    let cam_to_xyz: [f32; 9] = match (cm2_f32, cal1_f32, cal2_f32) {
-        (Some(ref cm2), Some(ref c1), Some(ref c2)) => {
-            let raw_cm1 = camera_to_xyz_matrix(&cm1_f32, Some(c1));
-            let raw_cm2 = camera_to_xyz_matrix(cm2, Some(c2));
-            interpolate_matrix(&raw_cm1, &raw_cm2, 0.5)
+    
+    let cm1_f32: [f32; 9] = info.camera_metadata.color_matrix.map(|cm| { let mut ccm = [0.0f32; 9]; for (i, v) in cm.iter().enumerate() { ccm[i] = *v as f32; } ccm }).unwrap_or_else(identity_ccm);
+    let cm2_f32: Option<[f32; 9]> = info.camera_metadata.color_matrix2.map(|cm| { let mut ccm = [0.0f32; 9]; for (i, v) in cm.iter().enumerate() { ccm[i] = *v as f32; } ccm });
+    let fm1_f32: Option<[f32; 9]> = info.camera_metadata.forward_matrix1.map(|fm| { let mut ccm = [0.0f32; 9]; for (i, v) in fm.iter().enumerate() { ccm[i] = *v as f32; } ccm });
+    let fm2_f32: Option<[f32; 9]> = info.camera_metadata.forward_matrix2.map(|fm| { let mut ccm = [0.0f32; 9]; for (i, v) in fm.iter().enumerate() { ccm[i] = *v as f32; } ccm });
+    let cal1_f32: Option<[f32; 9]> = info.camera_metadata.calibration_matrix1.map(|cm| { let mut ccm = [0.0f32; 9]; for (i, v) in cm.iter().enumerate() { ccm[i] = *v as f32; } ccm });
+    let cal2_f32: Option<[f32; 9]> = info.camera_metadata.calibration_matrix2.map(|cm| { let mut ccm = [0.0f32; 9]; for (i, v) in cm.iter().enumerate() { ccm[i] = *v as f32; } ccm });
+    
+    let cm_has_values = cm1_f32.iter().any(|&v| v.abs() > 0.01 && v.abs() < 10.0);
+    let mut matrix_path = "";
+    // The matrix that takes white-balanced camera RGB into XYZ under the
+    // matrix's reference illuminant. Two DNG conventions:
+    //   * ColorMatrix1: Camera-WB -> XYZ under illuminant1 (often D65 or
+    //     Standard A, sometimes custom). Row sums equal that illuminant.
+    //     Needs a Bradford CAT to D65 before applying xyz_to_Rec.709.
+    //   * ForwardMatrix1: Camera-WB -> XYZ under D50 (assumes camera
+    //     WB is applied via AsShotNeutral). Row sums equal D50
+    //     [0.96422, 1.0, 0.82521]. Needs only a fixed D50->D65 CAT for
+    //     a Rec.709 (D65) output.
+    //
+    // The DNG spec says to prefer ForwardMatrix1 over ColorMatrix1 when
+    // both are present because fm1 already incorporates scene WB and
+    // D50 adaptation. We therefore select fm1 if present, falling back
+    // to cm1 (with a per-frame Bradford CAT computed from the actual
+    // scene white in XYZ) only if no fm1 is available.
+    let cam_to_xyz: [f32; 9] = if let (Some(ref fm1), Some(ref fm2)) = (fm1_f32, fm2_f32) {
+        matrix_path = "ForwardMatrix1+2 → D50 (preferred)";
+        let fm_avg = interpolate_matrix(fm1, fm2, 0.5);
+        // fm1 is already Camera-WB -> D50; no orientation test needed.
+        // Verify it's the right orientation: row sums should match D50.
+        let rs = [fm_avg[0] + fm_avg[1] + fm_avg[2],
+                  fm_avg[3] + fm_avg[4] + fm_avg[5],
+                  fm_avg[6] + fm_avg[7] + fm_avg[8]];
+        let d50 = crate::color::D50_XYZ;
+        let d = (rs[0]-d50[0]).powi(2) + (rs[1]-d50[1]).powi(2) + (rs[2]-d50[2]).powi(2);
+        if d < 0.05 {
+            fm_avg
+        } else {
+            matrix_path = "ForwardMatrix1+2 (orientation-adjusted)";
+            detect_camera_to_xyz(&fm_avg)
         }
-        (Some(ref cm2), _, _) => {
-            let raw_cm1 = camera_to_xyz_matrix(&cm1_f32, None);
-            let raw_cm2 = camera_to_xyz_matrix(cm2, None);
-            interpolate_matrix(&raw_cm1, &raw_cm2, 0.5)
+    } else if let Some(ref fm1) = fm1_f32 {
+        matrix_path = "ForwardMatrix1 → D50 (preferred)";
+        let rs = [fm1[0] + fm1[1] + fm1[2],
+                  fm1[3] + fm1[4] + fm1[5],
+                  fm1[6] + fm1[7] + fm1[8]];
+        let d50 = crate::color::D50_XYZ;
+        let d = (rs[0]-d50[0]).powi(2) + (rs[1]-d50[1]).powi(2) + (rs[2]-d50[2]).powi(2);
+        if d < 0.05 {
+            *fm1
+        } else {
+            matrix_path = "ForwardMatrix1 (orientation-adjusted)";
+            detect_camera_to_xyz(fm1)
         }
-        _ => {
-            camera_to_xyz_matrix(&cm1_f32, None)
+    } else if cm_has_values {
+        matrix_path = "ColorMatrix1 → XYZ (no fm1 fallback)";
+        let cal = cal1_f32.or(cal2_f32);
+        match cm2_f32 {
+            Some(ref cm2) => {
+                let cm_avg = interpolate_matrix(&cm1_f32, cm2, 0.5);
+                camera_to_xyz_matrix(&cm_avg, cal.as_ref())
+            }
+            None => camera_to_xyz_matrix(&cm1_f32, cal.as_ref()),
         }
+    } else {
+        matrix_path = "IDENTITY";
+        identity_ccm()
     };
+    tracing::info!("matrix path: {} | cam_to_xyz diag=[{:.3},{:.3},{:.3}]", matrix_path, cam_to_xyz[0], cam_to_xyz[4], cam_to_xyz[8]);
+    // Suppress unused-import warning when nothing forwards to a transform that
+    // we might still want to log. Kept for parity with detector heuristics.
+    let _ = detect_camera_to_xyz(&cam_to_xyz);
 
-    let is_log = export_tf.is_log_bypass();
-    let target_xyz_to_rgb = export_cs.get_xyz_to_rgb_matrix();
-
-    let pattern = info.bayer_pattern;
-    let black_level = info.black_level;
-    let white_level = info.white_level;
-    let total_frames = timestamps.len();
-
-    let (codec_name, pix_fmt, mut extra_args) = build_ffmpeg_codec_args(
-        codec_family, &hevc_encoder, &h264_encoder, &av1_encoder, &prores_encoder,
-        prores_profile, dnxhr_profile, hevc_profile,
-        h264_profile, av1_profile, vp9_profile,
-        &rate_control,
-    );
-
-    let vui_tags = get_ffmpeg_vui_tags(&export_cs, &export_tf);
-    extra_args.extend(vui_tags.into_iter().map(String::from));
-
-    let xyz_to_rec = xyz_to_rec709();
-
-    // -----------------------------------------------------------------
-    // Audio pipeline
-    //
-    // Data flow:
-    //   1. decoder.write_audio_to() writes each audio chunk as raw s16le
-    //      to a temp file on disk via BufWriter (never holds all samples
-    //      in memory — safe for hours-long recordings).
-    //   2. Temp file path passed to VideoEncoder, which adds a second
-    //      -i input to FFmpeg:  -f s16le -ar RATE -ac CH -i <tempfile>
-    //   3. FFmpeg muxes audio alongside video; encoder Drop cleans up
-    //
-    // Future: add a user toggle (App::export_audio_enabled) gating the
-    // entire block below.  The toggle lives at App level so it can be
-    // rendered in the Export screen.  When disabled, skip to
-    //   let audio_temp_path: Option<PathBuf> = None;
-    // -----------------------------------------------------------------
-    let audio_temp_path = if info.has_audio
-        && info.audio_sample_rate > 0
-        && info.audio_channels > 0
-    {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
+    let xyz_to_output = export_cs.get_xyz_to_rgb_matrix();
+    // The cam_to_xyz matrix maps Camera-WB -> XYZ under some reference
+    // illuminant. For the GPU fused matrix we pre-bake a constant Bradford
+    // CAT from that illuminant to D65 (so the output is D65-based, e.g.
+    // Rec.709). The per-frame CPU path additionally re-applies the CAT
+    // using the actual scene white in XYZ for the case where the
+    // illuminant is unknown (cm1 path) — see `fused` construction below.
+    let rs = [cam_to_xyz[0] + cam_to_xyz[1] + cam_to_xyz[2],
+              cam_to_xyz[3] + cam_to_xyz[4] + cam_to_xyz[5],
+              cam_to_xyz[6] + cam_to_xyz[7] + cam_to_xyz[8]];
+    let cam_illuminant_xyz = if matrix_path.starts_with("ForwardMatrix") {
+        // fm1 maps to D50; row sums ARE D50 (within 0.05).
+        crate::color::D50_XYZ
+    } else {
+        // cm1 (or identity) — use the row sums as the implied illuminant.
+        // If row sums look degenerate (e.g. all near zero or far from any
+        // known illuminant), fall back to D50.
+        let l = rs[0].max(rs[1]).max(rs[2]);
+        if l < 0.1 || l > 5.0 { crate::color::D50_XYZ } else { rs }
+    };
+    let bradford_static = build_bradford_matrix(&cam_illuminant_xyz, &D65_XYZ);
+    let cam_to_xyz_d65 = mat_mul_3x3(&bradford_static, &cam_to_xyz);
+    let fused = mat_mul_3x3(&xyz_to_output, &cam_to_xyz_d65);
+    let pattern = info.bayer_pattern; let black_level = info.black_level; let white_level = info.white_level; let total_frames = timestamps.len();
+    
+    let (codec_name, pix_fmt, mut extra_args) = build_ffmpeg_codec_args(codec_family, &hevc_encoder, &h264_encoder, &av1_encoder, &prores_encoder, prores_profile, dnxhr_profile, hevc_profile, h264_profile, av1_profile, vp9_profile, &rate_control);
+    let vui_tags = get_ffmpeg_vui_tags(&export_cs, &export_tf); extra_args.extend(vui_tags.into_iter().map(String::from));
+    
+    let audio_temp_path = if info.has_audio && info.audio_sample_rate > 0 && info.audio_channels > 0 {
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
         let temp_path = std::env::temp_dir().join(format!("mcraw_audio_{}.raw", ts));
         match std::fs::File::create(&temp_path) {
-            Ok(file) => {
-                let mut writer = BufWriter::new(file);
-                match decoder.write_audio_to(&mut writer) {
-                    Ok(()) => {
-                        let _ = writer.flush();
-                        tracing::info!(
-                            "audio streamed to temp file: {} Hz, {} ch -> {}",
-                            info.audio_sample_rate, info.audio_channels,
-                            temp_path.display()
-                        );
-                        Some(temp_path)
-                    }
-                    Err(e) => {
-                        let _ = std::fs::remove_file(&temp_path);
-                        tracing::warn!("failed to write audio (export continues without audio): {}", e);
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("failed to create audio temp file (export continues without audio): {}", e);
-                None
-            }
+            Ok(file) => { let mut writer = BufWriter::new(file); match decoder.write_audio_to(&mut writer) { Ok(()) => { let _ = writer.flush(); Some(temp_path) } Err(e) => { let _ = std::fs::remove_file(&temp_path); None } } }
+            Err(_) => None
         }
-    } else {
-        None
-    };
-
-    let mut encoder = VideoEncoder::new(
-        &output_path, active_width, active_height, fps,
-        &codec_name, &pix_fmt, &extra_args,
-        audio_temp_path.as_deref(),
-        info.audio_sample_rate,
-        info.audio_channels,
-    )?;
-
-    // ----------------------------------------------------------------
-    // Pre-allocate the buffer pool (eliminates per-frame heap churn)
-    // ----------------------------------------------------------------
-    let stride_pixels = stride_width as usize * info.height as usize;
-    let pixel_count = (active_width * active_height) as usize;
-    let bytes_per_frame = pixel_count * 6;
-
-    let (free_tx, free_rx) = bounded::<FrameSlot>(PIPELINE_DEPTH);
-    let (loaded_tx, loaded_rx) = bounded::<FrameSlot>(PIPELINE_DEPTH);
-    let (processed_tx, processed_rx) = bounded::<FrameSlot>(PIPELINE_DEPTH);
-
-    for _ in 0..PIPELINE_DEPTH {
-        free_tx.send(FrameSlot {
-            bayer: vec![0u16; stride_pixels],
-            frame_bytes: vec![0u8; bytes_per_frame],
-            as_shot_neutral: [0.0; 3],
-        })?;
-    }
-
+    } else { None };
+    
+    let mut encoder = VideoEncoder::new(&output_path, active_width, active_height, fps, &codec_name, &pix_fmt, &extra_args, audio_temp_path.as_deref(), info.audio_sample_rate, info.audio_channels)?;
+    let stride_pixels = stride_width as usize * info.height as usize; let pixel_count = (active_width * active_height) as usize; let bytes_per_frame = pixel_count * 6;
+    let (free_tx, free_rx) = bounded::<FrameSlot>(PIPELINE_DEPTH); let (loaded_tx, loaded_rx) = bounded::<FrameSlot>(PIPELINE_DEPTH); let (processed_tx, processed_rx) = bounded::<FrameSlot>(PIPELINE_DEPTH);
+    for _ in 0..PIPELINE_DEPTH { free_tx.send(FrameSlot { bayer: vec![0u16; stride_pixels], frame_bytes: vec![0u8; bytes_per_frame], as_shot_neutral: [0.0; 3] })?; }
     let free_tx_writer = free_tx.clone();
-
-    // ==================================================================
-    // Stage 1 — Loader thread: raw frame I/O
-    // ==================================================================
-    let loader_handle = std::thread::Builder::new()
-        .name("loader".into())
-        .spawn({
-            let cancelled = cancelled.clone();
-            move || -> Result<()> {
-                for ts in &timestamps {
-                    if cancelled.load(Ordering::Relaxed) {
-                        break;
-                    }
-
-                    let mut slot = free_rx
-                        .recv()
-                        .map_err(|_| anyhow!("Loader: free pool closed prematurely"))?;
-
-                    let (bayer, frame_meta) = decoder.load_frame(*ts)?;
-
-                    slot.bayer = bayer;
-                    slot.as_shot_neutral = frame_meta.as_shot_neutral;
-
-                    loaded_tx
-                        .send(slot)
-                        .map_err(|_| anyhow!("Loader: processor channel closed"))?;
-                }
-
-                drop(loaded_tx);
-                Ok(())
+    
+    let filters = pattern.to_dcraw_filters(); let mut rcd_pipeline: Option<gpu::RcdPipeline> = None;
+    match pollster::block_on(gpu::GpuContext::new()) {
+        Ok(ctx) => { let ctx = std::sync::Arc::new(ctx); match gpu::RcdPipeline::new(ctx, active_width, active_height) { Ok(pipeline) => { rcd_pipeline = Some(pipeline); } Err(_) => {} } }
+        Err(_) => {}
+    }
+    
+    let loader_handle = std::thread::Builder::new().name("loader".into()).spawn({
+        let cancelled = cancelled.clone();
+        move || -> Result<()> {
+            for ts in &timestamps {
+                if cancelled.load(Ordering::Relaxed) { break; }
+                let mut slot = free_rx.recv().map_err(|_| anyhow!("Loader: free pool closed"))?;
+                let (bayer, frame_meta) = decoder.load_frame(*ts)?;
+                slot.bayer = bayer; slot.as_shot_neutral = frame_meta.as_shot_neutral;
+                loaded_tx.send(slot).map_err(|_| anyhow!("Loader: processor channel closed"))?;
             }
-        })?;
+            drop(loaded_tx); Ok(())
+        }
+    })?;
+    
+    // AgX pipeline is intentionally disabled. It will be reintroduced
+    // as a separate feature; for now the render path is scene-referred
+    // raw → WB → highlight-recon → CCM → OETF.
 
-    // Pre-build AgX pipeline — disabled for now; will be re-added as a
-    // dedicated AgX section with full parameter control when preview is ready.
-    let use_agx = false;
-    let agx_pipeline = if use_agx {
-        let mut cfg = AgxConfig::default();
-        cfg.in_gamut = Gamut::Rec709;
-        cfg.in_transfer = Transfer::Linear;
-        cfg.working_curve = Transfer::AgxLogKraken;
-        cfg.out_gamut = Gamut::Rec709;
-        cfg.out_transfer = OutputTransfer::Bt1886InverseEotf;
-        cfg.log_output = false;
-        Some(AgxPipeline::new(cfg))
-    } else {
-        None
-    };
+    let processor_handle = std::thread::Builder::new().name("processor".into()).spawn({
+        let cancelled = cancelled.clone();
+        move || -> Result<()> {
+            let mut rgb = vec![0.0f32; pixel_count * 3]; let demosaic = BilinearDemosaic::new(pattern);
+            for mut slot in loaded_rx {
+                if cancelled.load(Ordering::Relaxed) { break; }
+                slot.frame_bytes.fill(0); let as_shot = slot.as_shot_neutral;
 
-    // ==================================================================
-    // Stage 2 — Processor thread: demosaic → color pipeline → OETF → u16
-    // ==================================================================
-    let processor_handle = std::thread::Builder::new()
-        .name("processor".into())
-        .spawn({
-            let cancelled = cancelled.clone();
-            move || -> Result<()> {
-                let mut rgb = vec![0.0f32; pixel_count * 3];
-                let demosaic = BilinearDemosaic::new(pattern);
-
-                for mut slot in loaded_rx {
-                    if cancelled.load(Ordering::Relaxed) {
-                        break;
+                // Per-frame fused matrix. Three cases:
+                //
+                //   1. cam_to_xyz = fm1: fm1 already maps Camera-WB -> D50
+                //      XYZ. The only CAT needed is a fixed D50 -> D65 (which
+                //      is baked into the static `fused` above). Re-using
+                //      the static `fused` here is the correct and only
+                //      consistent choice; the per-frame as_shot does NOT
+                //      re-enter the matrix.
+                //
+                //   2. cam_to_xyz = cm1: cm1 maps Camera-WB -> XYZ under
+                //      some other illuminant (e.g. D65, A, custom). The
+                //      per-frame as_shot gives the actual scene white in
+                //      XYZ (under the matrix's reference illuminant) and
+                //      the Bradford CAT is computed from that.
+                //
+                //   3. cam_to_xyz = identity: no characterization, just
+                //      use the static fused (which is xyz_to_Rec709
+                //      applied to identity — produces non-neutral gray
+                //      for D65 scenes; this is a known limitation when
+                //      no matrix is provided).
+                let fused = if matrix_path.starts_with("ForwardMatrix") {
+                    // Use the precomputed static fused (D50 -> D65 -> Rec.709
+                    // CAT already baked in).
+                    fused
+                } else if matrix_path.starts_with("ColorMatrix") {
+                    // Per-frame CAT from cm1-as-shot-white to D65.
+                    let neutral_under_d65 =
+                        (as_shot[0] - 1.0).abs() < 1e-3 &&
+                        (as_shot[1] - 1.0).abs() < 1e-3 &&
+                        (as_shot[2] - 1.0).abs() < 1e-3;
+                    if neutral_under_d65 {
+                        fused
+                    } else {
+                        let scene_white_xyz = if as_shot[0] > 1e-6 && as_shot[1] > 1e-6 && as_shot[2] > 1e-6 {
+                            let mut v = mat_mul_vec3(&cam_to_xyz, &as_shot);
+                            v[0] = v[0].clamp(0.3, 3.0);
+                            v[1] = v[1].clamp(0.3, 3.0);
+                            v[2] = v[2].clamp(0.3, 3.0);
+                            v
+                        } else {
+                            D65_XYZ
+                        };
+                        let bradford_adapt = build_bradford_matrix(&scene_white_xyz, &D65_XYZ);
+                        let cam_to_xyz_d65 = mat_mul_3x3(&bradford_adapt, &cam_to_xyz);
+                        mat_mul_3x3(&xyz_to_output, &cam_to_xyz_d65)
                     }
+                } else {
+                    fused
+                };
 
-                    let as_shot = slot.as_shot_neutral;
-                    let (r_gain, b_gain) = if as_shot[0] > 1e-6 && as_shot[1] > 1e-6 && as_shot[2] > 1e-6 {
-                        (as_shot[1] / as_shot[0], as_shot[1] / as_shot[2])
-                    } else {
-                        (1.0, 1.0)
-                    };
-
-                    let scene_white_xyz: [f32; 3] = if as_shot[0] > 1e-6 && as_shot[1] > 1e-6 && as_shot[2] > 1e-6 {
-                        mat_mul_vec3(&cam_to_xyz, &as_shot)
-                    } else {
-                        [D65_XYZ[0], D65_XYZ[1], D65_XYZ[2]]
-                    };
-
-                    let output_matrix = if is_log { &target_xyz_to_rgb } else { &xyz_to_rec };
-                    let fused = build_cat16_output_matrix(&cam_to_xyz, &scene_white_xyz, &D65_XYZ, output_matrix);
-
-                    demosaic.process_par_into(
-                        &slot.bayer, stride_width, offset_x, offset_y,
-                        active_width, active_height, &pattern, &mut rgb,
-                    )?;
+                let gpu_ok = if let Some(ref mut pipeline) = rcd_pipeline {
+                    match pipeline.process(&slot.bayer, filters, black_level as f32, white_level as f32, stride_width, offset_x, offset_y, &fused, &slot.as_shot_neutral, &export_tf) {
+                        Ok(packed) => {
+                            slot.frame_bytes.par_chunks_exact_mut(6).enumerate().for_each(|(pi, out)| {
+                                let p0 = packed[pi * 2]; let p1 = packed[pi * 2 + 1];
+                                let r = (p0 & 0xFFFF) as u16; let g = ((p0 >> 16) & 0xFFFF) as u16; let b = (p1 & 0xFFFF) as u16;
+                                out[0] = r as u8; out[1] = (r >> 8) as u8; out[2] = g as u8; out[3] = (g >> 8) as u8; out[4] = b as u8; out[5] = (b >> 8) as u8;
+                            }); true
+                        } Err(_) => false
+                    }
+                } else { false };
+                
+                if !gpu_ok {
+                    demosaic.process_par_into(&slot.bayer, stride_width, offset_x, offset_y, active_width, active_height, &pattern, &mut rgb)?;
                     normalize_linear_f32(&mut rgb, black_level as f32, white_level as f32);
 
-                    let use_agx_frame = use_agx;
+                    let raw_r_gain = if as_shot[0] > 1e-6 && as_shot[1] > 1e-6 { as_shot[1] / as_shot[0] } else { 1.0 };
+                    let raw_b_gain = if as_shot[2] > 1e-6 && as_shot[1] > 1e-6 { as_shot[1] / as_shot[2] } else { 1.0 };
+                    tracing::info!("as_shot=[{:.4},{:.4},{:.4}] raw_wb_r={:.4} raw_wb_b={:.4}", as_shot[0], as_shot[1], as_shot[2], raw_r_gain, raw_b_gain);
+                    let r_gain = raw_r_gain.clamp(0.1, 10.0);
+                    let b_gain = raw_b_gain.clamp(0.1, 10.0);
+                    if (r_gain - raw_r_gain).abs() > 1e-3 || (b_gain - raw_b_gain).abs() > 1e-3 {
+                        tracing::warn!(
+                            "CPU WB gains clamped: as_shot={:?} raw=[{:.3},{:.3}] clamped=[{:.3},{:.3}]",
+                            as_shot, raw_r_gain, raw_b_gain, r_gain, b_gain
+                        );
+                    }
                     rgb.par_chunks_exact_mut(3).for_each(|chunk| {
+                        // 1. Apply WB
                         let r = chunk[0] * r_gain;
                         let g = chunk[1];
                         let b = chunk[2] * b_gain;
 
-                        if use_agx_frame {
-                            // AgX will handle highlight roll-off and tone mapping;
-                            // just apply CAT16 white-balance adaptation and move on.
-                            let rr = r / r_gain;
-                            let bb = b / b_gain;
-                            let out = mat_mul_vec3(&fused, &[rr, g, bb]);
-                            chunk[0] = out[0].max(0.0);
-                            chunk[1] = out[1].max(0.0);
-                            chunk[2] = out[2].max(0.0);
+                        // 2. Highlight reconstruction — desaturate toward
+                        //    neutral (post-WB max clamped to 1) when the
+                        //    pixel is blown. Triggered per-pixel so
+                        //    single-channel clips no longer go magenta.
+                        let max_val = r.max(g).max(b);
+                        let neutral = max_val.min(1.0);
+                        let t = if max_val > 0.95f32 { ((max_val - 0.95) / 0.05).min(1.0) } else { 0.0 };
+                        let (r, g, b) = if t > 0.0 {
+                            (r + (neutral - r) * t, g + (neutral - g) * t, b + (neutral - b) * t)
                         } else {
-                            let max_val = r.max(g).max(b);
-                            let (r, g, b) = if max_val > 0.95f32 {
-                                let t = ((max_val - 0.95) / 0.05).min(1.0);
-                                (r + (max_val - r) * t,
-                                 g + (max_val - g) * t,
-                                 b + (max_val - b) * t)
-                            } else {
-                                (r, g, b)
-                            };
+                            (r, g, b)
+                        };
 
-                            let rr = r / r_gain;
-                            let bb = b / b_gain;
-
-                            let out = mat_mul_vec3(&fused, &[rr, g, bb]);
-                            chunk[0] = out[0].max(0.0);
-                            chunk[1] = out[1].max(0.0);
-                            chunk[2] = out[2].max(0.0);
-                        }
+                        // 3. Apply CCM (on WB'd values — standard pipeline)
+                        let out = mat_mul_vec3(&fused, &[r, g, b]);
+                        chunk[0] = out[0].max(0.0); chunk[1] = out[1].max(0.0); chunk[2] = out[2].max(0.0);
                     });
-
-                    if let Some(ref agx) = agx_pipeline {
-                        // Full AgX tone mapping pipeline: tone scale, gamut
-                        // compression, and BT.1886 gamma 2.4 output.
-                        agx.process_frame(&mut rgb);
-                    } else if is_log {
-                        export_tf.process(&mut rgb);
-                    } else {
-                        rgb.par_iter_mut().for_each(|v| {
-                            if *v < 0.0 { *v = 0.0; }
-                            *v = if *v < 0.018 { 4.5 * *v } else { 1.099 * v.powf(0.45) - 0.099 };
-                        });
-                    }
-
+                    export_tf.process(&mut rgb);
+                    
                     slot.frame_bytes.par_chunks_exact_mut(6).enumerate().for_each(|(pi, out)| {
                         let base = pi * 3;
-                        let ru = (rgb[base].clamp(0.0, 1.0) * 65535.0) as u16;
-                        let gu = (rgb[base + 1].clamp(0.0, 1.0) * 65535.0) as u16;
-                        let bu = (rgb[base + 2].clamp(0.0, 1.0) * 65535.0) as u16;
-                        out[0] = ru as u8;
-                        out[1] = (ru >> 8) as u8;
-                        out[2] = gu as u8;
-                        out[3] = (gu >> 8) as u8;
-                        out[4] = bu as u8;
-                        out[5] = (bu >> 8) as u8;
+                        let ru = (rgb[base].clamp(0.0, 1.0) * 65535.0) as u16; let gu = (rgb[base + 1].clamp(0.0, 1.0) * 65535.0) as u16; let bu = (rgb[base + 2].clamp(0.0, 1.0) * 65535.0) as u16;
+                        out[0] = ru as u8; out[1] = (ru >> 8) as u8; out[2] = gu as u8; out[3] = (gu >> 8) as u8; out[4] = bu as u8; out[5] = (bu >> 8) as u8;
                     });
-
-                    processed_tx
-                        .send(slot)
-                        .map_err(|_| anyhow!("Processor: writer channel closed"))?;
                 }
-
-                drop(processed_tx);
-                Ok(())
+                processed_tx.send(slot).map_err(|_| anyhow!("Processor: writer channel closed"))?;
             }
-        })?;
-
-    // ==================================================================
-    // Stage 3 — Writer thread: drain processed frames to FFmpeg stdin
-    // ==================================================================
-    let writer_cancelled = cancelled.clone();
-
-    // Capture FFmpeg PID so a monitor thread can kill it on cancellation.
-    // This unblocks the writer thread if it is stuck inside push_frame().
-    let ffmpeg_pid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-    ffmpeg_pid.store(encoder.pid(), Ordering::Relaxed);
-
-    // Spawn a cancellation monitor that force-kills FFmpeg when the user
-    // cancels.  Without this the writer thread can hang indefinitely on
-    // macOS (and occasionally Linux/Windows) because stdin.write_all() is
-    // a blocking call that never reaches the cancel-flag check.
-    let monitor_cancelled = cancelled.clone();
-    let monitor_pid = ffmpeg_pid.clone();
-    let _monitor_handle = std::thread::Builder::new()
-        .name("cancel_monitor".into())
-        .spawn(move || {
-            while !monitor_cancelled.load(Ordering::Relaxed) {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            // Cancel flag was set — kill FFmpeg to unblock the writer.
-            let pid = monitor_pid.load(Ordering::Relaxed);
-            if pid > 0 {
-                #[cfg(target_os = "windows")]
-                {
-                    let _ = std::process::Command::new("taskkill")
-                        .args(["/F", "/PID", &pid.to_string()])
-                        .output();
-                }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    let _ = std::process::Command::new("kill")
-                        .args(["-TERM", &pid.to_string()])
-                        .output();
-                }
-            }
-        })
-        .ok();
-
-    let writer_handle = std::thread::Builder::new()
-        .name("writer".into())
-        .spawn(move || -> Result<()> {
-            let mut frames_written: usize = 0;
-
-            for slot in processed_rx {
-                if writer_cancelled.load(Ordering::Relaxed) {
-                    // Return slot to pool before exiting
-                    let _ = free_tx_writer.send(slot);
-                    // Skip finish() — encoder drops here, killing FFmpeg
-                    return Ok(());
-                }
-
-                encoder.push_frame(&slot.frame_bytes)?;
-
-                frames_written += 1;
-                on_progress(frames_written as f64 / total_frames as f64 * 100.0);
-
-                let _ = free_tx_writer.send(slot);
-            }
-
-            // Double-check cancel flag: processed_rx may have been dropped
-            // by the processor after the processor detected cancellation.
-            if writer_cancelled.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-
-            encoder.finish()?;
-            Ok(())
-        })?;
-
-    // ==================================================================
-    // Join all stages & propagate the first error
-    // ==================================================================
+            drop(processed_tx); Ok(())
+        }
+    })?;
+    
+    let writer_cancelled = cancelled.clone(); let ffmpeg_pid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)); ffmpeg_pid.store(encoder.pid(), Ordering::Relaxed);
+    let monitor_cancelled = cancelled.clone(); let monitor_pid = ffmpeg_pid.clone();
+    let _monitor_handle = std::thread::Builder::new().name("cancel_monitor".into()).spawn(move || {
+        while !monitor_cancelled.load(Ordering::Relaxed) { std::thread::sleep(std::time::Duration::from_millis(50)); }
+        let pid = monitor_pid.load(Ordering::Relaxed);
+        if pid > 0 { #[cfg(target_os = "windows")] { let _ = std::process::Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).output(); } #[cfg(not(target_os = "windows"))] { let _ = std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).output(); } }
+    }).ok();
+    
+    let writer_handle = std::thread::Builder::new().name("writer".into()).spawn(move || -> Result<()> {
+        let mut frames_written: usize = 0;
+        for slot in processed_rx {
+            if writer_cancelled.load(Ordering::Relaxed) { let _ = free_tx_writer.send(slot); return Ok(()); }
+            encoder.push_frame(&slot.frame_bytes)?; frames_written += 1; on_progress(frames_written as f64 / total_frames as f64 * 100.0); let _ = free_tx_writer.send(slot);
+        }
+        if writer_cancelled.load(Ordering::Relaxed) { return Ok(()); }
+        encoder.finish()?; Ok(())
+    })?;
+    
     let mut export_error: Option<anyhow::Error> = None;
-
-    match loader_handle.join() {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            cancelled.store(true, Ordering::Relaxed);
-            export_error = Some(e);
-        }
-        Err(_) => {
-            cancelled.store(true, Ordering::Relaxed);
-            export_error = Some(anyhow!("Loader thread panicked"));
-        }
-    }
-
-    match processor_handle.join() {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            cancelled.store(true, Ordering::Relaxed);
-            export_error.get_or_insert(e);
-        }
-        Err(_) => {
-            cancelled.store(true, Ordering::Relaxed);
-            export_error.get_or_insert(anyhow!("Processor thread panicked"));
-        }
-    }
-
-    match writer_handle.join() {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            export_error.get_or_insert(e);
-        }
-        Err(_) => {
-            export_error.get_or_insert(anyhow!("Writer thread panicked"));
-        }
-    }
-
-    // Clean up audio temp file (belt-and-suspenders with encoder Drop)
-    if let Some(ref audio_path) = audio_temp_path {
-        let _ = std::fs::remove_file(audio_path);
-    }
-
-    match export_error {
-        Some(_) if cancelled.load(Ordering::Relaxed) => {
-            Err(anyhow!("Export cancelled by user"))
-        }
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
+    match loader_handle.join() { Ok(Ok(())) => {} Ok(Err(e)) => { cancelled.store(true, Ordering::Relaxed); export_error = Some(e); } Err(_) => { cancelled.store(true, Ordering::Relaxed); export_error = Some(anyhow!("Loader panicked")); } }
+    match processor_handle.join() { Ok(Ok(())) => {} Ok(Err(e)) => { cancelled.store(true, Ordering::Relaxed); export_error.get_or_insert(e); } Err(_) => { cancelled.store(true, Ordering::Relaxed); export_error.get_or_insert(anyhow!("Processor panicked")); } }
+    match writer_handle.join() { Ok(Ok(())) => {} Ok(Err(e)) => { export_error.get_or_insert(e); } Err(_) => { export_error.get_or_insert(anyhow!("Writer panicked")); } }
+    if let Some(ref audio_path) = audio_temp_path { let _ = std::fs::remove_file(audio_path); }
+    match export_error { Some(_) if cancelled.load(Ordering::Relaxed) => Err(anyhow!("Export cancelled")), Some(e) => Err(e), None => Ok(()) }
 }

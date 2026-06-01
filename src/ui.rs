@@ -640,9 +640,126 @@ fn render_preview_or_progress(frame: &mut Frame, app: &App, area: Rect, _regions
 
     if app.is_exporting {
         render_render_progress(frame, app, area, border_color);
+    } else if app.last_export_summary.is_some() {
+        render_export_summary(frame, app, area, border_color);
     } else {
         render_preview_panel(frame, app, area, border_color);
     }
+}
+
+/// Post-render summary panel. Shown after an export finishes (success,
+/// failure, or cancellation) until the user starts another export. Mirrors
+/// the "render complete" panel in DaVinci Resolve — sticky settings + timing.
+fn render_export_summary(frame: &mut Frame, app: &App, area: Rect, border_color: Color) {
+    let summary = match app.last_export_summary.as_ref() {
+        Some(s) => s,
+        None => return,
+    };
+
+    let elapsed_secs = summary.elapsed.as_secs();
+    let mins = elapsed_secs / 60;
+    let secs = elapsed_secs % 60;
+    let elapsed_str = if mins > 0 {
+        format!("{}m {:02}s", mins, secs)
+    } else {
+        format!("{}.{:01}s", elapsed_secs, summary.elapsed.subsec_millis() / 100)
+    };
+
+    let avg_fps = if summary.elapsed.as_secs_f64() > 0.0 && summary.frame_count > 0 {
+        summary.frame_count as f64 / summary.elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+
+    let out_name = summary
+        .output_path
+        .split(std::path::MAIN_SEPARATOR)
+        .last()
+        .unwrap_or(&summary.output_path);
+
+    let (status_label, status_color) = match &summary.result {
+        Ok(()) => (" RENDER COMPLETE", Palette::SUCCESS),
+        Err(msg) if msg == "Cancelled by user" => (" RENDER CANCELLED", Color::Yellow),
+        Err(_) => (" RENDER FAILED", Color::Red),
+    };
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            status_label,
+            Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Output:      ", Style::default().fg(Palette::LABEL)),
+            Span::styled(out_name, Style::default().fg(Palette::VALUE)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Codec:       ", Style::default().fg(Palette::LABEL)),
+            Span::styled(
+                format!("{} ({})", summary.codec_label, summary.profile_label),
+                Style::default().fg(Palette::VALUE),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Gamut:       ", Style::default().fg(Palette::LABEL)),
+            Span::styled(&summary.color_space, Style::default().fg(Palette::VALUE)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Transfer:    ", Style::default().fg(Palette::LABEL)),
+            Span::styled(&summary.transfer, Style::default().fg(Palette::VALUE)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Rate:        ", Style::default().fg(Palette::LABEL)),
+            Span::styled(&summary.rate_control, Style::default().fg(Palette::VALUE)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Frames:      ", Style::default().fg(Palette::LABEL)),
+            Span::styled(format!("{}", summary.frame_count), Style::default().fg(Palette::VALUE)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Time:        ", Style::default().fg(Palette::LABEL)),
+            Span::styled(elapsed_str, Style::default().fg(Palette::VALUE)),
+            Span::raw("  "),
+            Span::styled(
+                format!("({:.1} fps avg)", avg_fps),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+    ];
+
+    // Add a wrapped error message for failures so the user can see why.
+    if let Err(ref msg) = summary.result {
+        if msg != "Cancelled by user" {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  Error:",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )));
+            // Show up to ~3 lines of the error.
+            for chunk in msg.lines().take(6) {
+                lines.push(Line::from(Span::styled(
+                    format!("    {}", chunk),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Press [v] or [R] to start a new export",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let panel = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Render Summary ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color)),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(panel, area);
 }
 
 fn render_preview_panel(frame: &mut Frame, app: &App, area: Rect, border_color: Color) {
@@ -720,7 +837,7 @@ fn render_render_progress(frame: &mut Frame, app: &App, area: Rect, border_color
         Line::from(""),
         Line::from(Span::styled(format!("  {:.1}%  |  Elapsed: {}  |  ETA: {}", pct, elapsed_str, eta_str), Style::default().fg(Palette::SUCCESS).add_modifier(Modifier::BOLD))),
         Line::from(""),
-        Line::from(Span::styled("  Press [v] to cancel", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled("  Press [x] / [v] / Ctrl+X to cancel", Style::default().fg(Color::DarkGray))),
     ];
 
     let panel = Paragraph::new(text)
