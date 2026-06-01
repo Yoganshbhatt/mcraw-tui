@@ -101,6 +101,7 @@ impl Default for Encoder {
 pub struct VideoEncoder {
     child: Child,
     audio_temp_path: Option<PathBuf>,
+    stderr_log_path: PathBuf,
 }
 
 impl VideoEncoder {
@@ -138,7 +139,7 @@ impl VideoEncoder {
             "-pix_fmt", pix_fmt,
         ]);
 
-        // Append dynamic extra args (profile, crf, preset, etc.)
+        // Append dynamic extra args (profile, crf, preset, color tags, etc.)
         cmd.args(extra_args);
 
         // For ProRes, DNxHR, and VideoToolbox encoders, inject an explicit format
@@ -152,11 +153,11 @@ impl VideoEncoder {
             _ => {}
         }
 
-        if codec == "libx264" {
-            cmd.args(["-x264-params", "colorprim=bt709:transfer=bt709:colormatrix=bt709"]);
-        } else if codec == "libx265" {
-            cmd.args(["-x265-params", "colorprim=bt709:transfer=bt709:colormatrix=bt709"]);
-        }
+        // NOTE: VUI signalling (color_primaries / color_trc / colorspace) is
+        // passed through `extra_args` and propagates automatically to libx264
+        // and libx265. We deliberately do **not** emit hard-coded
+        // `-x264-params colorprim=bt709:...` / `-x265-params colorprim=bt709:...`
+        // here because it would override the user's chosen gamut/transfer.
 
         // Add audio encoder if audio input is present
         if audio_temp_path.is_some() {
@@ -168,25 +169,78 @@ impl VideoEncoder {
             cmd.args(["-c:a", audio_codec]);
         }
 
+        // Capture FFmpeg stderr to a temp log file so we can surface real
+        // errors back to the user. The previous `/dev/null` redirect made
+        // failures appear as opaque "FFmpeg stdin not available" messages.
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let stderr_log_path = std::env::temp_dir()
+            .join(format!("mcraw_ffmpeg_stderr_{}.log", ts));
+        let stderr_file = std::fs::File::create(&stderr_log_path)
+            .map_err(|e| anyhow::anyhow!("Failed to create ffmpeg stderr log: {}", e))?;
+
         cmd.arg("-y").arg(output_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::from(stderr_file));
 
         let child = cmd.spawn()?;
-        tracing::info!("ffmpeg subprocess spawned: pid={} codec={} {}x{}@{}fps output={}",
-            child.id(), codec, width, height, fps, output_path);
+        tracing::info!("ffmpeg subprocess spawned: pid={} codec={} {}x{}@{}fps output={} stderr_log={}",
+            child.id(), codec, width, height, fps, output_path, stderr_log_path.display());
 
-        Ok(Self { child, audio_temp_path: audio_temp_path.map(|p| p.to_path_buf()) })
+        Ok(Self {
+            child,
+            audio_temp_path: audio_temp_path.map(|p| p.to_path_buf()),
+            stderr_log_path,
+        })
+    }
+
+    /// Read the captured FFmpeg stderr log (best-effort) and return the
+    /// final ~2 KB. Used to enrich error messages with the actual reason
+    /// FFmpeg failed.
+    fn tail_stderr(&self) -> String {
+        Self::tail_stderr_from(&self.stderr_log_path)
+    }
+
+    /// Free-function variant of `tail_stderr` so callers that already hold
+    /// a mutable borrow on `self.child` (e.g. inside `as_mut().ok_or_else(...)`)
+    /// can still pull stderr without re-borrowing `self`.
+    fn tail_stderr_from(path: &Path) -> String {
+        const TAIL_BYTES: usize = 2048;
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(_) => return String::new(),
+        };
+        let start = bytes.len().saturating_sub(TAIL_BYTES);
+        String::from_utf8_lossy(&bytes[start..]).trim().to_string()
     }
 
     pub fn push_frame(&mut self, data: &[u8]) -> Result<()> {
         use std::io::Write;
+        // Capture the stderr-log path up front so the error-handling
+        // closure does not need to re-borrow `self` while `self.child.stdin`
+        // is being borrowed mutably.
+        let stderr_path = self.stderr_log_path.clone();
         let stdin = self.child.stdin.as_mut().ok_or_else(|| {
             tracing::error!("ffmpeg stdin not available");
-            anyhow::anyhow!("FFmpeg stdin not available")
+            let stderr_tail = Self::tail_stderr_from(&stderr_path);
+            if stderr_tail.is_empty() {
+                anyhow::anyhow!("FFmpeg stdin not available (process may have crashed)")
+            } else {
+                anyhow::anyhow!("FFmpeg failed:\n{}", stderr_tail)
+            }
         })?;
-        stdin.write_all(data)?;
+        if let Err(e) = stdin.write_all(data) {
+            let stderr_tail = Self::tail_stderr_from(&stderr_path);
+            tracing::error!("ffmpeg push_frame error: {} | stderr: {}", e, stderr_tail);
+            if stderr_tail.is_empty() {
+                return Err(anyhow::anyhow!("FFmpeg write failed: {}", e));
+            } else {
+                return Err(anyhow::anyhow!("FFmpeg failed:\n{}", stderr_tail));
+            }
+        }
         Ok(())
     }
 
@@ -195,7 +249,18 @@ impl VideoEncoder {
         drop(self.child.stdin.take());
         let status = self.child.wait()?;
         tracing::info!("ffmpeg subprocess exited: {}", status);
-        Ok(())
+        if status.success() {
+            // Successful run — clean up the stderr log.
+            let _ = std::fs::remove_file(&self.stderr_log_path);
+            Ok(())
+        } else {
+            let stderr_tail = self.tail_stderr();
+            if stderr_tail.is_empty() {
+                Err(anyhow::anyhow!("FFmpeg exited with status: {}", status))
+            } else {
+                Err(anyhow::anyhow!("FFmpeg exited with status {}:\n{}", status, stderr_tail))
+            }
+        }
     }
 
     /// Force-terminate the FFmpeg subprocess. Used during cancellation to
@@ -219,6 +284,9 @@ impl Drop for VideoEncoder {
         if let Some(ref path) = self.audio_temp_path {
             let _ = std::fs::remove_file(path);
         }
+        // Best-effort cleanup; the log may have already been removed by
+        // `finish()` on success, or kept by an error path for diagnostics.
+        let _ = std::fs::remove_file(&self.stderr_log_path);
     }
 }
 

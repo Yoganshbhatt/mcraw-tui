@@ -128,8 +128,8 @@ impl CodecFamily {
                 match h264_encoder {
                     "h264_nvenc" => {
                         let (pf, ext) = match h264 {
-                            H264Profile::High_10bit => ("p010le", vec!["-preset", "p6", "-profile:v", "high10"]),
-                            H264Profile::Main_8bit => ("yuv420p", vec!["-preset", "p6"]),
+                            H264Profile::High10bit => ("p010le", vec!["-preset", "p6", "-profile:v", "high10"]),
+                            H264Profile::Main8bit => ("yuv420p", vec!["-preset", "p6"]),
                         };
                         base_codec_name = "h264_nvenc".to_string();
                         base_pix_fmt = pf.to_string();
@@ -137,8 +137,8 @@ impl CodecFamily {
                     }
                     "h264_amf" => {
                         let (pf, ext) = match h264 {
-                            H264Profile::High_10bit => ("p010le", vec!["-quality", "quality"]),
-                            H264Profile::Main_8bit => ("yuv420p", vec!["-quality", "quality"]),
+                            H264Profile::High10bit => ("p010le", vec!["-quality", "quality"]),
+                            H264Profile::Main8bit => ("yuv420p", vec!["-quality", "quality"]),
                         };
                         base_codec_name = "h264_amf".to_string();
                         base_pix_fmt = pf.to_string();
@@ -146,16 +146,16 @@ impl CodecFamily {
                     }
                     "h264_qsv" => {
                         let pf = match h264 {
-                            H264Profile::High_10bit => "p010le",
-                            H264Profile::Main_8bit => "yuv420p",
+                            H264Profile::High10bit => "p010le",
+                            H264Profile::Main8bit => "yuv420p",
                         };
                         base_codec_name = "h264_qsv".to_string();
                         base_pix_fmt = pf.to_string();
                     }
                     "h264_videotoolbox" => {
                         let pf = match h264 {
-                            H264Profile::High_10bit => "p010le",
-                            H264Profile::Main_8bit => "yuv420p",
+                            H264Profile::High10bit => "p010le",
+                            H264Profile::Main8bit => "yuv420p",
                         };
                         base_codec_name = "h264_videotoolbox".to_string();
                         base_pix_fmt = pf.to_string();
@@ -163,8 +163,8 @@ impl CodecFamily {
                     }
                     _ => {
                         let (pf, ext) = match h264 {
-                            H264Profile::Main_8bit => ("yuv420p", vec!["-preset", "slow"]),
-                            H264Profile::High_10bit => ("yuv422p10le", vec!["-preset", "slow"]),
+                            H264Profile::Main8bit => ("yuv420p", vec!["-preset", "slow"]),
+                            H264Profile::High10bit => ("yuv422p10le", vec!["-preset", "slow"]),
                         };
                         base_codec_name = "libx264".to_string();
                         base_pix_fmt = pf.to_string();
@@ -196,25 +196,33 @@ impl CodecFamily {
                     _ => {
                         base_codec_name = "libaom-av1".to_string();
                         base_pix_fmt = "yuv420p10le".to_string();
+                        // `-cpu-used 4` is libaom's speed preset.
+                        // `-b:v 0` is handled by `rate_control_args` for
+                        // CQ modes (so bitrate modes can override cleanly).
                         base_extra = vec!["-cpu-used", "4"];
                     }
                 }
             }
             CodecFamily::VP9 => {
-                let crf = match vp9 {
-                    Vp9Profile::Profile2_420_10bit => "30",
-                    Vp9Profile::Profile3_444_10bit => "30",
-                };
+                // VP9 quality / bitrate mode is fully driven by the user's
+                // rate-control choice (`-crf X -b:v 0` for CQ modes,
+                // `-b:v X -maxrate X` for bitrate modes — handled below).
                 base_codec_name = "libvpx-vp9".to_string();
-                base_pix_fmt = "yuv420p10le".to_string();
-                base_extra = vec!["-crf", crf, "-b:v", "0"];
+                base_pix_fmt = match vp9 {
+                    Vp9Profile::Profile2_420_10bit => "yuv420p10le".to_string(),
+                    Vp9Profile::Profile3_444_10bit => "yuv444p10le".to_string(),
+                };
+                base_extra = vec![];
             }
         }
 
         // Convert static extra args to owned Strings
         let mut extra: Vec<String> = base_extra.iter().map(|&s| s.to_string()).collect();
 
-        // Append rate-control flags for HEVC / H.264 / AV1 (not ProRes / DNxHR / VP9)
+        // Append rate-control flags. ProRes / DNxHR ignore CRF / bitrate
+        // flags (they use the explicit `-profile:v` instead), so we skip
+        // them. Every other family — including VP9 and AV1 — honours the
+        // user's rate-control choice.
         match self {
             CodecFamily::HEVC => {
                 extra.extend(rate_control_args(rate_control, hevc_encoder));
@@ -225,7 +233,13 @@ impl CodecFamily {
             CodecFamily::AV1 => {
                 extra.extend(rate_control_args(rate_control, av1_encoder));
             }
-            _ => {}
+            CodecFamily::VP9 => {
+                // libvpx-vp9 is always a software encoder; pass it through
+                // the same helper so Lossless / High / Standard / bitrate
+                // / Custom presets all work consistently.
+                extra.extend(rate_control_args(rate_control, "libvpx-vp9"));
+            }
+            CodecFamily::ProRes | CodecFamily::DNxHR => {}
         }
 
         tracing::debug!("ffmpeg args: codec={} pix_fmt={} extra={:?}",
@@ -355,24 +369,24 @@ impl HevcProfile {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum H264Profile {
-    Main_8bit,
-    High_10bit,
+    Main8bit,
+    High10bit,
 }
 
 impl H264Profile {
     pub fn name(&self) -> &'static str {
         match self {
-            H264Profile::Main_8bit => "Main 8-bit",
-            H264Profile::High_10bit => "High 10-bit",
+            H264Profile::Main8bit => "Main 8-bit",
+            H264Profile::High10bit => "High 10-bit",
         }
     }
 
     pub fn is_8bit(&self) -> bool {
-        matches!(self, H264Profile::Main_8bit)
+        matches!(self, H264Profile::Main8bit)
     }
 
     pub fn all() -> &'static [H264Profile] {
-        &[H264Profile::Main_8bit, H264Profile::High_10bit]
+        &[H264Profile::Main8bit, H264Profile::High10bit]
     }
 
     pub fn next(self) -> Self {
@@ -522,79 +536,160 @@ impl RateControl {
 /// Build the FFmpeg rate-control / quality arguments for a given encoder.
 ///
 /// * `is_hw` — `true` for GPU-backed encoders (nvenc / amf / qsv / videotoolbox).
-/// * `codec_name` — the FFmpeg encoder name (used only for default fallback).
+/// * `encoder_name` — the FFmpeg encoder name; used to pick the right flag set.
+///
+/// Special cases:
+/// * **libvpx-vp9** and **libaom-av1** require `-b:v 0` alongside `-crf` to
+///   enable constant-quality mode. Without `-b:v 0` they treat `-crf` as a
+///   max-bitrate hint and fall back to default VBR.
+/// * **NVENC** bitrate modes get an explicit `-rc:v vbr` so the preset's
+///   default rate control (which varies by FFmpeg / driver version) doesn't
+///   silently override the requested target.
 pub fn rate_control_args(rc: &RateControl, encoder_name: &str) -> Vec<String> {
     let is_hw = !encoder_name.starts_with("lib");
     let is_videotoolbox = encoder_name.ends_with("_videotoolbox");
+    let is_nvenc = encoder_name.ends_with("_nvenc");
+    let needs_bv0_for_crf = matches!(encoder_name, "libvpx-vp9" | "libaom-av1");
+
+    // Helper: produce a constant-quality arg pair for the encoder.
+    let cq = |value: &str| -> Vec<String> {
+        if is_videotoolbox {
+            vec!["-quality".into(), value.into()]
+        } else if is_hw {
+            vec!["-cq".into(), value.into()]
+        } else if needs_bv0_for_crf {
+            vec!["-crf".into(), value.into(), "-b:v".into(), "0".into()]
+        } else {
+            vec!["-crf".into(), value.into()]
+        }
+    };
+
+    // Helper: produce a target-bitrate arg set.
+    let bitrate = |value: &str| -> Vec<String> {
+        let mut v = vec![
+            "-b:v".into(), value.into(),
+            "-maxrate".into(), value.into(),
+        ];
+        if is_nvenc {
+            // Pin NVENC into VBR mode so `-b:v` actually drives the encoder
+            // (the default rc depends on preset + driver, which made bitrate
+            // modes unreliable).
+            v.push("-rc:v".into());
+            v.push("vbr".into());
+        }
+        v
+    };
+
     match rc {
         RateControl::Lossless => {
             if is_videotoolbox {
-                // VideoToolbox uses -quality for rate control
                 vec!["-quality".into(), "lossless".into()]
-            } else if is_hw {
-                vec!["-cq".into(), "16".into()]
             } else {
-                vec!["-crf".into(), "16".into()]
+                cq("16")
             }
         }
         RateControl::High => {
             if is_videotoolbox {
                 vec!["-quality".into(), "max".into()]
-            } else if is_hw {
-                vec!["-cq".into(), "20".into()]
             } else {
-                vec!["-crf".into(), "20".into()]
+                cq("20")
             }
         }
         RateControl::Standard => {
             if is_videotoolbox {
                 vec!["-quality".into(), "high".into()]
-            } else if is_hw {
-                vec!["-cq".into(), "24".into()]
             } else {
-                vec!["-crf".into(), "24".into()]
+                cq("24")
             }
         }
-        RateControl::Master400M => {
-            vec![
-                "-b:v".into(),
-                "400M".into(),
-                "-maxrate".into(),
-                "400M".into(),
-            ]
-        }
-        RateControl::Standard150M => {
-            vec![
-                "-b:v".into(),
-                "150M".into(),
-                "-maxrate".into(),
-                "150M".into(),
-            ]
-        }
+        RateControl::Master400M => bitrate("400M"),
+        RateControl::Standard150M => bitrate("150M"),
         RateControl::Custom(val) => {
             if val.is_empty() {
                 return vec![];
             }
             let upper = val.to_uppercase();
             if upper.ends_with('M') || upper.ends_with('K') {
-                vec![
-                    "-b:v".into(),
-                    val.clone(),
-                    "-maxrate".into(),
-                    val.clone(),
-                ]
+                bitrate(val)
             } else if val.parse::<f64>().is_ok() {
-                if is_videotoolbox {
-                    vec!["-quality".into(), val.clone()]
-                } else if is_hw {
-                    vec!["-cq".into(), val.clone()]
-                } else {
-                    vec!["-crf".into(), val.clone()]
-                }
+                cq(val)
             } else {
                 // Pass the raw string directly — FFmpeg validates it.
                 vec![val.clone()]
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_control_lossless_software_uses_crf() {
+        let args = rate_control_args(&RateControl::Lossless, "libx265");
+        assert_eq!(args, vec!["-crf", "16"]);
+    }
+
+    #[test]
+    fn rate_control_lossless_nvenc_uses_cq() {
+        let args = rate_control_args(&RateControl::Lossless, "hevc_nvenc");
+        assert_eq!(args, vec!["-cq", "16"]);
+    }
+
+    #[test]
+    fn rate_control_lossless_videotoolbox_uses_quality_lossless() {
+        let args = rate_control_args(&RateControl::Lossless, "hevc_videotoolbox");
+        assert_eq!(args, vec!["-quality", "lossless"]);
+    }
+
+    #[test]
+    fn rate_control_nvenc_bitrate_mode_pins_rc_to_vbr() {
+        // Regression test: NVENC bitrate modes used to silently get the
+        // preset's default rate-control mode, which made `-b:v` unreliable.
+        let args = rate_control_args(&RateControl::Master400M, "hevc_nvenc");
+        assert!(args.contains(&"-b:v".to_string()));
+        assert!(args.contains(&"-maxrate".to_string()));
+        assert!(args.contains(&"-rc:v".to_string()));
+        assert!(args.contains(&"vbr".to_string()));
+    }
+
+    #[test]
+    fn rate_control_vp9_crf_adds_bv0() {
+        // Regression test: libvpx-vp9 needs `-b:v 0` alongside `-crf`,
+        // otherwise it silently falls back to default VBR.
+        let args = rate_control_args(&RateControl::Standard, "libvpx-vp9");
+        assert!(args.contains(&"-crf".to_string()));
+        assert!(args.contains(&"24".to_string()));
+        assert!(args.contains(&"-b:v".to_string()));
+        assert!(args.contains(&"0".to_string()));
+    }
+
+    #[test]
+    fn rate_control_libaom_av1_crf_adds_bv0() {
+        let args = rate_control_args(&RateControl::High, "libaom-av1");
+        assert!(args.contains(&"-crf".to_string()));
+        assert!(args.contains(&"20".to_string()));
+        assert!(args.contains(&"-b:v".to_string()));
+        assert!(args.contains(&"0".to_string()));
+    }
+
+    #[test]
+    fn rate_control_custom_numeric_routes_to_cq() {
+        let args = rate_control_args(&RateControl::Custom("18".into()), "libx265");
+        assert_eq!(args, vec!["-crf", "18"]);
+    }
+
+    #[test]
+    fn rate_control_custom_bitrate_routes_to_bv() {
+        let args = rate_control_args(&RateControl::Custom("50M".into()), "libx265");
+        assert!(args.contains(&"-b:v".to_string()));
+        assert!(args.contains(&"50M".to_string()));
+    }
+
+    #[test]
+    fn rate_control_custom_empty_returns_empty() {
+        let args = rate_control_args(&RateControl::Custom(String::new()), "libx265");
+        assert!(args.is_empty());
     }
 }

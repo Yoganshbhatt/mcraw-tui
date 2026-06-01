@@ -37,6 +37,11 @@ crossbeam-channel = "0.5"
 # Pure-Rust MotionCam decoder (replaces C++ FFI)
 motioncam-decoder = { path = "../motioncam-decoder-rust", features = ["parallel"] }
 
+# GPU compute (WGSL compute shaders for RCD demosaicing)
+wgpu = { version = "24", features = ["wgsl"] }
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+
 # UUID for internal tracking
 uuid = { version = "1", features = ["v4"] }
 

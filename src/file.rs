@@ -145,6 +145,18 @@ impl BayerPattern {
             BayerPattern::QuadBayerBGGR => "QuadBayer BGGR",
         }
     }
+
+    /// Dcraw-style `filters` encoding for WGSL shaders.
+    /// Maps Bayer pattern to a u32 bitfield R=0, G1=1, G2=3(!), B=2.
+    pub fn to_dcraw_filters(&self) -> u32 {
+        match self {
+            BayerPattern::RGGB => 0x94949494,
+            BayerPattern::BGGR => 0x16161616,
+            BayerPattern::GRBG => 0x61616161,
+            BayerPattern::GBRG => 0x49494949,
+            _ => 0x94949494, // QuadBayer patterns fall back to RGGB
+        }
+    }
 }
 
 /// Camera metadata extracted from the MCRAW header block
