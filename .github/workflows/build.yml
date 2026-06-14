@@ -17,28 +17,16 @@ jobs:
             os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Checkout mcraw-tui
-        uses: actions/checkout@v4
-        with:
-          path: mcraw-tui
-
-      - name: Checkout motioncam-decoder-rust
-        uses: actions/checkout@v4
-        with:
-          repository: Yoganshbhatt/motioncam-decoder-rust
-          path: motioncam-decoder-rust
+      - uses: actions/checkout@v4
 
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
-        working-directory: mcraw-tui
 
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }}
-        working-directory: mcraw-tui
 
       - name: Package (macOS / Linux)
         if: runner.os != 'Windows'
-        working-directory: mcraw-tui
         run: |
           cp target/${{ matrix.target }}/release/mcraw-tui mcraw-tui-${{ matrix.target }}
           chmod +x mcraw-tui-${{ matrix.target }}
@@ -47,7 +35,6 @@ jobs:
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        working-directory: mcraw-tui
         run: |
           Copy-Item "target/${{ matrix.target }}/release/mcraw-tui.exe" -Destination "mcraw-tui-${{ matrix.target }}.exe"
           Compress-Archive -Path "mcraw-tui-${{ matrix.target }}.exe" -DestinationPath "mcraw-tui-${{ matrix.target }}.zip"
@@ -56,4 +43,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: mcraw-tui-${{ matrix.target }}
-          path: mcraw-tui/mcraw-tui-${{ matrix.target }}.zip
+          path: mcraw-tui-${{ matrix.target }}.zip
