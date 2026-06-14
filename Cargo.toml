@@ -35,7 +35,7 @@ rayon = "1.10"
 crossbeam-channel = "0.5"
 
 # Pure-Rust MotionCam decoder (replaces C++ FFI)
-motioncam-decoder = { path = "../motioncam-decoder-rust", features = ["parallel"] }
+motioncam-decoder = { version = "0.1", features = ["parallel"] }
 
 # GPU compute (WGSL compute shaders for RCD demosaicing)
 wgpu = { version = "24", features = ["wgsl"] }
