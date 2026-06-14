@@ -11,11 +11,15 @@ mod encoder;
 mod error;
 mod export;
 mod file;
+mod gradient;
+mod grading;
+mod gui;
 mod file_browser;
 mod hardware;
 mod metadata;
 mod pipeline;
 mod preset;
+mod preview;
 mod stats;
 mod ui;
 

@@ -9,43 +9,70 @@ use std::time::Duration;
 
 use crate::app::{App, ExportFocus, FocusTarget, ImportPopupState, QueueStatus};
 use crate::export::CodecFamily;
+use crate::gradient::{multi_stop_color, GRADIENT_COOL, GRADIENT_WARM};
+
 
 // ---------------------------------------------------------------------------
 // Palette
 // ---------------------------------------------------------------------------
 
+// Midnight Grove — warm organic palette
+// amber  #E8A035  green  #45E88A  ember  #C45C3C  mist   #6DAEAE  cream  #E8E4D9
 struct Palette;
 impl Palette {
-    const HEADER_BG: Color = Color::Rgb(25, 45, 85);
-    const HEADER_FG: Color = Color::White;
-    const BORDER: Color = Color::Rgb(70, 100, 140);
-    const BORDER_FOCUSED: Color = Color::Rgb(230, 190, 60);
-    const LABEL: Color = Color::Rgb(150, 150, 170);
-    const VALUE: Color = Color::White;
-    const FOCUSED: Color = Color::Rgb(230, 190, 60);
-    const CHECKED: Color = Color::Rgb(80, 210, 120);
-    const UNCHECKED: Color = Color::Rgb(90, 90, 110);
-    const HIGHLIGHT_BG: Color = Color::Rgb(45, 55, 90);
-    const HIGHLIGHT_FOCUSED_BG: Color = Color::Rgb(60, 70, 120);
-    const QUEUE_WAITING: Color = Color::Rgb(150, 150, 170);
-    const QUEUE_RENDERING: Color = Color::Rgb(230, 190, 60);
-    const QUEUE_COMPLETED: Color = Color::Rgb(80, 210, 120);
-    const QUEUE_FAILED: Color = Color::Rgb(220, 80, 80);
-    const BUTTON_BG: Color = Color::Rgb(50, 90, 170);
-    const BUTTON_FG: Color = Color::White;
-    const STATUS_KEY: Color = Color::Rgb(110, 190, 230);
-    const POPUP_TITLE: Color = Color::Rgb(230, 190, 60);
-    const POPUP_BORDER: Color = Color::Rgb(80, 120, 160);
-    const SUCCESS: Color = Color::Rgb(80, 210, 120);
-    const BROWSER_DIR: Color = Color::Rgb(110, 190, 230);
-    const BROWSER_MCRAW: Color = Color::Rgb(210, 210, 230);
-    const BROWSER_OTHER: Color = Color::Rgb(80, 80, 100);
-    const HW_CODEC: Color = Color::Rgb(80, 210, 120);
-    const SW_CODEC: Color = Color::Rgb(220, 140, 60);
-    const PROGRESS_BAR_BG: Color = Color::Rgb(40, 40, 60);
-    const PROGRESS_BAR_FG: Color = Color::Rgb(80, 210, 120);
-    const IMPORT_PROMPT: Color = Color::Rgb(130, 160, 200);
-    const PANEL_BG: Color = Color::Rgb(20, 25, 45);
+    // Backgrounds
+    const BG_VOID: Color = Color::Rgb(0x0A, 0x0D, 0x08);
+    const BG_PANEL: Color = Color::Rgb(0x12, 0x17, 0x0F);
+    const BG_ELEVATED: Color = Color::Rgb(0x1E, 0x25, 0x18);
+    // Text
+    const TEXT_PRIMARY: Color = Color::Rgb(0xE8, 0xE4, 0xD9);
+    const TEXT_SECONDARY: Color = Color::Rgb(0x8A, 0x9A, 0x8E);
+    // Accents
+    const ACCENT_AMBER: Color = Color::Rgb(0xE8, 0xA0, 0x35);
+    const ACCENT_GREEN: Color = Color::Rgb(0x45, 0xE8, 0x8A);
+    const ACCENT_EMBER: Color = Color::Rgb(0xC4, 0x5C, 0x3C);
+    const ACCENT_MIST: Color = Color::Rgb(0x6D, 0xAE, 0xAE);
+    // Borders
+    const BORDER_DIM: Color = Color::Rgb(0x2E, 0x3A, 0x28);
+    const BORDER_FOCUS: Color = Color::Rgb(0xE8, 0xA0, 0x35);
+    // UI state
+    const SUCCESS: Color = Color::Rgb(0x45, 0xE8, 0x8A);
+    const WARNING: Color = Color::Rgb(0xE8, 0xA0, 0x35);
+    const ERROR: Color = Color::Rgb(0xC4, 0x5C, 0x3C);
+    // Queue status
+    const QUEUE_WAITING: Color = Color::Rgb(0x8A, 0x9A, 0x8E);
+    const QUEUE_RENDERING: Color = Color::Rgb(0xE8, 0xA0, 0x35);
+    const QUEUE_COMPLETED: Color = Color::Rgb(0x45, 0xE8, 0x8A);
+    const QUEUE_FAILED: Color = Color::Rgb(0xC4, 0x5C, 0x3C);
+    // Browser file types
+    const BROWSER_DIR: Color = Color::Rgb(0xE8, 0xA0, 0x35);
+    const BROWSER_MCRAW: Color = Color::Rgb(0x45, 0xE8, 0x8A);
+    const BROWSER_OTHER: Color = Color::Rgb(0x8A, 0x9A, 0x8E);
+    // Hardware
+    const HW_CODEC: Color = Color::Rgb(0x45, 0xE8, 0x8A);
+    const SW_CODEC: Color = Color::Rgb(0x8A, 0x9A, 0x8E);
+    // Miscellaneous
+    const IMPORT_PROMPT: Color = Color::Rgb(0xE8, 0xA0, 0x35);
+    const STATUS_KEY: Color = Color::Rgb(0x6D, 0xAE, 0xAE);
+    // Legacy aliases (same colours, old names kept for existing renderers)
+    const BORDER: Color = Self::BORDER_DIM;
+    const BORDER_FOCUSED: Color = Self::BORDER_FOCUS;
+    const LABEL: Color = Self::TEXT_SECONDARY;
+    const VALUE: Color = Self::TEXT_PRIMARY;
+    const FOCUSED: Color = Self::ACCENT_AMBER;
+    const CHECKED: Color = Self::ACCENT_GREEN;
+    const UNCHECKED: Color = Self::TEXT_SECONDARY;
+    const HIGHLIGHT_BG: Color = Self::BG_ELEVATED;
+    const HIGHLIGHT_FOCUSED_BG: Color = Color::Rgb(0x2A, 0x35, 0x22);
+    const BUTTON_BG: Color = Self::BG_ELEVATED;
+    const BUTTON_FG: Color = Self::TEXT_PRIMARY;
+    const POPUP_TITLE: Color = Self::ACCENT_AMBER;
+    const POPUP_BORDER: Color = Self::BORDER_FOCUS;
+    const PROGRESS_BAR_BG: Color = Self::BG_ELEVATED;
+    const PROGRESS_BAR_FG: Color = Self::ACCENT_GREEN;
+    const PANEL_BG: Color = Self::BG_PANEL;
+    const HEADER_BG: Color = Self::BG_VOID;
+    const HEADER_FG: Color = Self::TEXT_PRIMARY;
 }
 
 // ---------------------------------------------------------------------------
@@ -91,6 +118,8 @@ pub enum ClickAction {
     ToggleBrowserSelection(usize),
     FavouriteNavigate(usize),
     OpenPresetPicker,
+    GradeSlider(usize),
+    FocusGrade,
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +151,8 @@ pub fn render(frame: &mut Frame, app: &App, regions: &mut Vec<ClickRegion>) {
         frame.render_widget(body_block, vert[1]);
     } else if app.show_culling {
         render_culling_screen(frame, vert[1], app, regions);
+    } else if app.show_grade_screen {
+        render_grade_screen_body(frame, vert[1], app, regions);
     } else {
         render_body(frame, vert[1], app, regions);
     }
@@ -161,44 +192,107 @@ pub fn render(frame: &mut Frame, app: &App, regions: &mut Vec<ClickRegion>) {
 // ---------------------------------------------------------------------------
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App, regions: &mut Vec<ClickRegion>) {
+    // Split header into left (content) and right (buttons) columns
+    let btn_total: u16 = 28; // "Grade" (8) + "  " (2) + "[Show] Browser" (18)
+    let header_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(btn_total),
+        ])
+        .split(area);
+
+    let left = header_layout[0];
+    let right = header_layout[1];
+
+    // Left section: file info
     let mut spans = vec![
-        Span::styled(" mcraw-tui ", Style::default().fg(Palette::HEADER_FG).bg(Palette::HEADER_BG).add_modifier(Modifier::BOLD)),
+        Span::styled(" mcraw-tui ", Style::default().fg(Palette::ACCENT_AMBER).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
     ];
     if let Some(ref path) = app.file_path {
         let name = path.split(std::path::MAIN_SEPARATOR).last().unwrap_or(path);
-        spans.push(Span::styled(name, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(name, Style::default().fg(Palette::TEXT_PRIMARY).add_modifier(Modifier::BOLD)));
         spans.push(Span::raw("  "));
     }
-    spans.push(Span::styled(format!("{} imported", app.imported_files.len()), Style::default().fg(Color::White)));
+    spans.push(Span::styled(format!("{} imported", app.imported_files.len()), Style::default().fg(Palette::TEXT_SECONDARY)));
     spans.push(Span::raw("  |  "));
-    spans.push(Span::styled(format!("Queue: {}", app.queue.len()), Style::default().fg(Color::White)));
+    spans.push(Span::styled(format!("Queue: {}", app.queue.len()), Style::default().fg(Palette::TEXT_SECONDARY)));
     if app.is_exporting {
         spans.push(Span::raw("  |  "));
         spans.push(Span::styled(format!("[{:.0}%]", app.export_progress), Style::default().fg(Palette::SUCCESS).add_modifier(Modifier::BOLD)));
     }
 
-    let toggle_label = if app.show_browser { "[Hide] Browser" } else { "[Show] Browser" };
-    let toggle_style = Style::default().fg(Palette::STATUS_KEY).add_modifier(Modifier::BOLD);
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(toggle_label, toggle_style));
-
-    let toggle_area = Rect {
-        x: area.x + area.width.saturating_sub(18),
-        y: area.y,
-        width: 18,
-        height: area.height,
+    // FPS meter
+    let fps = app.fps_counter.fps();
+    let fps_color = if fps > 55.0 {
+        Palette::ACCENT_GREEN
+    } else if fps > 30.0 {
+        Palette::ACCENT_AMBER
+    } else {
+        Palette::ACCENT_EMBER
     };
-    regions.push(ClickRegion { area: toggle_area, action: ClickAction::ToggleBrowser });
+    let fps_int = fps as u32;
+    let fps_dec = ((fps - fps_int as f64) * 10.0) as u8;
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(
+        format!("[{}", fps_int),
+        Style::default().fg(fps_color).add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(
+        format!(".{}fps]", fps_dec),
+        Style::default().fg(Palette::TEXT_SECONDARY),
+    ));
+
+    // Resolution badge
+    let resolution = app.file_info.as_ref().map(|info| {
+        if info.width >= 3800 || info.height >= 2100 { "4K".to_string() }
+        else if info.width >= 2500 || info.height >= 1400 { "1440p".to_string() }
+        else if info.width >= 1900 || info.height >= 1000 { "1080p".to_string() }
+        else if info.width >= 1200 || info.height >= 700 { "720p".to_string() }
+        else { format!("{}p", info.height) }
+    });
+    if let Some(ref res) = resolution {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(format!("[{}]", res), Style::default().fg(Palette::TEXT_SECONDARY)));
+    }
 
     frame.render_widget(
-        Paragraph::new(Line::from(spans)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Palette::BORDER)),
-        ),
-        area,
+        Paragraph::new(Line::from(spans)).block(Block::default()),
+        left,
     );
+
+    // Right section: grade + browser buttons
+    let is_grade_focused = app.focus_target == FocusTarget::Grade;
+    let grade_style = if is_grade_focused {
+        Style::default().fg(Palette::ACCENT_AMBER).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Palette::TEXT_SECONDARY)
+    };
+    let grade_label = if is_grade_focused { "◆ Grade" } else { "Grade" };
+    let toggle_label = if app.show_browser { "[Hide] Browser" } else { "[Show] Browser" };
+    let toggle_style = Style::default().fg(Palette::STATUS_KEY).add_modifier(Modifier::BOLD);
+
+    let right_line = Line::from(vec![
+        Span::styled(grade_label, grade_style),
+        Span::raw("  "),
+        Span::styled(toggle_label, toggle_style),
+    ]);
+    frame.render_widget(Paragraph::new(right_line), right);
+
+    // Click regions — exact visual positions within the right section
+    let grade_btn_w: u16 = 8;   // "◆ Grade" or "Grade" (+ leading char diff is fine)
+    let toggle_w: u16 = 18;     // "[Show] Browser" or "[Hide] Browser"
+    let gap: u16 = 2;           // "  " between them
+    let base_x = right.x;
+    regions.push(ClickRegion {
+        area: Rect { x: base_x, y: area.y, width: grade_btn_w, height: area.height },
+        action: ClickAction::FocusGrade,
+    });
+    regions.push(ClickRegion {
+        area: Rect { x: base_x + grade_btn_w + gap, y: area.y, width: toggle_w, height: area.height },
+        action: ClickAction::ToggleBrowser,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -247,8 +341,6 @@ fn render_empty_state(frame: &mut Frame, area: Rect, app: &App, regions: &mut Ve
 // ---------------------------------------------------------------------------
 
 fn render_body(frame: &mut Frame, area: Rect, app: &App, regions: &mut Vec<ClickRegion>) {
-    // 2x2 grid: Media Pool | Preview/Progress
-    //           Export       | Render Queue
     let vert = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -265,18 +357,134 @@ fn render_body(frame: &mut Frame, area: Rect, app: &App, regions: &mut Vec<Click
         ])
         .split(vert[0]);
 
-    let bottom = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(35),
-            Constraint::Percentage(65),
-        ])
-        .split(vert[1]);
+    if app.focus_target == FocusTarget::Grade {
+        let bottom = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(35),
+                Constraint::Percentage(65),
+            ])
+            .split(vert[1]);
+        render_media_pool(frame, app, top[0], regions);
+        render_preview_or_progress(frame, app, top[1], regions);
+        render_export_settings(frame, app, bottom[0], regions);
+        render_queue_panel(frame, app, bottom[1], regions);
+    } else {
+        // Normal mode: export settings left, queue right
+        let bottom = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(35),
+                Constraint::Percentage(65),
+            ])
+            .split(vert[1]);
+        render_media_pool(frame, app, top[0], regions);
+        render_preview_or_progress(frame, app, top[1], regions);
+        render_export_settings(frame, app, bottom[0], regions);
+        render_queue_panel(frame, app, bottom[1], regions);
+    }
+}
 
-    render_media_pool(frame, app, top[0], regions);
-    render_preview_or_progress(frame, app, top[1], regions);
-    render_export_settings(frame, app, bottom[0], regions);
-    render_queue_panel(frame, app, bottom[1], regions);
+fn render_grade_screen_body(frame: &mut Frame, area: Rect, app: &App, regions: &mut Vec<ClickRegion>) {
+    // Lightbox: full-screen canvas with Focus Strip at bottom
+    // The entire area becomes the "preview canvas" — no panel splits
+
+    // Bottom margin: 3 rows for Focus Strip + padding
+    let strip_height: u16 = 3;
+    let preview_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: area.height.saturating_sub(strip_height),
+    };
+    let strip_area = Rect {
+        x: area.x,
+        y: area.y + preview_area.height,
+        width: area.width,
+        height: strip_height,
+    };
+
+    // Render the canvas background
+    let canvas_border = if app.grade_before_snapshot.is_some() {
+        // Before/after flash: amber accent border
+        shockwave_border(app.shockwave_ticks_remaining, Palette::ACCENT_AMBER)
+    } else {
+        Palette::BG_VOID
+    };
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(canvas_border)),
+        preview_area,
+    );
+
+    // Metadata overlay in center of canvas
+    let file_name = app.file_path.as_ref()
+        .map(|s| std::path::Path::new(s))
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("Untitled");
+    let resolution = app.file_info.as_ref()
+        .map(|info| format!("{}x{}", info.width, info.height))
+        .unwrap_or_else(|| "N/A".to_string());
+    let frame_count = app.frame_count;
+    let fps = app.file_info.as_ref()
+        .map(|info| format!("{:.1}fps", info.fps))
+        .unwrap_or_else(|| "N/A".to_string());
+
+    let preview_lines = vec![
+        Line::from(Span::styled(
+            "◆ PREVIEW",
+            Style::default().fg(Palette::ACCENT_AMBER).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "GPU Pipeline Coming Soon",
+            Style::default().fg(Palette::TEXT_SECONDARY),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            file_name,
+            Style::default().fg(Palette::TEXT_PRIMARY).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format!("{}  |  {} frames  |  {}", resolution, frame_count, fps),
+            Style::default().fg(Palette::TEXT_SECONDARY),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "↑↓ category  ←→ adjust  B before/after  Esc exit",
+            Style::default().fg(Palette::STATUS_KEY),
+        )),
+    ];
+
+    let overlay = Paragraph::new(preview_lines)
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::NONE));
+    // Vertically center the overlay text
+    let overlay_area = Rect {
+        x: preview_area.x,
+        y: preview_area.y + preview_area.height.saturating_sub(8) / 2,
+        width: preview_area.width,
+        height: 8,
+    };
+    frame.render_widget(overlay, overlay_area);
+
+    // Focus Strip HUD at bottom
+    let strip_border = if app.grade_before_snapshot.is_some() {
+        shockwave_border(app.shockwave_ticks_remaining, Palette::BORDER_FOCUSED)
+    } else {
+        Palette::BORDER_DIM
+    };
+    let strip_line = focus_strip(app, strip_area.width.saturating_sub(4));
+    frame.render_widget(
+        Paragraph::new(strip_line)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(strip_border)),
+            ),
+        strip_area,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -300,9 +508,9 @@ fn render_culling_screen(frame: &mut Frame, area: Rect, app: &App, regions: &mut
     let items: Vec<ListItem> = app.imported_files.iter().enumerate().map(|(_i, f)| {
         let name = f.path.split(std::path::MAIN_SEPARATOR).last().unwrap_or(&f.path);
         let checkbox = if f.selected {
-            Span::styled("[*] ", Style::default().fg(Palette::CHECKED).add_modifier(Modifier::BOLD))
+            Span::styled("◉ ", Style::default().fg(Palette::CHECKED).add_modifier(Modifier::BOLD))
         } else {
-            Span::styled("[ ] ", Style::default().fg(Palette::UNCHECKED))
+            Span::styled("◌ ", Style::default().fg(Palette::UNCHECKED))
         };
         let content = Line::from(vec![
             checkbox,
@@ -427,7 +635,7 @@ fn render_browser_overlay(frame: &mut Frame, area: Rect, app: &App, regions: &mu
         let mut x = bar_area.x + 1;
         let star_style = Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD);
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled("★", star_style))),
+            Paragraph::new(Line::from(Span::styled("◆", star_style))),
             Rect { x: bar_area.x, y: bar_area.y, width: 1, height: 1 },
         );
         for (i, f) in app.favourite_folders.iter().enumerate() {
@@ -462,7 +670,7 @@ fn render_browser_overlay(frame: &mut Frame, area: Rect, app: &App, regions: &mu
                     .unwrap_or_else(|| f.to_string_lossy().into_owned());
                 let full = f.display().to_string();
                 let content = vec![
-                    Span::styled("★ ", Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD)),
+                    Span::styled("◆ ", Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD)),
                     Span::styled(format!("{:<24}", disp), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
                     Span::styled(full, Style::default().fg(Palette::LABEL)),
                 ];
@@ -494,6 +702,25 @@ fn render_browser_overlay(frame: &mut Frame, area: Rect, app: &App, regions: &mu
         if let Some(off) = state.offset().into() {
             app.favourites_scroll_offset.set(off);
         }
+        // Click regions for each visible favourite item
+        let visible_rows = list_area.height.saturating_sub(2) as usize;
+        let visible_start = app.favourites_scroll_offset.get();
+        for i in 0..visible_rows {
+            let idx = visible_start + i;
+            if idx >= app.favourite_folders.len() {
+                break;
+            }
+            let row_area = Rect {
+                x: list_area.x + 1,
+                y: list_area.y + 1 + i as u16,
+                width: list_area.width.saturating_sub(2),
+                height: 1,
+            };
+            regions.push(ClickRegion {
+                area: row_area,
+                action: ClickAction::FavouriteNavigate(idx),
+            });
+        }
     } else {
         let items: Vec<ListItem> = app
             .browser
@@ -504,9 +731,9 @@ fn render_browser_overlay(frame: &mut Frame, area: Rect, app: &App, regions: &mu
                 let is_mcraw = entry.name.to_lowercase().ends_with(".mcraw");
                 let checkbox = if is_mcraw {
                     if entry.selected {
-                        Span::styled("[*] ", Style::default().fg(Palette::CHECKED).add_modifier(Modifier::BOLD))
+                        Span::styled("◉ ", Style::default().fg(Palette::CHECKED).add_modifier(Modifier::BOLD))
                     } else {
-                        Span::styled("[ ] ", Style::default().fg(Palette::UNCHECKED))
+                        Span::styled("◌ ", Style::default().fg(Palette::UNCHECKED))
                     }
                 } else {
                     Span::styled("    ", Style::default())
@@ -624,7 +851,7 @@ fn render_browser_overlay(frame: &mut Frame, area: Rect, app: &App, regions: &mu
 
 fn render_media_pool(frame: &mut Frame, app: &App, area: Rect, regions: &mut Vec<ClickRegion>) {
     let is_focused = app.focus_target == FocusTarget::MediaPool;
-    let border_color = if is_focused { Palette::BORDER_FOCUSED } else { Palette::BORDER };
+    let border_color = shockwave_border(app.shockwave_ticks_remaining, if is_focused { Palette::BORDER_FOCUSED } else { Palette::BORDER });
     let inner_h = area.height.saturating_sub(2) as usize;
 
     // Panel-wide click region to focus media pool
@@ -633,9 +860,9 @@ fn render_media_pool(frame: &mut Frame, app: &App, area: Rect, regions: &mut Vec
     let items: Vec<ListItem> = app.imported_files.iter().enumerate().map(|(_i, f)| {
         let name = f.path.split(std::path::MAIN_SEPARATOR).last().unwrap_or(&f.path);
         let checkbox = if f.selected {
-            Span::styled("[*] ", Style::default().fg(Palette::CHECKED).add_modifier(Modifier::BOLD))
+            Span::styled("◉ ", Style::default().fg(Palette::CHECKED).add_modifier(Modifier::BOLD))
         } else {
-            Span::styled("[ ] ", Style::default().fg(Palette::UNCHECKED))
+            Span::styled("◌ ", Style::default().fg(Palette::UNCHECKED))
         };
         let res = format!("{}x{}", f.info.width, f.info.height);
         let fps = format!("{:.0}fps", f.info.fps);
@@ -746,8 +973,9 @@ fn render_media_pool(frame: &mut Frame, app: &App, area: Rect, regions: &mut Vec
 // ---------------------------------------------------------------------------
 
 fn render_preview_or_progress(frame: &mut Frame, app: &App, area: Rect, _regions: &mut Vec<ClickRegion>) {
-    let is_focused = app.focus_target == FocusTarget::Preview;
-    let border_color = if is_focused { Palette::BORDER_FOCUSED } else { Palette::BORDER };
+    let is_focused = app.focus_target == FocusTarget::Preview || app.focus_target == FocusTarget::Grade;
+    let base_color = if is_focused { Palette::BORDER_FOCUSED } else { Palette::BORDER };
+    let border_color = shockwave_border(app.shockwave_ticks_remaining, base_color);
 
     if app.is_exporting {
         render_render_progress(frame, app, area, border_color);
@@ -873,35 +1101,94 @@ fn render_export_summary(frame: &mut Frame, app: &App, area: Rect, border_color:
     frame.render_widget(panel, area);
 }
 
+/// Convert a frame index and frame rate to a timecode string HH:MM:SS:FF.
+fn frames_to_timecode(frame: usize, total: usize, fps: f64) -> (String, String) {
+    let tc = |f: usize| -> String {
+        let total_s = if fps > 0.0 { f as f64 / fps } else { 0.0 };
+        let h = (total_s / 3600.0) as u64;
+        let m = ((total_s % 3600.0) / 60.0) as u64;
+        let s = (total_s % 60.0) as u64;
+        let frames = (total_s.fract() * fps) as u64;
+        format!("{:02}:{:02}:{:02}:{:02}", h, m, s, frames)
+    };
+    (tc(frame), tc(total))
+}
+
+/// Build the sprocket-hole timeline row:
+/// `┊╎..╎..╎..╎..╎●╎..╎..╎..╎..╎..╎..╎..╎..╎┊`
+///
+/// The playhead (`●`) leaves a 1-frame phosphor trail (`░`)
+/// to simulate persistence of vision.
+fn sprocket_track(frame: usize, total: usize, width: usize, prev_playhead: Option<usize>) -> Line<'static> {
+    if width < 8 || total == 0 {
+        return Line::from("");
+    }
+    let capacity = width.saturating_sub(2); // minus end caps
+    let playhead_pos = if total > 0 {
+        (frame as f64 / total as f64) * capacity as f64
+    } else {
+        0.0
+    };
+    let playhead_idx = (playhead_pos as usize).min(capacity.saturating_sub(1));
+
+    // Frame tick interval
+    let tick_interval = (capacity / total.min(capacity)).max(1);
+
+    let mut chars = Vec::with_capacity(width);
+    chars.push(Span::raw("┊"));
+
+    for i in 0..capacity {
+        if i == playhead_idx {
+            chars.push(Span::styled("●", Style::default().fg(Palette::ACCENT_AMBER)));
+        } else if prev_playhead == Some(i) {
+            chars.push(Span::styled("░", Style::default().fg(Palette::ACCENT_AMBER)));
+        } else if i % tick_interval == 0 && i < capacity - 1 {
+            chars.push(Span::styled("╎", Style::default().fg(Palette::TEXT_SECONDARY)));
+        } else {
+            chars.push(Span::styled(".", Style::default().fg(Palette::BORDER_DIM)));
+        }
+    }
+    chars.push(Span::raw("┊"));
+    Line::from(chars)
+}
+
 fn render_preview_panel(frame: &mut Frame, app: &App, area: Rect, border_color: Color) {
     let info = app.focused_file_info().or(app.file_info.as_ref());
+    let inner_w = area.width.saturating_sub(4) as usize;
 
-    let text = if let Some(info) = info {
+    let mut lines: Vec<Line> = Vec::new();
+
+    if let Some(info) = info {
         let name = info.path.split(std::path::MAIN_SEPARATOR).last().unwrap_or(&info.path);
         let duration_secs = if info.fps > 0.0 { info.frame_count as f64 / info.fps } else { 0.0 };
         let mins = duration_secs as u64 / 60;
         let secs = duration_secs as u64 % 60;
-        vec![
-            Line::from(Span::styled(format!(" PREVIEW: {}", name), Style::default().fg(Palette::POPUP_TITLE).add_modifier(Modifier::BOLD))),
-            Line::from(""),
-            Line::from(vec![Span::styled("  Resolution:  ", Style::default().fg(Palette::LABEL)), Span::styled(format!("{} x {}", info.width, info.height), Style::default().fg(Palette::VALUE))]),
-            Line::from(vec![Span::styled("  Frames:      ", Style::default().fg(Palette::LABEL)), Span::styled(format!("{}", info.frame_count), Style::default().fg(Palette::VALUE))]),
-            Line::from(vec![Span::styled("  Frame Rate:  ", Style::default().fg(Palette::LABEL)), Span::styled(format!("{:.1} fps", info.fps), Style::default().fg(Palette::VALUE))]),
-            Line::from(vec![Span::styled("  Duration:    ", Style::default().fg(Palette::LABEL)), Span::styled(format!("{:02}:{:02}", mins, secs), Style::default().fg(Palette::VALUE))]),
-            Line::from(vec![Span::styled("  Camera:      ", Style::default().fg(Palette::LABEL)), Span::styled(info.camera_metadata.camera_model.as_deref().unwrap_or("MotionCam"), Style::default().fg(Palette::VALUE))]),
-            Line::from(vec![Span::styled("  Sensor:      ", Style::default().fg(Palette::LABEL)), Span::styled(info.camera_metadata.sensor_model.as_deref().unwrap_or("Unknown"), Style::default().fg(Palette::VALUE))]),
-            Line::from(vec![Span::styled("  ISO:         ", Style::default().fg(Palette::LABEL)), Span::styled(info.camera_metadata.iso.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()), Style::default().fg(Palette::VALUE))]),
-            Line::from(Span::styled("  [Preview coming soon]", Style::default().fg(Color::DarkGray))),
-        ]
-    } else {
-        vec![
-            Line::from(Span::styled(" PREVIEW", Style::default().fg(Palette::LABEL).add_modifier(Modifier::BOLD))),
-            Line::from(""),
-            Line::from(Span::styled("  Select a file from media pool", Style::default().fg(Color::DarkGray))),
-        ]
-    };
 
-    let panel = Paragraph::new(text)
+        lines.push(Line::from(Span::styled(format!(" PREVIEW: {}", name), Style::default().fg(Palette::POPUP_TITLE).add_modifier(Modifier::BOLD))));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled("  Resolution:  ", Style::default().fg(Palette::LABEL)), Span::styled(format!("{} x {}", info.width, info.height), Style::default().fg(Palette::VALUE))]));
+        lines.push(Line::from(vec![Span::styled("  Frames:      ", Style::default().fg(Palette::LABEL)), Span::styled(format!("{}", info.frame_count), Style::default().fg(Palette::VALUE))]));
+        lines.push(Line::from(vec![Span::styled("  Frame Rate:  ", Style::default().fg(Palette::LABEL)), Span::styled(format!("{:.1} fps", info.fps), Style::default().fg(Palette::VALUE))]));
+        lines.push(Line::from(vec![Span::styled("  Duration:    ", Style::default().fg(Palette::LABEL)), Span::styled(format!("{:02}:{:02}", mins, secs), Style::default().fg(Palette::VALUE))]));
+        lines.push(Line::from(vec![Span::styled("  Camera:      ", Style::default().fg(Palette::LABEL)), Span::styled(info.camera_metadata.camera_model.as_deref().unwrap_or("MotionCam"), Style::default().fg(Palette::VALUE))]));
+        lines.push(Line::from(vec![Span::styled("  Sensor:      ", Style::default().fg(Palette::LABEL)), Span::styled(info.camera_metadata.sensor_model.as_deref().unwrap_or("Unknown"), Style::default().fg(Palette::VALUE))]));
+        lines.push(Line::from(vec![Span::styled("  ISO:         ", Style::default().fg(Palette::LABEL)), Span::styled(info.camera_metadata.iso.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()), Style::default().fg(Palette::VALUE))]));
+
+        // Sprocket timeline
+        if inner_w >= 16 {
+            lines.push(Line::from(""));
+            let (current_tc, total_tc) = frames_to_timecode(app.frame_index, info.frame_count as usize, info.fps);
+            let tc_str = format!("  {} / {}  ", current_tc, total_tc);
+            lines.push(Line::from(Span::styled(tc_str, Style::default().fg(Palette::TEXT_PRIMARY))));
+            lines.push(sprocket_track(app.frame_index, info.frame_count as usize, inner_w, None));
+        }
+    } else {
+        lines.push(Line::from(Span::styled(" PREVIEW", Style::default().fg(Palette::LABEL).add_modifier(Modifier::BOLD))));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("  Select a file from media pool", Style::default().fg(Color::DarkGray))));
+    }
+
+    let panel = Paragraph::new(lines)
         .block(
             Block::default()
                 .title(" Preview / Info ")
@@ -912,16 +1199,266 @@ fn render_preview_panel(frame: &mut Frame, app: &App, area: Rect, border_color: 
     frame.render_widget(panel, area);
 }
 
+/// Gradient slider for the Grade panel.
+/// Renders a track like:
+/// ```text
+///  Exposure ▐████▓▓░░░░░░░░░░░░░▌ +1.20 stops
+/// ```
+/// Labels are right-padded to `label_w` so all sliders start at the same
+/// column. `value` can be any floating-point range — it is normalized to
+/// [0,1] using `lo` and `hi` for fill positioning. The filled side
+/// interpolates through GRADIENT_WARM from left to right. The value display
+/// text is shown in amber when focused, secondary otherwise.
+fn gradient_slider(label: &str, label_w: usize, value: f32, lo: f32, hi: f32, display: String,
+                   track_w: usize, is_focused: bool, anim_offset: u8) -> Line<'static> {
+    let dither = ["█", "▓", "▒", "░"];
+    let normalized = if hi > lo { ((value - lo) / (hi - lo)).clamp(0.0, 1.0) } else { 0.5 };
+    let filled = (normalized * track_w as f32).round() as usize;
+    let thumb_color = if is_focused {
+        Palette::ACCENT_AMBER
+    } else {
+        Palette::TEXT_SECONDARY
+    };
+
+    let mut spans = Vec::with_capacity(label_w + track_w + 16);
+
+    // Right-padded label so all sliders align
+    let padded = format!("{:width$}", label, width = label_w);
+    spans.push(Span::styled(
+        format!(" {}", padded),
+        Style::default().fg(if is_focused { Palette::ACCENT_AMBER } else { Palette::TEXT_PRIMARY }),
+    ));
+
+    // Left cap
+    spans.push(Span::styled("▐", Style::default().fg(Palette::BORDER_DIM)));
+
+    // Track — filled portion uses gradient via multi_stop_color
+    for i in 0..track_w {
+        let t = i as f32 / track_w.saturating_sub(1).max(1) as f32;
+        if i < filled {
+            let c = dither[((i + anim_offset as usize) % 4)];
+            let color = multi_stop_color(GRADIENT_WARM, t);
+            spans.push(Span::styled(c, Style::default().fg(color)));
+        } else {
+            spans.push(Span::styled("░", Style::default().fg(Palette::BORDER_DIM)));
+        }
+    }
+    // Right cap
+    spans.push(Span::styled("▌", Style::default().fg(Palette::BORDER_DIM)));
+
+    // Value display
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(display, Style::default().fg(thumb_color)));
+
+    Line::from(spans)
+}
+
+fn render_grade_panel(frame: &mut Frame, app: &App, area: Rect, border_color: Color) {
+    let inner_w = area.width.saturating_sub(6) as usize;
+    let track_w = inner_w.min(35).max(10);
+    let label_w = 12; // "Highlights  " — longest label = 10 + 2 padding
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        " GRADE",
+        Style::default().fg(Palette::POPUP_TITLE).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  \u{2191}\u{2193} category  \u{2190}\u{2192} adjust",
+        Style::default().fg(Palette::TEXT_SECONDARY),
+    )));
+    lines.push(Line::from(""));
+
+    for i in 0..crate::app::GradeSliders::count() {
+        let name = crate::app::GradeSliders::name(i);
+        let val = app.grade_sliders.value(i);
+        let lo = crate::app::GradeSliders::min(i);
+        let hi = crate::app::GradeSliders::max(i);
+        let display = app.grade_sliders.display_value(i);
+        let is_focused = app.focus_target == FocusTarget::Grade && app.grade_focus == i;
+        lines.push(gradient_slider(name, label_w, val, lo, hi, display, track_w, is_focused, app.progress_anim_offset));
+    }
+
+    let panel = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Grade ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color)),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(panel, area);
+}
+
+/// Return the border colour modulated by the heatwave shockwave animation.
+/// When active (≥3 ticks remaining), focused panel borders glow white-gold
+/// (#F0E68C) then decay back to the normal colour.
+fn shockwave_border(ticks: u8, normal: Color) -> Color {
+    if ticks >= 28 {
+        Color::Rgb(0xFF, 0xF8, 0xD0)
+    } else if ticks >= 24 {
+        Color::Rgb(0xF8, 0xEE, 0xA0)
+    } else if ticks >= 20 {
+        Color::Rgb(0xF0, 0xE6, 0x8C)
+    } else if ticks >= 16 {
+        Color::Rgb(0xE0, 0xD0, 0x78)
+    } else if ticks >= 12 {
+        Color::Rgb(0xD0, 0xBC, 0x64)
+    } else if ticks >= 9 {
+        Color::Rgb(0xC0, 0xA8, 0x50)
+    } else if ticks >= 6 {
+        Color::Rgb(0xB0, 0x94, 0x3C)
+    } else if ticks >= 4 {
+        Color::Rgb(0xA0, 0x80, 0x28)
+    } else if ticks >= 2 {
+        Color::Rgb(0x90, 0x6C, 0x14)
+    } else {
+        normal
+    }
+}
+
+/// Render the Lightbox Focus Strip — a single-line floating HUD at the bottom
+/// of the grade screen that shows the currently active parameter.
+fn focus_strip<'a>(app: &'a App, width: u16) -> Line<'a> {
+    let active = app.grade_strip_active || app.grade_strip_idle_ticks > 0;
+
+    let file_name = app.file_path.as_ref()
+        .map(|s| std::path::Path::new(s))
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("untitled");
+
+    if !active {
+        // Idle state: minimalist HUD
+        Line::from(vec![
+            Span::styled(" ◆ GRADE ACTIVE ", Style::default().fg(Palette::ACCENT_AMBER).add_modifier(Modifier::BOLD)),
+            Span::raw("│ "),
+            Span::styled(file_name, Style::default().fg(Palette::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+            Span::raw("  │  "),
+            Span::styled("[j/k]", Style::default().fg(Palette::STATUS_KEY)),
+            Span::styled(" Param ", Style::default().fg(Palette::TEXT_SECONDARY)),
+            Span::styled("[h/l]", Style::default().fg(Palette::STATUS_KEY)),
+            Span::styled(" Value ", Style::default().fg(Palette::TEXT_SECONDARY)),
+            Span::styled("[r]", Style::default().fg(Palette::STATUS_KEY)),
+            Span::styled(" Reset ", Style::default().fg(Palette::TEXT_SECONDARY)),
+            Span::styled("[b]", Style::default().fg(Palette::STATUS_KEY)),
+            Span::styled(" Before ", Style::default().fg(Palette::TEXT_SECONDARY)),
+            Span::styled("[Esc]", Style::default().fg(Palette::STATUS_KEY)),
+            Span::styled(" Exit", Style::default().fg(Palette::TEXT_SECONDARY)),
+        ])
+    } else {
+        // Active state: show the full parameter slider
+        let i = app.grade_focus;
+        let name = crate::app::GradeSliders::name(i);
+        let norm = app.grade_sliders.normalized(i);
+        let display = app.grade_sliders.display_value(i);
+
+        let track_w = (width as usize / 3).max(20).min(60);
+        let thumb_pos = (norm * track_w as f32).round() as usize;
+        let dither = ["█", "▓", "▒", "░"];
+        let is_temp_or_tint = i == 5 || i == 6;
+
+        let mut track_spans: Vec<Span<'static>> = Vec::with_capacity(track_w + 2);
+        track_spans.push(Span::styled("▐", Style::default().fg(Palette::BORDER_DIM)));
+
+        for pos in 0..track_w {
+            let t = pos as f32 / track_w.max(1) as f32;
+            let color = multi_stop_color(if is_temp_or_tint { GRADIENT_COOL } else { GRADIENT_WARM }, t);
+
+            let has_phosphor = app.phosphor_trail.iter()
+                .any(|&(pt, _)| (pt * track_w as f32 - pos as f32).abs() < 0.6);
+
+            if pos == thumb_pos {
+                track_spans.push(Span::styled("●", Style::default().fg(Palette::ACCENT_AMBER).add_modifier(Modifier::BOLD)));
+            } else if has_phosphor {
+                track_spans.push(Span::styled("░", Style::default().fg(Palette::ACCENT_AMBER)));
+            } else if pos < thumb_pos {
+                let di = ((pos + app.progress_anim_offset as usize) % 4).min(3);
+                track_spans.push(Span::styled(dither[di], Style::default().fg(color)));
+            } else {
+                track_spans.push(Span::styled(" ", Style::default().fg(color)));
+            }
+        }
+
+        track_spans.push(Span::styled("▌", Style::default().fg(Palette::BORDER_DIM)));
+
+        // Morph animation: name crossfades over 4 ticks
+        let name_style = if let Some((old_idx, ticks)) = app.grade_morph {
+            if old_idx == i {
+                let bright = (4 - ticks) as f32 / 4.0;
+                let bri = 0.5 + bright * 0.5;
+                let r = (0xE8u8 as f32 * bri) as u8;
+                let g = (0xA0u8 as f32 * (0.5 + bright * 0.3)) as u8;
+                let b = (0x35u8 as f32 * (0.5 + bright * 0.3)) as u8;
+                Style::default().fg(Color::Rgb(r, g, b)).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Palette::TEXT_SECONDARY)
+            }
+        } else {
+            Style::default().fg(Palette::ACCENT_AMBER).add_modifier(Modifier::BOLD)
+        };
+
+        Line::from({
+            let mut line_spans: Vec<Span<'static>> = vec![
+                Span::raw(" "),
+                Span::styled("◆", Style::default().fg(Palette::ACCENT_AMBER).add_modifier(Modifier::BOLD)),
+                Span::raw(" "),
+                Span::styled(name, name_style),
+                Span::raw(" "),
+            ];
+            line_spans.extend(track_spans);
+            line_spans.extend(vec![
+                Span::raw(" "),
+                Span::styled(display, Style::default().fg(Palette::ACCENT_AMBER)),
+                Span::raw("  │  "),
+                Span::styled("[j/k]", Style::default().fg(Palette::STATUS_KEY)),
+                Span::raw(" "),
+                Span::styled("[h/l]", Style::default().fg(Palette::STATUS_KEY)),
+                Span::raw(" "),
+                Span::styled("[r]", Style::default().fg(Palette::STATUS_KEY)),
+                Span::raw(" Reset"),
+            ]);
+            line_spans
+        })
+    }
+}
+
+/// Build a Unicode-block progress bar with warm gradient fill and animated dither.
+///
+/// Dither characters cycle through `█▓▒░` every 4 ticks (controlled by
+/// `anim_offset`), creating a flowing/breathing texture. The fill colour
+/// interpolates through `GRADIENT_WARM` from left to right.
+fn gradient_progress_bar(percent: f64, width: usize, _anim_offset: u8) -> Vec<Span<'static>> {
+    let dither = ["█", "▓", "▒", "░"];
+    let pct = percent.clamp(0.0, 100.0) / 100.0;
+    let exact_filled = pct * width as f64;
+    let filled = exact_filled as usize;
+    let frac = exact_filled - filled as f64; // fractional part of the head cell
+    let mut spans = Vec::with_capacity(width);
+
+    for i in 0..width {
+        let t = i as f32 / (width as f32).max(1.0);
+        let color = multi_stop_color(GRADIENT_WARM, t);
+        let dither_idx = if i < filled {
+            // Solidly filled: full block
+            0
+        } else if i == filled && frac > 0.001 {
+            // Head cell: fractional fill using animated dither based on frac
+            let head_step = (frac * 3.0).round() as usize; // 0..3 → ▓▒░
+            (head_step + 1).min(3) // 1, 2, or 3 → ▓, ▒, ░
+        } else {
+            // Unfilled
+            3
+        };
+        spans.push(Span::styled(dither[dither_idx], Style::new().fg(color)));
+    }
+    spans
+}
+
 fn render_render_progress(frame: &mut Frame, app: &App, area: Rect, border_color: Color) {
     let pct = app.export_progress;
     let bar_width = area.width.saturating_sub(4) as usize;
-    let filled = (pct / 100.0 * bar_width as f64) as usize;
-    let empty = bar_width.saturating_sub(filled);
-
-    let mut bar = String::from("[");
-    for _ in 0..filled { bar.push('#'); }
-    for _ in 0..empty { bar.push('-'); }
-    bar.push(']');
+    let bar_spans = gradient_progress_bar(pct, bar_width, app.progress_anim_offset);
 
     let elapsed = app.export_start_time
         .map(|t| t.elapsed())
@@ -942,9 +1479,9 @@ fn render_render_progress(frame: &mut Frame, app: &App, area: Rect, border_color
     let eta_str = format!("{:02}:{:02}", est_mins, est_remain);
 
     let text = vec![
-        Line::from(Span::styled(" RENDERING", Style::default().fg(Palette::QUEUE_RENDERING).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(format!(" {} Rendering", crate::app::SPINNER_FRAMES[app.spinner_frame as usize % crate::app::SPINNER_FRAMES.len()]), Style::default().fg(Palette::QUEUE_RENDERING).add_modifier(Modifier::BOLD))),
         Line::from(""),
-        Line::from(Span::styled(format!("  {}", bar), Style::default().fg(Palette::PROGRESS_BAR_FG))),
+        Line::from(vec![Span::raw("  ")].into_iter().chain(bar_spans.into_iter()).collect::<Vec<_>>()),
         Line::from(""),
         Line::from(Span::styled(format!("  {:.1}%  |  Elapsed: {}  |  ETA: {}", pct, elapsed_str, eta_str), Style::default().fg(Palette::SUCCESS).add_modifier(Modifier::BOLD))),
         Line::from(""),
@@ -967,7 +1504,7 @@ fn render_render_progress(frame: &mut Frame, app: &App, area: Rect, border_color
 
 fn render_export_settings(frame: &mut Frame, app: &App, area: Rect, regions: &mut Vec<ClickRegion>) {
     let is_focused = app.focus_target == FocusTarget::ExportSettings;
-    let border_color = if is_focused { Palette::BORDER_FOCUSED } else { Palette::BORDER };
+    let border_color = shockwave_border(app.shockwave_ticks_remaining, if is_focused { Palette::BORDER_FOCUSED } else { Palette::BORDER });
     let show_rate = !matches!(app.export_codec_family, CodecFamily::ProRes | CodecFamily::DNxHR);
 
     // Panel-wide click region to focus export settings
@@ -1173,7 +1710,8 @@ fn truncate_to_width(s: &str, max_chars: usize) -> String {
 
 fn render_queue_panel(frame: &mut Frame, app: &App, area: Rect, regions: &mut Vec<ClickRegion>) {
     let is_focused = app.focus_target == FocusTarget::Queue;
-    let border_color = if is_focused { Palette::BORDER_FOCUSED } else { Palette::BORDER };
+    let base = if is_focused { Palette::BORDER_FOCUSED } else { Palette::BORDER };
+    let border_color = shockwave_border(app.shockwave_ticks_remaining, base);
     let inner_h = area.height.saturating_sub(2) as usize;
 
     // Panel-wide click region to focus queue
@@ -1195,15 +1733,18 @@ fn render_queue_panel(frame: &mut Frame, app: &App, area: Rect, regions: &mut Ve
         let items: Vec<ListItem> = app.queue.iter().enumerate().map(|(_i, q)| {
             let name = q.path.split(std::path::MAIN_SEPARATOR).last().unwrap_or(&q.path);
             let checkbox = if q.selected {
-                Span::styled("[*] ", Style::default().fg(Palette::CHECKED).add_modifier(Modifier::BOLD))
+                Span::styled("◉ ", Style::default().fg(Palette::CHECKED).add_modifier(Modifier::BOLD))
             } else {
-                Span::styled("[ ] ", Style::default().fg(Palette::UNCHECKED))
+                Span::styled("◌ ", Style::default().fg(Palette::UNCHECKED))
             };
+            let shockwave_flash = app.shockwave_ticks_remaining > 0
+                && matches!(q.status, QueueStatus::Completed);
             let (status_color, status_text) = match &q.status {
                 QueueStatus::Waiting => (Palette::QUEUE_WAITING, "Waiting"),
                 QueueStatus::Rendering => (Palette::QUEUE_RENDERING, "Rendering"),
-                QueueStatus::Completed => (Palette::QUEUE_COMPLETED, "Done"),
-                QueueStatus::Failed(_) => (Palette::QUEUE_FAILED, "Failed"),
+                QueueStatus::Completed if shockwave_flash => (Palette::ACCENT_EMBER, "✓ Done"),
+                QueueStatus::Completed => (Palette::QUEUE_COMPLETED, "✓ Done"),
+                QueueStatus::Failed(_) => (Palette::QUEUE_FAILED, "✗ Failed"),
             };
             let progress_str = if matches!(q.status, QueueStatus::Rendering) {
                 format!("{:.0}%", q.progress)

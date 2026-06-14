@@ -1,6 +1,11 @@
-name: Build binaries
+name: Build and Release
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 0.2.0)'
+        required: true
+        type: string
 
 jobs:
   build:
@@ -44,3 +49,143 @@ jobs:
         with:
           name: mcraw-tui-${{ matrix.target }}
           path: mcraw-tui-${{ matrix.target }}.zip
+
+  release:
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Compute SHA256 hashes
+        id: shas
+        run: |
+          TAG="v${{ github.event.inputs.version }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+
+          mkdir -p release
+          for target in \
+            aarch64-apple-darwin \
+            x86_64-apple-darwin \
+            x86_64-unknown-linux-gnu \
+            x86_64-pc-windows-msvc
+          do
+            zip="mcraw-tui-$target.zip"
+            cp "artifacts/mcraw-tui-$target/$zip" "release/$zip"
+            sha=$(sha256sum "release/$zip" | cut -d' ' -f1)
+            echo "hash_$target=$sha" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.event.inputs.version }}
+          name: v${{ github.event.inputs.version }}
+          body: |
+            **mcraw-tui v${{ github.event.inputs.version }}**
+
+            ## Install
+
+            ### Homebrew
+            ```bash
+            brew install mcraw-tui.rb
+            ```
+
+            ### Scoop (Windows)
+            ```powershell
+            scoop install bucket/mcraw-tui.json
+            ```
+          files: release/mcraw-tui-*.zip
+          generate_release_notes: true
+
+      - name: Update Homebrew formula
+        run: |
+          VER="${{ github.event.inputs.version }}"
+          TAG="v${{ github.event.inputs.version }}"
+          ARM_HASH="${{ steps.shas.outputs.hash_aarch64-apple-darwin }}"
+          INTEL_HASH="${{ steps.shas.outputs.hash_x86_64-apple-darwin }}"
+          LINUX_HASH="${{ steps.shas.outputs.hash_x86_64-unknown-linux-gnu }}"
+
+          cat > mcraw-tui.rb <<'RUBY'
+          class McrawTui < Formula
+            desc "Cross Platform TUI for encoding your motioncam MCRAW files to professional video formats. All in the Terminal."
+            homepage "https://github.com/Yoganshbhatt/mcraw-tui"
+            version "VER_PLACEHOLDER"
+            license "Apache-2.0"
+
+            if OS.mac? && Hardware::CPU.arm?
+              url "https://github.com/Yoganshbhatt/mcraw-tui/releases/download/TAG_PLACEHOLDER/mcraw-tui-aarch64-apple-darwin.zip"
+              sha256 "ARM_HASH_PLACEHOLDER"
+            elsif OS.mac? && Hardware::CPU.intel?
+              url "https://github.com/Yoganshbhatt/mcraw-tui/releases/download/TAG_PLACEHOLDER/mcraw-tui-x86_64-apple-darwin.zip"
+              sha256 "INTEL_HASH_PLACEHOLDER"
+            elsif OS.linux? && Hardware::CPU.intel?
+              url "https://github.com/Yoganshbhatt/mcraw-tui/releases/download/TAG_PLACEHOLDER/mcraw-tui-x86_64-unknown-linux-gnu.zip"
+              sha256 "LINUX_HASH_PLACEHOLDER"
+            end
+
+            depends_on "ffmpeg"
+
+            def install
+              bin.install "mcraw-tui"
+            end
+          end
+          RUBY
+
+          sed -i "s/VER_PLACEHOLDER/$VER/" mcraw-tui.rb
+          sed -i "s|TAG_PLACEHOLDER|$TAG|g" mcraw-tui.rb
+          sed -i "s/ARM_HASH_PLACEHOLDER/${ARM_HASH^^}/" mcraw-tui.rb
+          sed -i "s/INTEL_HASH_PLACEHOLDER/${INTEL_HASH^^}/" mcraw-tui.rb
+          sed -i "s/LINUX_HASH_PLACEHOLDER/${LINUX_HASH^^}/" mcraw-tui.rb
+
+      - name: Update Scoop manifest
+        run: |
+          VER="${{ github.event.inputs.version }}"
+          TAG="v${{ github.event.inputs.version }}"
+          WIN_HASH="${{ steps.shas.outputs.hash_x86_64-pc-windows-msvc }}"
+
+          cat > bucket/mcraw-tui.json <<'JSON'
+          {
+              "version": "VER_PLACEHOLDER",
+              "description": "Cross Platform TUI for encoding your motioncam MCRAW files to professional video formats. All in the Terminal.",
+              "homepage": "https://github.com/Yoganshbhatt/mcraw-tui",
+              "license": "Apache-2.0",
+              "architecture": {
+                  "64bit": {
+                      "url": "https://github.com/Yoganshbhatt/mcraw-tui/releases/download/TAG_PLACEHOLDER/mcraw-tui-x86_64-pc-windows-msvc.zip",
+                      "hash": "WIN_HASH_PLACEHOLDER"
+                  }
+              },
+              "bin": "mcraw-tui.exe",
+              "depends": "ffmpeg",
+              "checkver": "github",
+              "autoupdate": {
+                  "architecture": {
+                      "64bit": {
+                          "url": "https://github.com/Yoganshbhatt/mcraw-tui/releases/download/v$version/mcraw-tui-x86_64-pc-windows-msvc.zip"
+                      }
+                  }
+              }
+          }
+          JSON
+
+          sed -i "s/VER_PLACEHOLDER/$VER/" bucket/mcraw-tui.json
+          sed -i "s|TAG_PLACEHOLDER|$TAG|g" bucket/mcraw-tui.json
+          sed -i "s/WIN_HASH_PLACEHOLDER/${WIN_HASH^^}/" bucket/mcraw-tui.json
+
+      - name: Commit manifest updates
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add mcraw-tui.rb bucket/mcraw-tui.json
+          git commit -m "release: update manifests for v${{ github.event.inputs.version }}"
+          git push

@@ -26,6 +26,9 @@ use crate::file::McrawFileInfo;
 use crate::file_browser::FileBrowser;
 use crate::preset::ExportPreset;
 use crate::stats::PipelineStats;
+
+/// Braille spinner frames for the rendering indicator (500ms cycle at 50ms/tick).
+pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 use crate::ui::{self, ClickAction};
 
 // ---------------------------------------------------------------------------
@@ -62,6 +65,170 @@ pub enum FocusTarget {
     Queue,
     ExportSettings,
     Preview,
+    Grade,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GradeSliders {
+    pub exposure: f32,
+    pub contrast: f32,
+    pub saturation: f32,
+    pub shadows: f32,
+    pub highlights: f32,
+    pub temperature: f32,
+    pub tint: f32,
+    pub sharpen: f32,
+}
+
+impl GradeSliders {
+    pub fn name(index: usize) -> &'static str {
+        match index {
+            0 => "Exposure",
+            1 => "Contrast",
+            2 => "Saturation",
+            3 => "Shadows",
+            4 => "Highlights",
+            5 => "Temp",
+            6 => "Tint",
+            7 => "Sharpen",
+            _ => "",
+        }
+    }
+
+    pub fn default_val(index: usize) -> f32 {
+        match index {
+            0 => 0.0,
+            1 => 1.0,
+            2 => 1.0,
+            3 => 0.0,
+            4 => 0.0,
+            5 => 5200.0,
+            6 => 0.0,
+            7 => 0.0,
+            _ => 0.0,
+        }
+    }
+
+    pub fn min(index: usize) -> f32 {
+        match index {
+            0 => -5.0,
+            1 => 0.0,
+            2 => 0.0,
+            3 => -1.0,
+            4 => -1.0,
+            5 => 2000.0,
+            6 => -100.0,
+            7 => 0.0,
+            _ => 0.0,
+        }
+    }
+
+    pub fn max(index: usize) -> f32 {
+        match index {
+            0 => 5.0,
+            1 => 2.0,
+            2 => 2.0,
+            3 => 1.0,
+            4 => 1.0,
+            5 => 10000.0,
+            6 => 100.0,
+            7 => 1.0,
+            _ => 1.0,
+        }
+    }
+
+    pub fn step_small(index: usize) -> f32 {
+        match index {
+            0 => 0.1,
+            5 => 50.0,
+            6 => 1.0,
+            _ => 0.05,
+        }
+    }
+
+    pub fn step_large(index: usize) -> f32 {
+        match index {
+            0 => 1.0,
+            5 => 500.0,
+            6 => 10.0,
+            _ => 0.25,
+        }
+    }
+
+    pub fn value(&self, index: usize) -> f32 {
+        match index {
+            0 => self.exposure,
+            1 => self.contrast,
+            2 => self.saturation,
+            3 => self.shadows,
+            4 => self.highlights,
+            5 => self.temperature,
+            6 => self.tint,
+            7 => self.sharpen,
+            _ => 0.0,
+        }
+    }
+
+    pub fn normalized(&self, index: usize) -> f32 {
+        let v = self.value(index);
+        let lo = Self::min(index);
+        let hi = Self::max(index);
+        if hi <= lo { return 0.5; }
+        ((v - lo) / (hi - lo)).clamp(0.0, 1.0)
+    }
+
+    pub fn display_value(&self, index: usize) -> String {
+        let sign = |x: f32| if x >= 0.0 { "+" } else { "" };
+        match index {
+            0 => format!("{}{:.1} stops", sign(self.exposure), self.exposure),
+            1 => format!("{:.2}x", self.contrast),
+            2 => format!("{:.2}x", self.saturation),
+            3 => format!("{}{:.2}", sign(self.shadows), self.shadows),
+            4 => format!("{}{:.2}", sign(self.highlights), self.highlights),
+            5 => format!("{:.0}K", self.temperature),
+            6 => format!("{}{:.0}", sign(self.tint), self.tint),
+            _ => format!("{:.2}", self.sharpen),
+        }
+    }
+
+    pub fn set(&mut self, index: usize, v: f32) {
+        let lo = Self::min(index);
+        let hi = Self::max(index);
+        let v = v.clamp(lo, hi);
+        match index {
+            0 => self.exposure = v,
+            1 => self.contrast = v,
+            2 => self.saturation = v,
+            3 => self.shadows = v,
+            4 => self.highlights = v,
+            5 => self.temperature = v,
+            6 => self.tint = v,
+            7 => self.sharpen = v,
+            _ => {}
+        }
+    }
+
+    pub fn apply_delta(&mut self, index: usize, step: f32) {
+        let cur = self.value(index);
+        self.set(index, cur + step);
+    }
+
+    pub fn count() -> usize { 8 }
+}
+
+impl Default for GradeSliders {
+    fn default() -> Self {
+        Self {
+            exposure: 0.0,
+            contrast: 1.0,
+            saturation: 1.0,
+            shadows: 0.0,
+            highlights: 0.0,
+            temperature: 5200.0,
+            tint: 0.0,
+            sharpen: 0.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +269,51 @@ pub enum Screen {
     Browse,
     Info,
     Export,
+}
+
+/// Tracks real render-loop frame rate using a simple per-second counter.
+///
+/// Updates once per second with EMA smoothing (`0.9 * prev + 0.1 * current`)
+/// to dampen visual jitter. The value is exposed via `fps()` and rendered
+/// right-aligned in the header bar.
+#[derive(Debug, Clone)]
+pub struct FPSCounter {
+    last_draw: Instant,
+    frames_this_second: u32,
+    second_start: Instant,
+    smooth_fps: f64,
+}
+
+impl FPSCounter {
+    pub fn new() -> Self {
+        Self {
+            last_draw: Instant::now(),
+            frames_this_second: 0,
+            second_start: Instant::now(),
+            smooth_fps: 0.0,
+        }
+    }
+
+    /// Call once per frame before measuring elapsed time.
+    pub fn tick(&mut self) {
+        let now = Instant::now();
+        self.frames_this_second += 1;
+        if now.duration_since(self.second_start).as_secs_f64() >= 1.0 {
+            let fps = self.frames_this_second as f64;
+            if self.smooth_fps == 0.0 {
+                self.smooth_fps = fps;
+            } else {
+                self.smooth_fps = self.smooth_fps * 0.9 + fps * 0.1;
+            }
+            self.frames_this_second = 0;
+            self.second_start = now;
+        }
+        self.last_draw = now;
+    }
+
+    pub fn fps(&self) -> f64 {
+        self.smooth_fps
+    }
 }
 
 pub struct App {
@@ -147,6 +359,9 @@ pub struct App {
     // Culling mode flag
     pub show_culling: bool,
 
+    // Full-screen grade mode (Shift+G)
+    pub show_grade_screen: bool,
+
     // Persistent export settings
     pub export_color_space: ColorSpace,
     pub export_transfer_function: TransferFunction,
@@ -169,6 +384,12 @@ pub struct App {
     pub active_rate_control: RateControl,
     pub is_editing_custom_rate: bool,
 
+    // Grading sliders (Phase 2)
+    pub grade_sliders: GradeSliders,
+    pub grade_focus: usize,
+    /// Active mouse drag on a grade slider: (slider_index, track_x, track_width)
+    pub grade_dragging: Option<(usize, u16, u16)>,
+
     // Media pool / queue workflow
     pub imported_files: Vec<ImportedFile>,
     pub media_pool_index: usize,
@@ -185,6 +406,9 @@ pub struct App {
 
     // Browser double-click detection
     pub last_browser_click: Option<(Instant, usize)>,
+
+    // Grade slider double-click detection
+    pub last_grade_click: Option<(Instant, usize)>,
 
     // Drag-drop visual feedback
     pub drop_highlight: Option<Instant>,
@@ -231,6 +455,27 @@ pub struct App {
     /// True while the user is typing a name for a new preset. Captures
     /// the live text and the cursor position. Esc cancels, Enter saves.
     pub preset_naming: Option<PresetNamingState>,
+
+    // Animation state
+    pub spinner_frame: u8,
+    pub progress_anim_offset: u8,
+
+    // Real-time render-loop performance meter
+    pub fps_counter: FPSCounter,
+
+    // Heatwave shockwave countdown (0 = inactive)
+    pub shockwave_ticks_remaining: u8,
+
+    // Focus strip state — whether the single-line HUD is in expanded slider view
+    pub grade_strip_active: bool,
+    // Parameter morph animation: (old_index, ticks_remaining)
+    pub grade_morph: Option<(usize, u8)>,
+    // Phosphor trail: (track_position 0..1, ticks_remaining)
+    pub phosphor_trail: Vec<(f32, u8)>,
+    // Snapshot for before/after comparison (B key)
+    pub grade_before_snapshot: Option<GradeSliders>,
+    // Focus strip idle counter: decrements each tick
+    pub grade_strip_idle_ticks: u8,
 }
 
 /// Overlay state for the preset-picker. `Shown` holds the list, cursor
@@ -351,10 +596,12 @@ impl App {
             favourite_folders: Self::load_favourites(),
             help_scroll: 0,
             show_culling: false,
+            show_grade_screen: false,
             import_popup: ImportPopupState::Hidden,
             focus_target: FocusTarget::MediaPool,
             show_full_info: false,
             last_browser_click: None,
+            last_grade_click: None,
             drop_highlight: None,
             drop_import_rx: None,
             drop_import_cancel: None,
@@ -368,6 +615,19 @@ impl App {
             active_preset: None,
             preset_picker: PresetPickerState::default(),
             preset_naming: None,
+
+            spinner_frame: 0,
+            progress_anim_offset: 0,
+            fps_counter: FPSCounter::new(),
+            shockwave_ticks_remaining: 0,
+            grade_sliders: GradeSliders::default(),
+            grade_focus: 0,
+            grade_dragging: None,
+            grade_strip_active: true,
+            grade_morph: None,
+            phosphor_trail: Vec::new(),
+            grade_before_snapshot: None,
+            grade_strip_idle_ticks: 0,
         }
     }
 
@@ -425,6 +685,20 @@ impl App {
                         if let Ok(first_frame_meta) = decoder.load_frame_metadata(timestamps[0]) {
                             info.width = first_frame_meta.width as u16;
                             info.height = first_frame_meta.height as u16;
+                        }
+                        // Initialize grade temperature from file white balance
+                        if let Some(wb) = info.camera_metadata.wb_multipliers {
+                            let r_gain = wb[0];
+                            let b_gain = wb[2];
+                            let ratio = (r_gain / b_gain.max(1e-6)).clamp(0.1, 10.0);
+                            let temp = if ratio >= 1.0 {
+                                5200.0 + (ratio - 1.0) * 3000.0
+                            } else {
+                                5200.0 - (1.0 - ratio) * 3000.0
+                            };
+                            self.grade_sliders.set(5, temp.clamp(2000.0, 10000.0));
+                        } else {
+                            self.grade_sliders.set(5, 5200.0);
                         }
                     }
                 }
@@ -1335,16 +1609,9 @@ impl App {
                         q.progress = pct;
                     }
                 }
-                ExportEvent::Stats(stats) => {
-                    let report = stats.report();
-                    report.print_summary();
-                    if let Ok(path) = std::env::var("MCRAW_STATS_DUMP") {
-                        let path = std::path::PathBuf::from(path);
-                        match report.write_json(&path) {
-                            Ok(()) => tracing::info!("stats dumped to {}", path.display()),
-                            Err(e) => tracing::warn!("failed to dump stats to {}: {}", path.display(), e),
-                        }
-                    }
+                ExportEvent::Stats(_stats) => {
+                    // Stats are collected internally for future TUI display
+                    // (FPS meter, phase timing chart). No terminal output.
                 }
                 ExportEvent::Done(result) => {
                     self.is_exporting = false;
@@ -1400,6 +1667,7 @@ impl App {
                                 self.status_message = format!(
                                     "Video export completed ({:02}m {:02}s)", mins, secs
                                 );
+                                self.shockwave_ticks_remaining = 30;
                             }
                             Err(e) => {
                                 tracing::error!("export failed: {}", e);
@@ -1524,13 +1792,15 @@ impl App {
     pub fn cycle_focus(&mut self) {
         self.focus_target = match self.focus_target {
             FocusTarget::MediaPool => FocusTarget::Preview,
-            FocusTarget::Preview => FocusTarget::ExportSettings,
+            FocusTarget::Preview => FocusTarget::Grade,
+            FocusTarget::Grade => FocusTarget::ExportSettings,
             FocusTarget::ExportSettings => FocusTarget::Queue,
             FocusTarget::Queue => FocusTarget::MediaPool,
         };
         let label = match self.focus_target {
             FocusTarget::MediaPool => "Media Pool",
             FocusTarget::Preview => "Preview",
+            FocusTarget::Grade => "Grade",
             FocusTarget::ExportSettings => "Export Settings",
             FocusTarget::Queue => "Render Queue",
         };
@@ -1542,6 +1812,7 @@ impl App {
         let label = match target {
             FocusTarget::MediaPool => "Media Pool",
             FocusTarget::Preview => "Preview",
+            FocusTarget::Grade => "Grade",
             FocusTarget::ExportSettings => "Export Settings",
             FocusTarget::Queue => "Render Queue",
         };
@@ -1589,6 +1860,17 @@ fn execute_click_action(app: &mut App, action: ClickAction) {
         }
         ClickAction::FocusPreview => {
             app.set_focus(FocusTarget::Preview);
+        }
+        ClickAction::FocusGrade => {
+            app.show_grade_screen = !app.show_grade_screen;
+            if app.show_grade_screen {
+                app.set_focus(FocusTarget::Grade);
+                app.status_message = "Grade screen — Esc to exit".to_string();
+            } else {
+                app.grade_dragging = None;
+                app.set_focus(FocusTarget::Preview);
+                app.status_message = "Normal view".to_string();
+            }
         }
         ClickAction::AddSelectedToQueue => app.add_selected_to_queue(),
         ClickAction::AddAllToQueue => app.add_all_to_queue(),
@@ -1721,6 +2003,10 @@ fn execute_click_action(app: &mut App, action: ClickAction) {
         ClickAction::OpenPresetPicker => {
             app.open_preset_picker();
         }
+        ClickAction::GradeSlider(i) => {
+            app.grade_focus = i;
+            app.set_focus(FocusTarget::Grade);
+        }
     }
 }
 
@@ -1816,8 +2102,37 @@ pub async fn run(args: Cli) -> Result<()> {
         app.poll_drop_import();
         app.browser.try_refresh();
 
+        // Record render timestamp BEFORE drawing so the FPS meter includes
+        // the draw and sleep overhead, giving a realistic "frames the user
+        // actually sees" reading.
+        app.fps_counter.tick();
+
         let mut click_regions = Vec::new();
         terminal.draw(|frame| ui::render(frame, &app, &mut click_regions))?;
+
+        // Advance animation state
+        app.spinner_frame = app.spinner_frame.wrapping_add(1);
+        // Slow the dither animation to ~800ms cycle (every 4th tick)
+        if app.spinner_frame % 4 == 0 {
+            app.progress_anim_offset = app.progress_anim_offset.wrapping_add(1);
+        }
+        if app.shockwave_ticks_remaining > 0 {
+            app.shockwave_ticks_remaining -= 1;
+        }
+        // Decay grade morph animation
+        if let Some((_, ref mut t)) = app.grade_morph {
+            *t = t.saturating_sub(1);
+            if *t == 0 { app.grade_morph = None; }
+        }
+        // Decay phosphor trail
+        app.phosphor_trail.iter_mut().for_each(|(_, t)| *t = t.saturating_sub(1));
+        app.phosphor_trail.retain(|(_, t)| *t > 0);
+        // Decay focus strip idle counter
+        if app.grade_strip_idle_ticks > 0 {
+            app.grade_strip_idle_ticks = app.grade_strip_idle_ticks.saturating_sub(1);
+        } else if app.show_grade_screen {
+            app.grade_strip_active = false;
+        }
 
         // Drain ALL pending events each frame — critical for drag-drop where
         // the terminal sends a burst of events that must be consumed together.
@@ -2156,7 +2471,11 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                     if app.show_help {
                         app.help_scroll = app.help_scroll.saturating_sub(1);
                     } else if app.show_browser {
-                        if app.browser.selected_index > 0 { app.browser.selected_index -= 1; }
+                        if app.browsing_favourites {
+                            app.navigate_favourites(-1);
+                        } else if app.browser.selected_index > 0 {
+                            app.browser.selected_index -= 1;
+                        }
                     } else {
                         match app.focus_target {
                             FocusTarget::MediaPool => { if app.media_pool_index > 0 { app.media_pool_index -= 1; } }
@@ -2181,6 +2500,14 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                                 }
                             }
                             FocusTarget::Preview => {}
+                            FocusTarget::Grade => {
+                                let step = if mouse_event.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
+                                    GradeSliders::step_large(app.grade_focus)
+                                } else {
+                                    GradeSliders::step_small(app.grade_focus)
+                                };
+                                app.grade_sliders.apply_delta(app.grade_focus, step);
+                            }
                         }
                     }
                 }
@@ -2188,8 +2515,12 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                     if app.show_help {
                         app.help_scroll = app.help_scroll.saturating_add(1);
                     } else if app.show_browser {
-                        let len = app.browser.entries.len();
-                        if len > 0 { app.browser.selected_index = (app.browser.selected_index + 1).min(len - 1); }
+                        if app.browsing_favourites {
+                            app.navigate_favourites(1);
+                        } else {
+                            let len = app.browser.entries.len();
+                            if len > 0 { app.browser.selected_index = (app.browser.selected_index + 1).min(len - 1); }
+                        }
                     } else {
                         match app.focus_target {
                             FocusTarget::MediaPool => {
@@ -2201,7 +2532,6 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                                 if len > 0 { app.queue_index = (app.queue_index + 1).min(len - 1); }
                             }
                             FocusTarget::ExportSettings => {
-                                // Cycle VALUES of the currently focused setting
                                 match app.export_focus {
                                     ExportFocus::CodecFamily => app.cycle_codec(true),
                                     ExportFocus::ColorSpace => {
@@ -2217,6 +2547,14 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                                 }
                             }
                             FocusTarget::Preview => {}
+                            FocusTarget::Grade => {
+                                let step = if mouse_event.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
+                                    GradeSliders::step_large(app.grade_focus)
+                                } else {
+                                    GradeSliders::step_small(app.grade_focus)
+                                };
+                                app.grade_sliders.apply_delta(app.grade_focus, -step);
+                            }
                         }
                     }
                 }
@@ -2226,10 +2564,48 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                     for region in click_regions.iter().rev() {
                         if col >= region.area.x && col < region.area.x + region.area.width
                             && row >= region.area.y && row < region.area.y + region.area.height {
-                            execute_click_action(app, region.action.clone());
+                            match &region.action {
+                                ClickAction::GradeSlider(i) => {
+                                    let now = Instant::now();
+                                    let is_double = app.last_grade_click.as_ref()
+                                        .map(|&(t, idx)| idx == *i && now.duration_since(t).as_millis() < 400)
+                                        .unwrap_or(false);
+                                    if is_double {
+                                        // Double-click: reset to default
+                                        let def = GradeSliders::default_val(*i);
+                                        app.grade_sliders.set(*i, def);
+                                        app.last_grade_click = None;
+                                        app.status_message = format!("Reset {} to default", GradeSliders::name(*i));
+                                    } else {
+                                        // Single click: set value from x position + start drag
+                                        let x_offset = col.saturating_sub(region.area.x);
+                                        let norm = (x_offset as f32 / region.area.width.max(1) as f32).clamp(0.0, 1.0);
+                                        let lo = GradeSliders::min(*i);
+                                        let hi = GradeSliders::max(*i);
+                                        app.grade_sliders.set(*i, lo + norm * (hi - lo));
+                                        app.grade_focus = *i;
+                                        app.grade_dragging = Some((*i, region.area.x, region.area.width));
+                                        app.last_grade_click = Some((now, *i));
+                                    }
+                                }
+                                _ => execute_click_action(app, region.action.clone()),
+                            }
                             break;
                         }
                     }
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some((i, track_x, track_w)) = app.grade_dragging {
+                        let col = mouse_event.column;
+                        let x_offset = col.saturating_sub(track_x);
+                        let norm = (x_offset as f32 / track_w.max(1) as f32).clamp(0.0, 1.0);
+                        let lo = GradeSliders::min(i);
+                        let hi = GradeSliders::max(i);
+                        app.grade_sliders.set(i, lo + norm * (hi - lo));
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    app.grade_dragging = None;
                 }
                 _ => {}
             }
@@ -2435,12 +2811,30 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                         app.show_help = !app.show_help;
                     }
                     'b' => {
-                        app.show_browser = !app.show_browser;
-                        app.status_message = if app.show_browser {
-                            "Browser shown"
+                        // In grade mode, 'b' does before/after; otherwise browser toggle
+                        if app.show_grade_screen || app.focus_target == FocusTarget::Grade {
+                            if app.grade_before_snapshot.is_none() {
+                                app.grade_before_snapshot = Some(app.grade_sliders);
+                                app.grade_sliders = GradeSliders::default();
+                                app.shockwave_ticks_remaining = 8;
+                                app.status_message = "BEFORE — holding original values".to_string();
+                            }
                         } else {
-                            "Browser hidden"
-                        }.to_string();
+                            app.show_browser = !app.show_browser;
+                            app.status_message = if app.show_browser {
+                                "Browser shown"
+                            } else {
+                                "Browser hidden"
+                            }.to_string();
+                        }
+                    }
+                    'B' => {
+                        // Release before/after: restore snapshot
+                        if let Some(snap) = app.grade_before_snapshot.take() {
+                            app.grade_sliders = snap;
+                            app.shockwave_ticks_remaining = 5;
+                            app.status_message = "AFTER — restored grade".to_string();
+                        }
                     }
                     'e' => {
                         app.set_focus(FocusTarget::ExportSettings);
@@ -2473,6 +2867,7 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                             FocusTarget::Queue => app.remove_from_queue(),
                             FocusTarget::ExportSettings => {}
                             FocusTarget::Preview => {}
+                            FocusTarget::Grade => {}
                         }
                     }
                     'x' => {
@@ -2498,7 +2893,13 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                         app.render_all();
                     }
                     'r' => {
-                        if app.focus_target == FocusTarget::ExportSettings {
+                        if app.show_grade_screen || app.focus_target == FocusTarget::Grade {
+                            let def = GradeSliders::default_val(app.grade_focus);
+                            app.grade_sliders.set(app.grade_focus, def);
+                            app.status_message = format!("Reset {} to default", GradeSliders::name(app.grade_focus));
+                            app.grade_strip_active = true;
+                            app.grade_strip_idle_ticks = 15;
+                        } else if app.focus_target == FocusTarget::ExportSettings {
                             app.export_focus = ExportFocus::RateControl;
                             app.cycle_rate_control();
                         }
@@ -2625,6 +3026,17 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                             app.status_message = if app.show_culling { "Culling mode" } else { "Normal mode" }.to_string();
                         }
                     }
+                    'G' => {
+                        app.show_grade_screen = !app.show_grade_screen;
+                        if app.show_grade_screen {
+                            app.set_focus(FocusTarget::Grade);
+                            app.status_message = "Grade screen — Esc to exit".to_string();
+                        } else {
+                            app.grade_dragging = None;
+                            app.set_focus(FocusTarget::Preview);
+                            app.status_message = "Normal view".to_string();
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -2643,6 +3055,11 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                         app.status_message = "Folder view".to_string();
                     } else if app.show_browser {
                         app.show_browser = false;
+                    } else if app.show_grade_screen {
+                        app.show_grade_screen = false;
+                        app.grade_dragging = None;
+                        app.set_focus(FocusTarget::Preview);
+                        app.status_message = "Normal view".to_string();
                     } else if app.show_help {
                         app.show_help = false;
                     } else {
@@ -2672,13 +3089,60 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                     }
                 }
                 crossterm::event::KeyCode::Right | crossterm::event::KeyCode::Char('l') => {
-                    if app.frame_index < app.frame_count.saturating_sub(1) {
+                    if app.focus_target == FocusTarget::Grade {
+                        let step = if key_event.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
+                            GradeSliders::step_large(app.grade_focus)
+                        } else {
+                            GradeSliders::step_small(app.grade_focus)
+                        };
+                        let old_norm = app.grade_sliders.normalized(app.grade_focus);
+                        app.grade_sliders.apply_delta(app.grade_focus, step);
+                        app.phosphor_trail.push((old_norm, 4));
+                        app.grade_strip_active = true;
+                        app.grade_strip_idle_ticks = 15;
+                    } else if app.frame_index < app.frame_count.saturating_sub(1) {
                         app.frame_index += 1;
                     }
                 }
                 crossterm::event::KeyCode::Left | crossterm::event::KeyCode::Char('h') => {
-                    if app.frame_index > 0 {
+                    if app.focus_target == FocusTarget::Grade {
+                        let step = if key_event.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
+                            GradeSliders::step_large(app.grade_focus)
+                        } else {
+                            GradeSliders::step_small(app.grade_focus)
+                        };
+                        let old_norm = app.grade_sliders.normalized(app.grade_focus);
+                        app.grade_sliders.apply_delta(app.grade_focus, -step);
+                        app.phosphor_trail.push((old_norm, 4));
+                        app.grade_strip_active = true;
+                        app.grade_strip_idle_ticks = 15;
+                    } else if app.frame_index > 0 {
                         app.frame_index -= 1;
+                    }
+                }
+                crossterm::event::KeyCode::Char('L') => {
+                    if app.focus_target == FocusTarget::Grade {
+                        let step = GradeSliders::step_large(app.grade_focus);
+                        let old_norm = app.grade_sliders.normalized(app.grade_focus);
+                        app.grade_sliders.apply_delta(app.grade_focus, step);
+                        app.phosphor_trail.push((old_norm, 4));
+                        app.grade_strip_active = true;
+                        app.grade_strip_idle_ticks = 15;
+                    } else {
+                        let jump = 10.min(app.frame_count.saturating_sub(app.frame_index + 1));
+                        app.frame_index = app.frame_index.saturating_add(jump);
+                    }
+                }
+                crossterm::event::KeyCode::Char('H') => {
+                    if app.focus_target == FocusTarget::Grade {
+                        let step = GradeSliders::step_large(app.grade_focus);
+                        let old_norm = app.grade_sliders.normalized(app.grade_focus);
+                        app.grade_sliders.apply_delta(app.grade_focus, -step);
+                        app.phosphor_trail.push((old_norm, 4));
+                        app.grade_strip_active = true;
+                        app.grade_strip_idle_ticks = 15;
+                    } else {
+                        app.frame_index = app.frame_index.saturating_sub(10);
                     }
                 }
                 crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
@@ -2710,6 +3174,14 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                                 };
                             }
                             FocusTarget::Preview => {}
+                            FocusTarget::Grade => {
+                                if app.grade_focus > 0 {
+                                    app.grade_morph = Some((app.grade_focus, 4));
+                                    app.grade_focus -= 1;
+                                    app.grade_strip_active = true;
+                                    app.grade_strip_idle_ticks = 15;
+                                }
+                            }
                         }
                     }
                 }
@@ -2742,6 +3214,14 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                                 };
                             }
                             FocusTarget::Preview => {}
+                            FocusTarget::Grade => {
+                                if app.grade_focus + 1 < GradeSliders::count() {
+                                    app.grade_morph = Some((app.grade_focus, 4));
+                                    app.grade_focus += 1;
+                                    app.grade_strip_active = true;
+                                    app.grade_strip_idle_ticks = 15;
+                                }
+                            }
                         }
                     }
                 }
@@ -2754,6 +3234,7 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                             FocusTarget::Queue => app.toggle_queue_selection(),
                             FocusTarget::ExportSettings => {}
                             FocusTarget::Preview => {}
+                            FocusTarget::Grade => {}
                         }
                     }
                 }
@@ -2812,6 +3293,8 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                         app.media_pool_index = 0;
                     } else if app.focus_target == FocusTarget::Queue {
                         app.queue_index = 0;
+                    } else {
+                        app.frame_index = 0;
                     }
                 }
                 crossterm::event::KeyCode::End => {
@@ -2833,6 +3316,8 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                         if !app.queue.is_empty() {
                             app.queue_index = app.queue.len() - 1;
                         }
+                    } else {
+                        app.frame_index = app.frame_count.saturating_sub(1);
                     }
                 }
                 crossterm::event::KeyCode::Backspace => {
