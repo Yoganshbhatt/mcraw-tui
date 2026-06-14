@@ -1,8 +1,6 @@
 # mcraw-tui
 
-Cross-platform TUI for browsing, inspecting, and exporting MotionCam (`.mcraw`) files.
-
-Reads MCRAW and MOTION format files, decodes raw Bayer data through a full color pipeline, and exports to professional video formats or CinemaDNG. All in the terminal.
+Cross Platform TUI for encoding your MotionCam MCRAW files to professional video formats. All in the Terminal.
 
 ## Features
 
@@ -14,46 +12,57 @@ Reads MCRAW and MOTION format files, decodes raw Bayer data through a full color
 - **Export presets**: save/load named preset configurations
 - **Batch queue**: add multiple files, render sequentially, track per-file progress
 
-## Prerequisites
+## Quick install
 
-- **Rust** 1.74+ (edition 2021)
-- **FFmpeg** 5.0+ on `PATH` — required at runtime for video encoding
-- **`motioncam-decoder-rust`** — sibling directory checked out alongside this repo
+Pre-built binaries for macOS (arm64 + x86_64), Linux, and Windows are available via package managers.
 
-### Installing FFmpeg
+### Homebrew (macOS / Linux)
 
 ```bash
-# macOS
-brew install ffmpeg
-
-# Ubuntu/Debian
-sudo apt install ffmpeg
-
-# Fedora
-sudo dnf install ffmpeg
-
-# Windows (Scoop)
-scoop install ffmpeg
-
-# Windows (Winget)
-winget install ffmpeg
+brew install https://raw.githubusercontent.com/Yoganshbhatt/mcraw-tui/main/mcraw-tui.rb
 ```
+
+Homebrew automatically installs FFmpeg as a dependency.
+
+### Scoop (Windows)
+
+```bash
+scoop bucket add mcraw-tui https://github.com/Yoganshbhatt/mcraw-tui
+scoop install mcraw-tui
+```
+
+Scoop automatically installs FFmpeg as a dependency.
+
+### Cargo (any platform, requires Rust)
+
+```bash
+cargo install mcraw-tui
+```
+
+FFmpeg must be installed separately (see below).
 
 ## Build from source
 
 ```bash
-# Clone both repos
 git clone https://github.com/Yoganshbhatt/mcraw-tui.git
-git clone https://github.com/Yoganshbhatt/motioncam-decoder-rust.git
-
-# Build
 cd mcraw-tui
 cargo build --release
-
-# The binary is at target/release/mcraw-tui (or mcraw-tui.exe on Windows)
 ```
 
-The binary is self-contained — `motioncam-decoder-rust` is statically linked. Only FFmpeg is needed at runtime.
+The binary is at `target/release/mcraw-tui` (or `mcraw-tui.exe` on Windows). The `motioncam-decoder` crate is pulled from crates.io — no sibling checkout needed.
+
+### Prerequisites for building / Cargo install
+
+- **Rust** 1.74+ (`rustup` recommended)
+- **FFmpeg** 5.0+ on `PATH` — required at runtime for video encoding
+
+| Platform | FFmpeg install |
+|---|---|
+| macOS | `brew install ffmpeg` |
+| Linux (Ubuntu/Debian) | `sudo apt install ffmpeg` |
+| Linux (Fedora) | `sudo dnf install ffmpeg` |
+| Windows (Scoop) | `scoop install ffmpeg` |
+| Windows (Winget) | `winget install ffmpeg` |
 
 ### Platform notes
 
