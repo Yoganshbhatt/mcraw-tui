@@ -15,6 +15,7 @@ Cargo.lock
 *.md
 !README.md
 !CREDITS.md
+!TODO.md
 
 # IDE
 .idea/

@@ -2,21 +2,20 @@
 
 Cross-platform TUI for browsing, inspecting, and exporting MotionCam (`.mcraw`) files.
 
-Reads MCRAW and MOTION format files, decodes raw Bayer data through a full color pipeline (15 color spaces, 15 transfer functions, AgX tone mapping), and exports to professional video formats or CinemaDNG. All in the terminal.
+Reads MCRAW and MOTION format files, decodes raw Bayer data through a full color pipeline, and exports to professional video formats or CinemaDNG. All in the terminal.
 
 ## Features
 
-- **Browse and inspect** `.mcraw` files with metadata display, frame-by-frame navigation
-- **Full color pipeline**: demosaic (bilinear + RCD GPU), white balance, color matrix, transfer function encoding
-- **15 color spaces**: Rec.709, Rec.2020, ACES AP1, ARRI Wide Gamut 3/4, Canon Cinema Gamut, DaVinci Wide Gamut, DCI-P3, Display P3, F-Gamut/C, Panasonic V-Gamut, S-Gamut3/Cine, sRGB
-- **15 transfer functions**: Gamma 2.4, Rec.709, Linear, PQ (ST.2084), HLG (BT.2100), ARRI LogC3/LogC4, Apple Log/Log 2, C-Log3, DaVinci Intermediate, F-Log2, S-Log3, V-Log, ACEScct
-- **AgX tone mapping** for spectral gamut mapping and highlight roll-off
+- **In-browser file management**: file browser with directory navigation, favourites, hidden file toggle
+- **Selective import**: import individual, selected, or all `.mcraw` files from a directory
+- **Full color pipeline**: bilinear demosaic (RCD GPU with CPU fallback), white balance, color matrix, transfer function encoding
+- **15 color spaces**: ACES AP1, ARRI Wide Gamut 3/4, Canon Cinema Gamut, DaVinci Wide Gamut, DCI-P3, Display P3, F-Gamut/C, Panasonic V-Gamut, Rec.2020, Rec.709, S-Gamut3/Cine, sRGB
+- **15 transfer functions**: Gamma 2.4, Rec.709, Linear, PQ (ST.2084), HLG, ARRI LogC3/LogC4, Apple Log/Log 2, C-Log3, DaVinci Intermediate, F-Log2, S-Log3, V-Log, ACEScct
 - **Export to**: ProRes, DNxHR, H.264, HEVC, AV1, VP9, CinemaDNG
 - **Hardware encoder detection**: NVENC, AMF, QSV, VideoToolbox auto-selected when available
-- **GPU compute demosaic** via wgpu + WGSL (optional, graceful CPU fallback)
 - **Export presets**: save/load named preset configurations
 - **Batch queue**: add multiple files, render sequentially, track per-file progress
-- **Per-phase pipeline timing** via `MCRAW_STATS_DUMP` env var
+- **GPU compute demosaic** via wgpu + WGSL (graceful CPU fallback)
 
 ## Prerequisites
 
@@ -41,9 +40,6 @@ scoop install ffmpeg
 
 # Windows (Winget)
 winget install ffmpeg
-
-# Windows (manual)
-# Download from https://ffmpeg.org/download.html and add to PATH
 ```
 
 ## Build from source
@@ -57,18 +53,18 @@ git clone https://github.com/Yoganshbhatt/motioncam-decoder-rust.git
 cd mcraw-tui
 cargo build --release
 
-# The binary is at target/release/mcraw-tui
+# The binary is at target/release/mcraw-tui (or mcraw-tui.exe on Windows)
 ```
 
-The final binary is self-contained — `motioncam-decoder-rust` is statically linked. Only FFmpeg is needed at runtime.
+The binary is self-contained — `motioncam-decoder-rust` is statically linked. Only FFmpeg is needed at runtime.
 
-### Platform-specific notes
+### Platform notes
 
 | Platform | Notes |
 |---|---|
-| **Windows** | MSVC build tools required (`scoop install rustup-msvc` or Visual Studio Build Tools). Run in Windows Terminal for best results. |
-| **macOS** | Tested on both Apple Silicon and Intel. Gatekeeper warning on first run: `xattr -d com.apple.quarantine mcraw-tui` |
+| **macOS** | Gatekeeper warning on first run: `xattr -d com.apple.quarantine mcraw-tui` |
 | **Linux** | Requires glibc. No additional libraries needed beyond ffmpeg. |
+| **Windows** | Run in Windows Terminal for best results. |
 
 ## CLI Usage
 
@@ -93,9 +89,9 @@ mcraw-tui [OPTIONS] [COMMAND]
 | `info` | Print file metadata and exit | `mcraw-tui info -f video.mcraw` |
 | `export` | Export to another format | `mcraw-tui export -f video.mcraw -F prores -o output.mov` |
 
-### Export formats
+### Export format flags
 
-| Format flag | Description | Codec |
+| Flag | Format | Codec |
 |---|---|---|
 | `dng` | CinemaDNG image sequence | LJ92-compressed DNG |
 | `prores` | Apple ProRes | ProRes 422/444 |
@@ -106,30 +102,28 @@ mcraw-tui [OPTIONS] [COMMAND]
 
 ### Panel layout
 
-The interface has three panels when the browser is hidden (default), four when visible:
-
 ```
 ┌─────────────────────────────────────────────────────┐
-│ Header: file path, frame info, export status         │
+│ Header: file path, metadata, export status           │
 ├──────────────┬──────────────────────┬────────────────┤
 │  Media Pool  │  Render Queue        │ Export Settings│
 │  (imported   │  (pending/           │  (color space, │
 │   .mcraw     │   rendering/         │   transfer fn, │
 │   files)     │   completed/failed)  │   codec, rate) │
 ├──────────────┴──────────────────────┴────────────────┤
-│ Browser overlay (toggle with `b`)                     │
+│ Browser overlay (toggle with `b`)                    │
 └─────────────────────────────────────────────────────┘
 ```
 
 ### Workflow
 
-1. **Open a file** with `mcraw-tui -f file.mcraw` or drag-and-drop a `.mcraw` onto the terminal
-2. **Browse** files with `b` to open the file browser, navigate with arrow keys
-3. **Import** selected files with `I` (browser) or open directly
-4. **Configure** export settings in the right panel — cycle through options with `c`/`g`/`t`/`p`/`r`
+1. **Open** with `mcraw-tui -f file.mcraw` — browser opens automatically if no file specified
+2. **Browse** files with the file browser — navigate directories, mark favourites, toggle hidden files
+3. **Import** individual files with `I` or load all `.mcraw` in current folder with `L`
+4. **Configure** export settings — cycle through codec, color space, transfer function, profile, rate control
 5. **Queue** items with `a` (selected) or `A` (all imported)
 6. **Render** with `v` (selected) or `R` (all queued)
-7. **Monitor progress** in the queue panel — cancel with `X`
+7. **Monitor** progress in the queue panel — cancel with `X`
 
 ### Keybindings
 
@@ -140,8 +134,6 @@ The interface has three panels when the browser is hidden (default), four when v
 | `Tab` | Cycle focus: Media Pool → Queue → Export Settings |
 | `↑` / `k` | Navigate up (list, browser, favourites) |
 | `↓` / `j` | Navigate down |
-| `←` / `h` | Previous frame |
-| `→` / `l` | Next frame |
 | `PageUp` | Fast scroll up (10 items) |
 | `PageDown` | Fast scroll down |
 | `Home` | Jump to start of list |
@@ -201,10 +193,6 @@ The interface has three panels when the browser is hidden (default), four when v
 | `Ctrl+X` | Cancel in-progress export |
 | `Esc` | Close popup → Full info → Favourites → Browser → Help → Quit |
 
-### Drag and drop
-
-Drag `.mcraw` files onto the terminal window to import them. An import popup lets you choose between importing just the dropped files or all `.mcraw` files in the parent directory.
-
 ## Export formats
 
 The TUI supports more codecs than the CLI. Full matrix:
@@ -219,7 +207,7 @@ The TUI supports more codecs than the CLI. Full matrix:
 | **VP9** | Profile2 420 10-bit, Profile3 444 10-bit | Lossless, High, Standard, Custom |
 | **DNG** | CinemaDNG image sequence (LJ92) | N/A |
 
-Hardware encoders (NVENC, AMF, QSV, VideoToolbox) are detected at startup and preferred over software encoders.
+Hardware encoders (NVENC, AMF, QSV, VideoToolbox) are detected at startup and preferred over software encoders when available.
 
 ## Export presets
 
@@ -233,45 +221,48 @@ Save and load named preset configurations. Presets are stored in the platform co
 
 ### Color spaces
 
-| Name | Usage |
+| Name | Source |
 |---|---|
 | ACES AP1 | Academy Color Encoding System |
-| ARRI Wide Gamut 3 | ARRI Alexa |
+| ARRI Wide Gamut 3 | ARRI Alexa (Legacy) |
 | ARRI Wide Gamut 4 | ARRI Alexa 35 |
-| Canon Cinema Gamut | Canon Cinema cameras |
+| Canon Cinema Gamut | Canon Cinema EOS cameras |
 | DaVinci Wide Gamut | Blackmagic Design |
-| DCI-P3 | Digital cinema projection |
-| Display P3 | Apple displays |
-| F-Gamut / F-Gamut C | Fujifilm |
+| DCI-P3 | SMPTE RP 431-2 (Digital Cinema) |
+| Display P3 | Apple (P3 D65, ICC profile) |
+| F-Gamut | Fujifilm |
+| F-Gamut C | Fujifilm (Cinema variant) |
 | Panasonic V-Gamut | Panasonic Varicam |
-| Rec.2020 | UHDTV / BT.2020 |
-| Rec.709 | HDTV / BT.709 |
-| S-Gamut3 / S-Gamut3.Cine | Sony |
-| sRGB | Web / SDR displays |
+| Rec.2020 | ITU-R BT.2020 (UHDTV) |
+| Rec.709 | ITU-R BT.709 (HDTV) |
+| S-Gamut3 | Sony |
+| S-Gamut3.Cine | Sony (Cinema variant) |
+| sRGB | IEC 61966-2-1 (Web / SDR) |
 
 ### Transfer functions
 
-| Name | Type |
+| Name | Source |
 |---|---|
-| Linear | Scene-linear |
-| Gamma 2.4 | SDR display |
-| Rec.709 | SDR broadcast |
-| PQ (ST.2084) | HDR10 |
-| HLG (BT.2100) | Hybrid Log-Gamma |
-| ARRI LogC3 / LogC4 | ARRI log |
-| Apple Log / Apple Log 2 | Apple log |
-| C-Log3 | Canon log |
-| DaVinci Intermediate | Blackmagic intermediate |
-| F-Log2 | Fujifilm log |
-| S-Log3 | Sony log |
-| V-Log | Panasonic log |
-| ACEScct | ACES log |
+| Linear | Scene-linear reference |
+| Gamma 2.4 | SDR display standard |
+| Rec.709 | HDTV broadcast |
+| PQ (ST.2084) | SMPTE ST.2084 (HDR10) |
+| HLG | ITU-R BT.2100 (Hybrid Log-Gamma) |
+| ARRI LogC3 | ARRI (Alexa) |
+| ARRI LogC4 | ARRI (Alexa 35 / 265) |
+| Apple Log | Apple (iPhone 15 Pro / Log profile) |
+| Apple Log 2 | Apple (iPhone 16 Pro / Log v2) |
+| C-Log3 | Canon (Cinema EOS) |
+| DaVinci Intermediate | Blackmagic Design (DaVinci Resolve) |
+| F-Log2 | Fujifilm |
+| S-Log3 | Sony |
+| V-Log | Panasonic (Varicam) |
+| ACEScct | Academy Color Encoding System |
 
 ### Pipeline order
 
 ```
-Raw Bayer → Demosaic → White balance → Color matrix (CCM) →
-Transfer function → Optional AgX tone mapping → RGB encoding
+Raw Bayer → Demosaic (bilinear / RCD GPU) → White balance → Color matrix (CCM) → Transfer function → RGB encoding
 ```
 
 ## Logging
@@ -286,17 +277,9 @@ Logs are written to the platform-specific data directory:
 
 Logs rotate daily and are cleaned after 7 days. Set `MCRAW_TUI_LOG=<level>` to control verbosity.
 
-## Performance statistics
-
-Set `MCRAW_STATS_DUMP=stats.json` when running export to write per-phase timing data:
-
-```bash
-MCRAW_STATS_DUMP=export-timing.json mcraw-tui export -f video.mcraw -F prores -o output.mov
-```
-
-Phase timings recorded: setup, decode, demosaic, normalize, white balance, CCM, OETF, pack, GPU, encode push, finalize.
-
 ## Architecture
+
+Three-thread pipeline using bounded crossbeam channels:
 
 ```
 ┌──────────┐    ┌──────────────┐    ┌──────────┐
@@ -304,16 +287,16 @@ Phase timings recorded: setup, decode, demosaic, normalize, white balance, CCM, 
 │ (decoder)│    │ (demosaic →  │    │ (ffmpeg  │
 │          │    │  WB → CCM →  │    │  stdin)  │
 │          │    │  OETF)       │    │          │
-└──────────┘    └──────────────┘    └──────────┘
-                    │ optional
-                    ↓
-               ┌──────────┐
-               │  GPU     │
-               │ (wgpu)   │
-               └──────────┘
+└──────────┘    └──────┬───────┘    └──────────┘
+                       │ optional
+                       ↓
+                  ┌──────────┐
+                  │  GPU     │
+                  │ (wgpu)   │
+                  └──────────┘
 ```
 
-Three-thread pipeline using bounded crossbeam channels. Each frame slot is pre-allocated (`PIPELINE_DEPTH = 3`). The processor thread can optionally dispatch RCD demosaic to a GPU compute pipeline (wgpu + WGSL) with graceful CPU fallback.
+The processor thread can optionally dispatch RCD demosaic to a GPU compute pipeline (wgpu + WGSL) with graceful CPU fallback.
 
 ## Credits
 
@@ -321,7 +304,6 @@ This project builds on several open-source colour science projects. Full details
 
 Key dependencies:
 - **colour-science/colour** (BSD-3-Clause) — transfer function implementations and color space conversions
-- **AgX / Troy Sobotka** (MIT) — AgX tone mapping pipeline
 - **motioncam-decoder-rust** (Apache-2.0) — MotionCam RAW file decoding
 
 ## License
