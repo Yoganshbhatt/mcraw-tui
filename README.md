@@ -217,47 +217,11 @@ Save and load named preset configurations. Presets are stored in the platform co
 - Press `P` to open the preset picker
 - `Delete` removes a saved preset
 
-## Color science reference
+## Color science
 
-### Color spaces
+**Color spaces**: ACES AP1, ARRI Wide Gamut 3, ARRI Wide Gamut 4, Canon Cinema Gamut, DaVinci Wide Gamut, DCI-P3, Display P3, F-Gamut, F-Gamut C, Panasonic V-Gamut, Rec.2020, Rec.709, S-Gamut3, S-Gamut3.Cine, sRGB
 
-| Name | Source |
-|---|---|
-| ACES AP1 | Academy Color Encoding System |
-| ARRI Wide Gamut 3 | ARRI Alexa (Legacy) |
-| ARRI Wide Gamut 4 | ARRI Alexa 35 |
-| Canon Cinema Gamut | Canon Cinema EOS cameras |
-| DaVinci Wide Gamut | Blackmagic Design |
-| DCI-P3 | SMPTE RP 431-2 (Digital Cinema) |
-| Display P3 | Apple (P3 D65, ICC profile) |
-| F-Gamut | Fujifilm |
-| F-Gamut C | Fujifilm (Cinema variant) |
-| Panasonic V-Gamut | Panasonic Varicam |
-| Rec.2020 | ITU-R BT.2020 (UHDTV) |
-| Rec.709 | ITU-R BT.709 (HDTV) |
-| S-Gamut3 | Sony |
-| S-Gamut3.Cine | Sony (Cinema variant) |
-| sRGB | IEC 61966-2-1 (Web / SDR) |
-
-### Transfer functions
-
-| Name | Source |
-|---|---|
-| Linear | Scene-linear reference |
-| Gamma 2.4 | SDR display standard |
-| Rec.709 | HDTV broadcast |
-| PQ (ST.2084) | SMPTE ST.2084 (HDR10) |
-| HLG | ITU-R BT.2100 (Hybrid Log-Gamma) |
-| ARRI LogC3 | ARRI (Alexa) |
-| ARRI LogC4 | ARRI (Alexa 35 / 265) |
-| Apple Log | Apple (iPhone 15 Pro / Log profile) |
-| Apple Log 2 | Apple (iPhone 16 Pro / Log v2) |
-| C-Log3 | Canon (Cinema EOS) |
-| DaVinci Intermediate | Blackmagic Design (DaVinci Resolve) |
-| F-Log2 | Fujifilm |
-| S-Log3 | Sony |
-| V-Log | Panasonic (Varicam) |
-| ACEScct | Academy Color Encoding System |
+**Transfer functions**: ACEScct, ARRI LogC3, ARRI LogC4, Apple Log, Apple Log 2, C-Log3, DaVinci Intermediate, F-Log2, Gamma 2.4, HLG, Linear, PQ (ST.2084), Rec.709, S-Log3, V-Log
 
 ### Pipeline order
 
