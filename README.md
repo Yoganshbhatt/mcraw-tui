@@ -9,13 +9,10 @@ Reads MCRAW and MOTION format files, decodes raw Bayer data through a full color
 - **In-browser file management**: file browser with directory navigation, favourites, hidden file toggle
 - **Selective import**: import individual, selected, or all `.mcraw` files from a directory
 - **Full color pipeline**: bilinear demosaic (RCD GPU with CPU fallback), white balance, color matrix, transfer function encoding
-- **15 color spaces**: ACES AP1, ARRI Wide Gamut 3/4, Canon Cinema Gamut, DaVinci Wide Gamut, DCI-P3, Display P3, F-Gamut/C, Panasonic V-Gamut, Rec.2020, Rec.709, S-Gamut3/Cine, sRGB
-- **15 transfer functions**: Gamma 2.4, Rec.709, Linear, PQ (ST.2084), HLG, ARRI LogC3/LogC4, Apple Log/Log 2, C-Log3, DaVinci Intermediate, F-Log2, S-Log3, V-Log, ACEScct
 - **Export to**: ProRes, DNxHR, H.264, HEVC, AV1, VP9, CinemaDNG
 - **Hardware encoder detection**: NVENC, AMF, QSV, VideoToolbox auto-selected when available
 - **Export presets**: save/load named preset configurations
 - **Batch queue**: add multiple files, render sequentially, track per-file progress
-- **GPU compute demosaic** via wgpu + WGSL (graceful CPU fallback)
 
 ## Prerequisites
 
@@ -219,9 +216,23 @@ Save and load named preset configurations. Presets are stored in the platform co
 
 ## Color science
 
-**Color spaces**: ACES AP1, ARRI Wide Gamut 3, ARRI Wide Gamut 4, Canon Cinema Gamut, DaVinci Wide Gamut, DCI-P3, Display P3, F-Gamut, F-Gamut C, Panasonic V-Gamut, Rec.2020, Rec.709, S-Gamut3, S-Gamut3.Cine, sRGB
-
-**Transfer functions**: ACEScct, ARRI LogC3, ARRI LogC4, Apple Log, Apple Log 2, C-Log3, DaVinci Intermediate, F-Log2, Gamma 2.4, HLG, Linear, PQ (ST.2084), Rec.709, S-Log3, V-Log
+| Color spaces | Transfer functions |
+|---|---|
+| ACES AP1 | ACEScct |
+| ARRI Wide Gamut 3 | ARRI LogC3 |
+| ARRI Wide Gamut 4 | ARRI LogC4 |
+| Canon Cinema Gamut | Apple Log |
+| DaVinci Wide Gamut | Apple Log 2 |
+| DCI-P3 | C-Log3 |
+| Display P3 | DaVinci Intermediate |
+| F-Gamut | F-Log2 |
+| F-Gamut C | Gamma 2.4 |
+| Panasonic V-Gamut | HLG |
+| Rec.2020 | Linear |
+| Rec.709 | PQ (ST.2084) |
+| S-Gamut3 | Rec.709 |
+| S-Gamut3.Cine | S-Log3 |
+| sRGB | V-Log |
 
 ### Pipeline order
 
