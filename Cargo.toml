@@ -5,6 +5,7 @@ edition = "2021"
 description = "Cross-platform TUI for browsing and exploring MotionCam (.mcraw) files"
 authors = ["Terminal Developer"]
 license = "Apache-2.0"
+repository = "https://github.com/Yoganshbhatt/mcraw-tui"
 
 [dependencies]
 # TUI framework
