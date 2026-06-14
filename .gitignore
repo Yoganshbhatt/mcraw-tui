@@ -27,6 +27,11 @@ Cargo.lock
 .DS_Store
 Thumbs.db
 
+# Working files / design docs
+OPTIMIZATION_SESSION.json
+mcraw-stats-test.json
+mcraw-tui-redesign.txt
+
 # Debug artifacts
 References/
 timing_results.txt
