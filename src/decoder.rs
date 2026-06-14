@@ -141,6 +141,12 @@ impl Decoder {
         Ok(ts)
     }
 
+    /// Hint the OS to prefetch a frame's range into the page cache (B4).
+    /// See `motioncam_decoder::Decoder::prefetch`. No-op on Windows.
+    pub fn prefetch(&self, timestamp_ns: i64) {
+        self.inner.prefetch(timestamp_ns);
+    }
+
     pub fn load_frame(&self, timestamp_ns: i64) -> Result<(Vec<u16>, FrameMetadata)> {
         let (pixels, meta) = self.inner.load_frame(timestamp_ns)
             .map_err(|e| {
@@ -166,6 +172,17 @@ impl Decoder {
             focal_length,
             aperture,
         }))
+    }
+
+    /// Decode a frame into a caller-owned buffer (B1). Returns only the
+    /// `asShotNeutral` triplet (B2) — the only metadata the export hot
+    /// path uses. Use `load_frame` if you need the other fields.
+    pub fn load_frame_into(&self, timestamp_ns: i64, out: &mut [u16]) -> Result<[f32; 3]> {
+        self.inner.load_frame_into(timestamp_ns, out)
+            .map_err(|e| {
+                tracing::error!("failed to decode frame at ns {}: {}", timestamp_ns, e);
+                anyhow!("Failed to decode frame at ns {}: {}", timestamp_ns, e)
+            })
     }
 
     pub fn load_frame_metadata(&self, timestamp_ns: i64) -> Result<FrameMetadata> {

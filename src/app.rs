@@ -24,6 +24,8 @@ use crate::decoder::Decoder;
 use crate::encoder::{EncodeJob, EncodeStatus, Encoder, OutputFormat};
 use crate::file::McrawFileInfo;
 use crate::file_browser::FileBrowser;
+use crate::preset::ExportPreset;
+use crate::stats::PipelineStats;
 use crate::ui::{self, ClickAction};
 
 // ---------------------------------------------------------------------------
@@ -75,6 +77,7 @@ pub enum ImportPopupState {
 #[derive(Debug)]
 pub enum ExportEvent {
     Progress(f64),
+    Stats(Arc<PipelineStats>),
     Done(Result<()>),
 }
 
@@ -199,8 +202,50 @@ pub struct App {
     // Pinned favourites bar toggle
     pub show_favourites_bar: bool,
 
+    // When true, the browser list is replaced by a flat view of the
+    // user's favourite folders (f-key toggle). `..` is hidden in this
+    // view because the favourites list isn't a filesystem hierarchy.
+    pub browsing_favourites: bool,
+
+    // Persistent ListState offset for the favourites list view
+    pub favourites_scroll_offset: Cell<usize>,
+
     // Timestamp + index of last clicked favourite (for d-key removal)
     pub last_clicked_favourite: Option<(Instant, usize)>,
+
+    // -------------------------------------------------------------------
+    // Export presets
+    // -------------------------------------------------------------------
+    /// User-saved export setting bundles. Loaded from
+    /// `presets.json` at startup, written back on every change.
+    pub presets: Vec<crate::preset::ExportPreset>,
+
+    /// Name of the preset that was last applied, if any. Shown in the
+    /// Export Settings panel header so the user can see *why* the current
+    /// settings look the way they do.
+    pub active_preset: Option<String>,
+
+    /// State of the preset-picker overlay.
+    pub preset_picker: PresetPickerState,
+
+    /// True while the user is typing a name for a new preset. Captures
+    /// the live text and the cursor position. Esc cancels, Enter saves.
+    pub preset_naming: Option<PresetNamingState>,
+}
+
+/// Overlay state for the preset-picker. `Shown` holds the list, cursor
+/// index, and a transient error/info string rendered at the bottom.
+#[derive(Debug, Clone, Default)]
+pub struct PresetPickerState {
+    pub open: bool,
+    pub index: usize,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PresetNamingState {
+    pub name: String,
+    pub message: Option<String>,
 }
 
 /// Event from async drag-drop import worker
@@ -317,6 +362,12 @@ impl App {
             browser_scroll_offset: Cell::new(0),
             show_favourites_bar: true,
             last_clicked_favourite: None,
+            browsing_favourites: false,
+            favourites_scroll_offset: Cell::new(0),
+            presets: ExportPreset::load_all(),
+            active_preset: None,
+            preset_picker: PresetPickerState::default(),
+            preset_naming: None,
         }
     }
 
@@ -1038,16 +1089,21 @@ impl App {
         };
 
         let rate_control = self.active_rate_control.clone();
+        let stats = Arc::new(PipelineStats::new());
+        let stats_for_event = Arc::clone(&stats);
 
         std::thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 crate::pipeline::run_export(
-                    info, output_path, progress_cb, cancel_flag,
+                    info, output_path, progress_cb, cancel_flag, stats,
                     cs, tf, cf, pp, dp, hp, h4p, ap, vp,
                     hevc_enc, h264_enc, av1_enc, prores_enc,
                     rate_control,
                 )
             }));
+            // Always emit stats before Done so the UI can persist them,
+            // even on panic/cancel.
+            let _ = tx.send(ExportEvent::Stats(stats_for_event));
             match result {
                 Ok(export_result) => {
                     let _ = tx.send(ExportEvent::Done(export_result));
@@ -1088,6 +1144,147 @@ impl App {
             self.status_message = "Added to favourites".to_string();
         }
         self.save_favourites();
+    }
+
+    // -----------------------------------------------------------------------
+    // Export presets
+    // -----------------------------------------------------------------------
+
+    /// Snapshot the current export settings as a named preset and persist
+    /// the full preset list to disk. If a preset with the same name already
+    /// exists it is replaced in place.
+    pub fn save_current_as_preset(&mut self, name: String) {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            self.status_message = "Preset name cannot be empty".to_string();
+            return;
+        }
+        let preset = ExportPreset::snapshot(
+            name.clone(),
+            self.export_color_space,
+            self.export_transfer_function,
+            self.export_codec_family,
+            self.prores_profile,
+            self.dnxhr_profile,
+            self.hevc_profile,
+            self.h264_profile,
+            self.av1_profile,
+            self.vp9_profile,
+            self.active_rate_control.clone(),
+            self.export_folder.clone(),
+        );
+        ExportPreset::upsert(&mut self.presets, preset);
+        ExportPreset::save_all(&self.presets);
+        self.active_preset = Some(name.clone());
+        self.status_message = format!("Saved preset: {}", name);
+    }
+
+    /// Apply the preset at the given index, copying every field onto the
+    /// app's live state.
+    pub fn apply_preset(&mut self, index: usize) {
+        if index >= self.presets.len() {
+            return;
+        }
+        let p = self.presets[index].clone();
+        self.export_color_space = p.color_space;
+        self.export_transfer_function = p.transfer_function;
+        self.export_codec_family = p.codec_family;
+        self.prores_profile = p.prores_profile;
+        self.dnxhr_profile = p.dnxhr_profile;
+        self.hevc_profile = p.hevc_profile;
+        self.h264_profile = p.h264_profile;
+        self.av1_profile = p.av1_profile;
+        self.vp9_profile = p.vp9_profile;
+        self.active_rate_control = p.rate_control;
+        self.export_folder = p.export_folder;
+        // Exit custom-rate edit mode if the preset isn't a custom rate.
+        if !matches!(self.active_rate_control, RateControl::Custom(_)) {
+            self.is_editing_custom_rate = false;
+        }
+        self.active_preset = Some(p.name.clone());
+        self.status_message = format!("Applied preset: {}", p.name);
+    }
+
+    /// Delete the preset at the given index. If that preset was the active
+    /// one, clear the active marker.
+    pub fn delete_preset(&mut self, index: usize) {
+        if index >= self.presets.len() {
+            return;
+        }
+        let removed_name = self.presets[index].name.clone();
+        self.presets.remove(index);
+        ExportPreset::save_all(&self.presets);
+        if self.active_preset.as_deref() == Some(removed_name.as_str()) {
+            self.active_preset = None;
+        }
+        // Keep the cursor in bounds.
+        if !self.presets.is_empty() && self.preset_picker.index >= self.presets.len() {
+            self.preset_picker.index = self.presets.len() - 1;
+        }
+        self.preset_picker.message = Some(format!("Deleted preset: {}", removed_name));
+        self.status_message = format!("Deleted preset: {}", removed_name);
+    }
+
+    /// Open the preset picker overlay. If there are no presets, surface a
+    /// hint in the status bar instead of opening an empty list.
+    pub fn open_preset_picker(&mut self) {
+        if self.presets.is_empty() {
+            self.status_message = "No presets yet — press [p] to save the current settings".to_string();
+            return;
+        }
+        self.preset_picker.open = true;
+        self.preset_picker.index = self.presets.len().saturating_sub(1).min(self.preset_picker.index);
+        self.preset_picker.message = None;
+    }
+
+    pub fn close_preset_picker(&mut self) {
+        self.preset_picker.open = false;
+        self.preset_picker.message = None;
+    }
+
+    /// Enter the in-line naming mode for a new preset. The user types the
+    /// name and presses Enter to save.
+    pub fn begin_naming_preset(&mut self) {
+        let default_name = match &self.active_preset {
+            Some(n) => format!("{} (copy)", n),
+            None => "My Preset".to_string(),
+        };
+        self.preset_naming = Some(PresetNamingState { name: default_name, message: None });
+        self.preset_picker.open = false;
+    }
+
+    pub fn cancel_naming_preset(&mut self) {
+        self.preset_naming = None;
+    }
+
+    /// Finalize naming: save the preset and exit the naming state.
+    pub fn commit_naming_preset(&mut self) {
+        let name = match self.preset_naming.as_ref() {
+            Some(s) => s.name.clone(),
+            None => return,
+        };
+        self.preset_naming = None;
+        self.save_current_as_preset(name);
+    }
+
+    /// True if the current settings exactly match the named preset (best
+    /// effort: only checked for the fields we know about).
+    pub fn current_matches_preset(&self, name: &str) -> bool {
+        if let Some(p) = self.presets.iter().find(|p| p.name == name) {
+            p.color_space == self.export_color_space
+                && p.transfer_function == self.export_transfer_function
+                && p.codec_family == self.export_codec_family
+                && p.prores_profile == self.prores_profile
+                && p.dnxhr_profile == self.dnxhr_profile
+                && p.hevc_profile == self.hevc_profile
+                && p.h264_profile == self.h264_profile
+                && p.av1_profile == self.av1_profile
+                && p.vp9_profile == self.vp9_profile
+                && p.rate_control.name() == self.active_rate_control.name()
+                && p.export_folder == self.export_folder
+        } else {
+            false
+        }
     }
 
     pub fn import_selected_from_browser(&mut self) {
@@ -1136,6 +1333,17 @@ impl App {
                     self.export_progress = pct;
                     if let Some(q) = self.queue.iter_mut().find(|q| matches!(q.status, QueueStatus::Rendering)) {
                         q.progress = pct;
+                    }
+                }
+                ExportEvent::Stats(stats) => {
+                    let report = stats.report();
+                    report.print_summary();
+                    if let Ok(path) = std::env::var("MCRAW_STATS_DUMP") {
+                        let path = std::path::PathBuf::from(path);
+                        match report.write_json(&path) {
+                            Ok(()) => tracing::info!("stats dumped to {}", path.display()),
+                            Err(e) => tracing::warn!("failed to dump stats to {}: {}", path.display(), e),
+                        }
                     }
                 }
                 ExportEvent::Done(result) => {
@@ -1267,6 +1475,45 @@ impl App {
                 self.show_favourites_bar = false;
             }
             BrowserDirection::ToggleHidden => self.browser.toggle_hidden(),
+        }
+    }
+
+    /// Move the favourites-list cursor by `delta`. Clamps to bounds.
+    pub fn navigate_favourites(&mut self, delta: i64) {
+        if self.favourite_folders.is_empty() {
+            return;
+        }
+        let cur = self.favourites_scroll_offset.get() as i64;
+        let max = (self.favourite_folders.len() as i64) - 1;
+        let next = (cur + delta).clamp(0, max);
+        self.favourites_scroll_offset.set(next as usize);
+    }
+
+    /// Navigate into the favourite at the current cursor position.
+    pub fn open_selected_favourite(&mut self) {
+        let idx = self.favourites_scroll_offset.get();
+        if let Some(path) = self.favourite_folders.get(idx).cloned() {
+            self.status_message = format!("Navigated to favourite: {}", path.display());
+            self.browser = FileBrowser::from_path(path);
+            self.browser_scroll_offset = Cell::new(0);
+            self.browsing_favourites = false;
+            self.show_favourites_bar = false;
+        }
+    }
+
+    /// Delete the favourite at the current cursor position.
+    pub fn delete_selected_favourite(&mut self) {
+        let idx = self.favourites_scroll_offset.get();
+        if idx < self.favourite_folders.len() {
+            let name = self.favourite_folders[idx].display().to_string();
+            self.favourite_folders.remove(idx);
+            self.save_favourites();
+            if self.favourite_folders.is_empty() {
+                self.browsing_favourites = false;
+            } else if self.favourites_scroll_offset.get() >= self.favourite_folders.len() {
+                self.favourites_scroll_offset.set(self.favourite_folders.len() - 1);
+            }
+            self.status_message = format!("Removed favourite: {}", name);
         }
     }
 
@@ -1470,6 +1717,9 @@ fn execute_click_action(app: &mut App, action: ClickAction) {
                 app.last_clicked_favourite = Some((Instant::now(), i));
                 app.status_message = "Navigated to favourite folder".to_string();
             }
+        }
+        ClickAction::OpenPresetPicker => {
+            app.open_preset_picker();
         }
     }
 }
@@ -2011,6 +2261,67 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
             tracing::debug!("key event: code={:?} modifiers={:?}", key_event.code, key_event.modifiers);
 
             // ----------------------------------------------------------------
+            // Preset naming (inline text entry)
+            // ----------------------------------------------------------------
+            if app.preset_naming.is_some() {
+                let naming = app.preset_naming.clone().unwrap();
+                match key_event.code {
+                    crossterm::event::KeyCode::Char(c) => {
+                        if let Some(state) = app.preset_naming.as_mut() {
+                            state.name.push(c);
+                        }
+                    }
+                    crossterm::event::KeyCode::Backspace => {
+                        if let Some(state) = app.preset_naming.as_mut() {
+                            state.name.pop();
+                        }
+                    }
+                    crossterm::event::KeyCode::Enter => {
+                        app.commit_naming_preset();
+                    }
+                    crossterm::event::KeyCode::Esc => {
+                        app.cancel_naming_preset();
+                        app.status_message = "Preset save cancelled".to_string();
+                    }
+                    _ => {}
+                }
+                let _ = naming; // Silence unused warning if not used.
+                return;
+            }
+
+            // ----------------------------------------------------------------
+            // Preset picker overlay
+            // ----------------------------------------------------------------
+            if app.preset_picker.open {
+                match key_event.code {
+                    crossterm::event::KeyCode::Esc => app.close_preset_picker(),
+                    crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
+                        if app.preset_picker.index > 0 {
+                            app.preset_picker.index -= 1;
+                        }
+                        app.preset_picker.message = None;
+                    }
+                    crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
+                        if app.preset_picker.index + 1 < app.presets.len() {
+                            app.preset_picker.index += 1;
+                        }
+                        app.preset_picker.message = None;
+                    }
+                    crossterm::event::KeyCode::Enter => {
+                        let idx = app.preset_picker.index;
+                        app.close_preset_picker();
+                        app.apply_preset(idx);
+                    }
+                    crossterm::event::KeyCode::Delete | crossterm::event::KeyCode::Backspace => {
+                        let idx = app.preset_picker.index;
+                        app.delete_preset(idx);
+                    }
+                    _ => {}
+                }
+                return;
+            }
+
+            // ----------------------------------------------------------------
             // Import popup
             // ----------------------------------------------------------------
             if app.import_popup != ImportPopupState::Hidden {
@@ -2218,8 +2529,23 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                     }
                     'f' => {
                         if app.show_browser {
-                            app.show_favourites_bar = !app.show_favourites_bar;
-                            app.status_message = if app.show_favourites_bar { "Favourites bar shown".to_string() } else { "Favourites bar hidden".to_string() };
+                            // `f` toggles between the normal folder view and
+                            // a flat list of favourite folders. The bar at
+                            // the top of the browser (when visible) is still
+                            // mouse-only; this gives a keyboard-first path
+                            // through the favourites and also fixes the
+                            // `..` occlusion bug because the favourites are
+                            // rendered through the normal list widget.
+                            if app.browsing_favourites {
+                                app.browsing_favourites = false;
+                                app.status_message = "Folder view".to_string();
+                            } else if app.favourite_folders.is_empty() {
+                                app.status_message = "No favourites yet — press [F] to add the current folder".to_string();
+                            } else {
+                                app.browsing_favourites = true;
+                                app.favourites_scroll_offset = Cell::new(0);
+                                app.status_message = "Favourites view (press [f] or [Esc] to return)".to_string();
+                            }
                         }
                     }
                     'F' => {
@@ -2244,8 +2570,17 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                     }
                     'p' => {
                         if app.focus_target == FocusTarget::ExportSettings {
+                            // Save the current export settings as a new preset.
+                            app.begin_naming_preset();
+                        } else {
                             app.cycle_profile(true);
                         }
+                    }
+                    'P' => {
+                        // Open the preset picker (regardless of focus —
+                        // most useful from the Export Settings panel but
+                        // works from anywhere for power users).
+                        app.open_preset_picker();
                     }
                     's' => {
                         app.status_message = "Settings (coming soon)".to_string();
@@ -2303,12 +2638,20 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                         app.import_popup = ImportPopupState::Hidden;
                     } else if app.show_full_info {
                         app.show_full_info = false;
+                    } else if app.browsing_favourites {
+                        app.browsing_favourites = false;
+                        app.status_message = "Folder view".to_string();
                     } else if app.show_browser {
                         app.show_browser = false;
                     } else if app.show_help {
                         app.show_help = false;
                     } else {
                         app.running = false;
+                    }
+                }
+                crossterm::event::KeyCode::Delete => {
+                    if app.browsing_favourites {
+                        app.delete_selected_favourite();
                     }
                 }
                 crossterm::event::KeyCode::Tab => {
@@ -2322,6 +2665,8 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                         if app.is_editing_custom_rate {
                             app.status_message = "Type a rate value. Enter to confirm, Esc to cancel.".to_string();
                         }
+                    } else if app.browsing_favourites {
+                        app.open_selected_favourite();
                     } else if app.show_browser {
                         app.navigate_browser(BrowserDirection::Enter);
                     }
@@ -2339,6 +2684,8 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                 crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
                     if app.show_help {
                         app.help_scroll = app.help_scroll.saturating_sub(1);
+                    } else if app.browsing_favourites {
+                        app.navigate_favourites(-1);
                     } else if app.show_browser {
                         app.navigate_browser(BrowserDirection::Up);
                     } else {
@@ -2369,6 +2716,8 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                 crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
                     if app.show_help {
                         app.help_scroll = app.help_scroll.saturating_add(1);
+                    } else if app.browsing_favourites {
+                        app.navigate_favourites(1);
                     } else if app.show_browser {
                         app.navigate_browser(BrowserDirection::Down);
                     } else {
@@ -2411,6 +2760,8 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                 crossterm::event::KeyCode::PageUp => {
                     if app.show_help {
                         app.help_scroll = app.help_scroll.saturating_sub(10);
+                    } else if app.browsing_favourites {
+                        app.navigate_favourites(-10);
                     } else if app.show_browser {
                         let entries_len = app.browser.entries.len();
                         if entries_len > 0 {
@@ -2432,6 +2783,8 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                 crossterm::event::KeyCode::PageDown => {
                     if app.show_help {
                         app.help_scroll = app.help_scroll.saturating_add(10);
+                    } else if app.browsing_favourites {
+                        app.navigate_favourites(10);
                     } else if app.show_browser {
                         let entries_len = app.browser.entries.len();
                         if entries_len > 0 {
@@ -2451,7 +2804,9 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                     }
                 }
                 crossterm::event::KeyCode::Home => {
-                    if app.show_browser {
+                    if app.browsing_favourites {
+                        app.favourites_scroll_offset = Cell::new(0);
+                    } else if app.show_browser {
                         app.browser.selected_index = 0;
                     } else if app.focus_target == FocusTarget::MediaPool {
                         app.media_pool_index = 0;
@@ -2460,7 +2815,12 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                     }
                 }
                 crossterm::event::KeyCode::End => {
-                    if app.show_browser {
+                    if app.browsing_favourites {
+                        if !app.favourite_folders.is_empty() {
+                            app.favourites_scroll_offset
+                                .set(app.favourite_folders.len() - 1);
+                        }
+                    } else if app.show_browser {
                         let entries_len = app.browser.entries.len();
                         if entries_len > 0 {
                             app.browser.selected_index = entries_len - 1;
@@ -2476,7 +2836,10 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                     }
                 }
                 crossterm::event::KeyCode::Backspace => {
-                    if app.show_browser {
+                    if app.browsing_favourites {
+                        app.browsing_favourites = false;
+                        app.status_message = "Folder view".to_string();
+                    } else if app.show_browser {
                         app.navigate_browser(BrowserDirection::GoUp);
                     }
                 }

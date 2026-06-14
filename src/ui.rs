@@ -90,6 +90,7 @@ pub enum ClickAction {
     RemoveSelectedFromMediaPool,
     ToggleBrowserSelection(usize),
     FavouriteNavigate(usize),
+    OpenPresetPicker,
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +140,12 @@ pub fn render(frame: &mut Frame, app: &App, regions: &mut Vec<ClickRegion>) {
     }
     if app.show_help {
         render_help_overlay(frame, app, size);
+    }
+    if app.preset_picker.open {
+        render_preset_picker(frame, size, app);
+    }
+    if app.preset_naming.is_some() {
+        render_preset_naming(frame, size, app);
     }
 
     // Drop preview overlay - shows briefly after files are dropped
@@ -366,73 +373,193 @@ fn render_browser_overlay(frame: &mut Frame, area: Rect, app: &App, regions: &mu
 
     frame.render_widget(Clear, browser_area);
 
-    let path_display = app.browser.current_path_display();
+    // Inner dimensions once the border is accounted for.
     let inner_h = browser_area.height.saturating_sub(2);
     let has_room_for_buttons = inner_h >= 3;
-    let bar_rows: u16 = if app.show_favourites_bar && !app.favourite_folders.is_empty() { 1 } else { 0 };
 
-    let items: Vec<ListItem> = app.browser.entries.iter().enumerate().map(|(_i, entry)| {
-        let is_mcraw = entry.name.to_lowercase().ends_with(".mcraw");
-        let checkbox = if is_mcraw {
-            if entry.selected {
-                Span::styled("[*] ", Style::default().fg(Palette::CHECKED).add_modifier(Modifier::BOLD))
-            } else {
-                Span::styled("[ ] ", Style::default().fg(Palette::UNCHECKED))
+    // We now render a vertical stack INSIDE the bordered block:
+    //   [ favourites bar? ] [ list area ] [ button row? ]
+    // The favourites bar is given its own row so it can never occlude the
+    // `..` entry or any other list item (previously it was rendered after
+    // the List widget as an overlay, which hid row 0).
+    let show_fav_bar = app.show_favourites_bar
+        && !app.browsing_favourites
+        && !app.favourite_folders.is_empty();
+    let bar_rows: u16 = if show_fav_bar { 1 } else { 0 };
+    let button_rows: u16 = if has_room_for_buttons { 1 } else { 0 };
+
+    let inner_x = browser_area.x + 1;
+    let inner_w = browser_area.width.saturating_sub(2);
+    let inner_y = browser_area.y + 1;
+
+    let bar_area = Rect {
+        x: inner_x,
+        y: inner_y,
+        width: inner_w,
+        height: bar_rows,
+    };
+    let list_y = inner_y + bar_rows;
+    let list_h = inner_h.saturating_sub(bar_rows + button_rows);
+    let list_area = Rect {
+        x: inner_x,
+        y: list_y,
+        width: inner_w,
+        height: list_h,
+    };
+    let button_y = inner_y + inner_h.saturating_sub(button_rows);
+    let button_area = Rect {
+        x: inner_x + 1,
+        y: button_y,
+        width: inner_w.saturating_sub(2),
+        height: button_rows,
+    };
+
+    // Title reflects the current mode (folder list vs favourites list).
+    let path_display = app.browser.current_path_display();
+    let title = if app.browsing_favourites {
+        format!(" Favourites (Esc/f to return) ")
+    } else {
+        format!(" Browse: {} ", path_display)
+    };
+
+    // 1) Pinned favourites bar (drawn in its own row, not as an overlay).
+    if show_fav_bar {
+        let mut x = bar_area.x + 1;
+        let star_style = Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled("★", star_style))),
+            Rect { x: bar_area.x, y: bar_area.y, width: 1, height: 1 },
+        );
+        for (i, f) in app.favourite_folders.iter().enumerate() {
+            if x >= bar_area.x + bar_area.width.saturating_sub(3) {
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled("…", Style::default().fg(Color::DarkGray)))),
+                    Rect { x, y: bar_area.y, width: 1, height: 1 },
+                );
+                break;
             }
-        } else {
-            Span::styled("    ", Style::default())
-        };
-        let name_style = if entry.is_dir {
-            Style::default().fg(Palette::BROWSER_DIR)
-        } else if is_mcraw {
-            Style::default().fg(Palette::BROWSER_MCRAW)
-        } else {
-            Style::default().fg(Palette::BROWSER_OTHER)
-        };
-        let mut content = vec![
-            checkbox,
-            Span::styled(&entry.name, name_style),
-        ];
-        if let Some(ref info) = entry.file_info {
-            content.push(Span::raw("  "));
-            content.push(Span::styled(format!("{}x{}", info.width, info.height), Style::default().fg(Palette::SUCCESS)));
+            let disp = f.file_name().map(|n| n.to_string_lossy()).unwrap_or_else(|| f.to_string_lossy());
+            let text = format!(" {} ", disp);
+            let item_style = Style::default().fg(Color::Cyan).bg(Palette::HIGHLIGHT_BG);
+            let item_area = Rect { x, y: bar_area.y, width: text.len() as u16, height: 1 };
+            frame.render_widget(Paragraph::new(Line::from(Span::styled(&text, item_style))), item_area);
+            regions.push(ClickRegion { area: item_area, action: ClickAction::FavouriteNavigate(i) });
+            x = x.saturating_add(text.len() as u16 + 1);
         }
-        ListItem::new(Line::from(content))
-    }).collect();
+    }
 
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .title(format!(" Browse: {} ", path_display))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Palette::BORDER_FOCUSED)),
-        )
-        .highlight_style(
-            Style::default()
-                .fg(Palette::FOCUSED)
-                .add_modifier(Modifier::BOLD)
-                .bg(Palette::HIGHLIGHT_BG),
-        )
-        .highlight_symbol("> ");
+    // 2) List area: either the favourites list (full replace) or the
+    //    normal browser entries.
+    if app.browsing_favourites {
+        let items: Vec<ListItem> = app
+            .favourite_folders
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let disp = f
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| f.to_string_lossy().into_owned());
+                let full = f.display().to_string();
+                let content = vec![
+                    Span::styled("★ ", Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("{:<24}", disp), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::styled(full, Style::default().fg(Palette::LABEL)),
+                ];
+                let _ = i;
+                ListItem::new(Line::from(content))
+            })
+            .collect();
 
-    let mut state = ListState::default()
-        .with_offset(app.browser_scroll_offset.get());
-    state.select(Some(app.browser.selected_index));
-    frame.render_stateful_widget(list, browser_area, &mut state);
-    app.browser_scroll_offset.set(state.offset());
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Palette::BORDER_FOCUSED))
+                    .title(title),
+            )
+            .highlight_style(
+                Style::default()
+                    .fg(Palette::FOCUSED)
+                    .add_modifier(Modifier::BOLD)
+                    .bg(Palette::HIGHLIGHT_BG),
+            )
+            .highlight_symbol("> ");
 
-    // Button row at the bottom
+        let mut state = ListState::default()
+            .with_offset(app.favourites_scroll_offset.get());
+        state.select(Some(app.favourites_scroll_offset.get()));
+        frame.render_stateful_widget(list, list_area, &mut state);
+        // Keep the offset in sync (handles clamping done by the widget).
+        if let Some(off) = state.offset().into() {
+            app.favourites_scroll_offset.set(off);
+        }
+    } else {
+        let items: Vec<ListItem> = app
+            .browser
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(_i, entry)| {
+                let is_mcraw = entry.name.to_lowercase().ends_with(".mcraw");
+                let checkbox = if is_mcraw {
+                    if entry.selected {
+                        Span::styled("[*] ", Style::default().fg(Palette::CHECKED).add_modifier(Modifier::BOLD))
+                    } else {
+                        Span::styled("[ ] ", Style::default().fg(Palette::UNCHECKED))
+                    }
+                } else {
+                    Span::styled("    ", Style::default())
+                };
+                let name_style = if entry.is_dir {
+                    Style::default().fg(Palette::BROWSER_DIR)
+                } else if is_mcraw {
+                    Style::default().fg(Palette::BROWSER_MCRAW)
+                } else {
+                    Style::default().fg(Palette::BROWSER_OTHER)
+                };
+                let mut content = vec![
+                    checkbox,
+                    Span::styled(&entry.name, name_style),
+                ];
+                if let Some(ref info) = entry.file_info {
+                    content.push(Span::raw("  "));
+                    content.push(Span::styled(
+                        format!("{}x{}", info.width, info.height),
+                        Style::default().fg(Palette::SUCCESS),
+                    ));
+                }
+                ListItem::new(Line::from(content))
+            })
+            .collect();
+
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Palette::BORDER_FOCUSED))
+                    .title(title),
+            )
+            .highlight_style(
+                Style::default()
+                    .fg(Palette::FOCUSED)
+                    .add_modifier(Modifier::BOLD)
+                    .bg(Palette::HIGHLIGHT_BG),
+            )
+            .highlight_symbol("> ");
+
+        let mut state = ListState::default()
+            .with_offset(app.browser_scroll_offset.get());
+        state.select(Some(app.browser.selected_index));
+        frame.render_stateful_widget(list, list_area, &mut state);
+        app.browser_scroll_offset.set(state.offset());
+    }
+
+    // 3) Button row (bottom of inner area).
     if has_room_for_buttons {
-        let btn_y = browser_area.y + browser_area.height.saturating_sub(2);
-        let btn_row = Rect {
-            x: browser_area.x + 2,
-            y: btn_y,
-            width: browser_area.width.saturating_sub(4),
-            height: 1,
-        };
-        let import_btn = Rect { x: btn_row.x, y: btn_row.y, width: 16, height: 1 };
+        let import_btn = Rect { x: button_area.x, y: button_area.y, width: 16, height: 1 };
         regions.push(ClickRegion { area: import_btn, action: ClickAction::ImportOption1 });
-        let all_btn = Rect { x: btn_row.x + 17, y: btn_row.y, width: 10, height: 1 };
+        let all_btn = Rect { x: button_area.x + 17, y: button_area.y, width: 10, height: 1 };
         regions.push(ClickRegion { area: all_btn, action: ClickAction::ImportOption2 });
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -440,70 +567,54 @@ fn render_browser_overlay(frame: &mut Frame, area: Rect, app: &App, regions: &mu
                 Span::raw(" "),
                 Span::styled(" [L] All ", Style::default().fg(Palette::BUTTON_FG).bg(Palette::BUTTON_BG).add_modifier(Modifier::BOLD)),
             ])),
-            btn_row,
+            button_area,
         );
     }
 
-    // Pinned favourites bar (rendered AFTER the List so it appears on top)
-    if bar_rows > 0 {
-        let fav_y = browser_area.y + 1;
-        let mut x = browser_area.x + 2;
-        let star_style = Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD);
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled("★", star_style))),
-            Rect { x: browser_area.x + 1, y: fav_y, width: 1, height: 1 },
-        );
-        for (i, f) in app.favourite_folders.iter().enumerate() {
-            if x >= browser_area.x + browser_area.width.saturating_sub(3) {
-                frame.render_widget(
-                    Paragraph::new(Line::from(Span::styled("…", Style::default().fg(Color::DarkGray))),
-                ), Rect { x, y: fav_y, width: 1, height: 1 });
+    // 4) Click regions for list items (only meaningful for the normal
+    //    browser list — the favourites list is keyboard-driven).
+    if !app.browsing_favourites {
+        // The List widget draws its own border inside `list_area`, so its
+        // items live at `list_area.y + 1` onward. The last inner row
+        // (`list_area.height - 2`) is the bottom border — skip it.
+        let visible_rows = list_area.height.saturating_sub(2) as usize;
+        let visible_start = app.browser_scroll_offset.get();
+        for i in 0..visible_rows {
+            let entry_index = visible_start + i;
+            if entry_index >= app.browser.entries.len() {
                 break;
             }
-            let disp = f.file_name().map(|n| n.to_string_lossy()).unwrap_or_else(|| f.to_string_lossy());
-            let text = format!(" {} ", disp);
-            let item_style = Style::default().fg(Color::Cyan).bg(Palette::HIGHLIGHT_BG);
-            let item_area = Rect { x, y: fav_y, width: text.len() as u16, height: 1 };
-            frame.render_widget(Paragraph::new(Line::from(Span::styled(&text, item_style))), item_area);
-            regions.push(ClickRegion { area: item_area, action: ClickAction::FavouriteNavigate(i) });
-            x = x.saturating_add(text.len() as u16 + 1);
-        }
-    }
+            let is_mcraw = app.browser.entries[entry_index]
+                .name
+                .to_lowercase()
+                .ends_with(".mcraw");
 
-    // Click regions for list items, shifted down by bar_rows.
-    // The button row occupies the last inner row (overlap handled by button priority).
-    let list_h = inner_h.saturating_sub(bar_rows) as usize;
-    let visible_start = app.browser_scroll_offset.get();
+            if is_mcraw {
+                let cb_area = Rect {
+                    x: list_area.x + 1,
+                    y: list_area.y + 1 + i as u16,
+                    width: 4,
+                    height: 1,
+                };
+                regions.push(ClickRegion {
+                    area: cb_area,
+                    action: ClickAction::ToggleBrowserSelection(entry_index),
+                });
+            }
 
-    for i in 0..list_h {
-        let entry_index = visible_start + bar_rows as usize + i;
-        if entry_index >= app.browser.entries.len() {
-            break;
-        }
-        let is_mcraw = app.browser.entries[entry_index].name.to_lowercase().ends_with(".mcraw");
-
-        if is_mcraw {
-            let cb_area = Rect {
-                x: browser_area.x + 2,
-                y: browser_area.y + 1 + bar_rows + i as u16,
-                width: 4,
+            let row_area = Rect {
+                x: list_area.x + 5,
+                y: list_area.y + 1 + i as u16,
+                width: list_area.width.saturating_sub(6),
                 height: 1,
             };
-            regions.push(ClickRegion { area: cb_area, action: ClickAction::ToggleBrowserSelection(entry_index) });
+            let action = if is_mcraw {
+                ClickAction::BrowserSelectAndEnter(entry_index)
+            } else {
+                ClickAction::BrowserNavigate(entry_index)
+            };
+            regions.push(ClickRegion { area: row_area, action });
         }
-
-        let row_area = Rect {
-            x: browser_area.x + 6,
-            y: browser_area.y + 1 + bar_rows + i as u16,
-            width: browser_area.width.saturating_sub(7),
-            height: 1,
-        };
-        let action = if is_mcraw {
-            ClickAction::BrowserSelectAndEnter(entry_index)
-        } else {
-            ClickAction::BrowserNavigate(entry_index)
-        };
-        regions.push(ClickRegion { area: row_area, action });
     }
 }
 
@@ -867,7 +978,47 @@ fn render_export_settings(frame: &mut Frame, app: &App, area: Rect, regions: &mu
         Line::from(""),
     ];
 
-    let base_y = area.y + 3;
+    // Active preset indicator (shown in the title and a sub-line).
+    // Truncated to fit the inner panel width so a long preset name
+    // (or the "(none — press P to pick or p to save current)" hint) never
+    // wraps onto a second row. A wrapping preset line would silently push
+    // every cycle control down by 1 row, making the touch hit regions
+    // land one row above the visible control.
+    let preset_label = "Preset:";
+    let preset_value = match &app.active_preset {
+        Some(name) => {
+            let matches = app.current_matches_preset(name);
+            let marker = if matches { "●" } else { "○" };
+            let status = if matches { " (in sync)" } else { " (modified)" };
+            format!("{} {}{}", marker, name, status)
+        }
+        None => "(none — press P to pick or p to save current)".to_string(),
+    };
+    let preset_value_display = truncate_to_width(&preset_value, max_value_width(area.width, preset_label));
+    lines.push(Line::from(Span::styled(
+        format!("  {} {}", preset_label, preset_value_display),
+        Style::default().fg(Palette::LABEL),
+    )));
+    lines.push(Line::from(""));
+
+    // The Paragraph is wrapped in Borders::ALL, so the inner content starts
+    // at area.y + 1. The lines pushed above occupy rows 1..=4 (title, blank,
+    // preset, blank), so the first control row (Codec) is at area.y + 5.
+    let base_y = area.y + 5;
+
+    // Click region covering the whole preset line — tapping the preset
+    // (active name, sync marker, or the "(none — press P to pick …)" hint)
+    // opens the preset picker, mirroring the `P` key.
+    let preset_area = Rect {
+        x: area.x + 1,
+        y: area.y + 3,
+        width: area.width.saturating_sub(2),
+        height: 1,
+    };
+    regions.push(ClickRegion {
+        area: preset_area,
+        action: ClickAction::OpenPresetPicker,
+    });
 
     // --- Codec ---
     let co_focused = app.export_focus == ExportFocus::CodecFamily && is_focused;
@@ -880,79 +1031,92 @@ fn render_export_settings(frame: &mut Frame, app: &App, area: Rect, regions: &mu
         Style::default().fg(Palette::SW_CODEC)
     };
     let codec_suffix = if is_codec_hw_available(app) { " [HW]" } else { " [SW]" };
+    let codec_value = format!("{}{}", codec_name, codec_suffix);
+    let codec_display = truncate_to_width(&codec_value, max_value_width(area.width, "Codec:"));
     lines.push(Line::from(vec![
         Span::styled("  Codec:    ", Style::default().fg(Palette::LABEL)),
-        Span::styled(codec_name, codec_style),
-        Span::styled(codec_suffix, Style::default().fg(Palette::LABEL)),
+        Span::styled(codec_display, codec_style),
     ]));
-    let co_area = Rect { x: area.x + 12, y: base_y, width: area.width.saturating_sub(14), height: 1 };
+    let co_area = Rect { x: area.x + 1, y: base_y, width: area.width.saturating_sub(2), height: 1 };
     regions.push(ClickRegion { area: co_area, action: ClickAction::CycleCodec });
 
     // --- Gamut ---
     let cs_focused = app.export_focus == ExportFocus::ColorSpace && is_focused;
+    let gamut_display = truncate_to_width(app.export_color_space.name(), max_value_width(area.width, "Gamut:"));
     lines.push(Line::from(vec![
         Span::styled("  Gamut:    ", Style::default().fg(Palette::LABEL)),
-        Span::styled(app.export_color_space.name(), if cs_focused {
+        Span::styled(gamut_display, if cs_focused {
             Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Palette::VALUE)
         }),
     ]));
-    let cs_area = Rect { x: area.x + 12, y: base_y + 1, width: area.width.saturating_sub(14), height: 1 };
+    let cs_area = Rect { x: area.x + 1, y: base_y + 1, width: area.width.saturating_sub(2), height: 1 };
     regions.push(ClickRegion { area: cs_area, action: ClickAction::CycleGamut });
 
     // --- Transfer ---
     let tf_focused = app.export_focus == ExportFocus::TransferFunction && is_focused;
+    let tf_display = truncate_to_width(app.export_transfer_function.name(), max_value_width(area.width, "Transfer:"));
     lines.push(Line::from(vec![
         Span::styled("  Transfer: ", Style::default().fg(Palette::LABEL)),
-        Span::styled(app.export_transfer_function.name(), if tf_focused {
+        Span::styled(tf_display, if tf_focused {
             Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Palette::VALUE)
         }),
     ]));
-    let tf_area = Rect { x: area.x + 12, y: base_y + 2, width: area.width.saturating_sub(14), height: 1 };
+    let tf_area = Rect { x: area.x + 1, y: base_y + 2, width: area.width.saturating_sub(2), height: 1 };
     regions.push(ClickRegion { area: tf_area, action: ClickAction::CycleTransfer });
 
     // --- Profile ---
     let pr_focused = app.export_focus == ExportFocus::Profile && is_focused;
+    let profile_display = truncate_to_width(app.active_profile_name(), max_value_width(area.width, "Profile:"));
     lines.push(Line::from(vec![
         Span::styled("  Profile:  ", Style::default().fg(Palette::LABEL)),
-        Span::styled(app.active_profile_name(), if pr_focused {
+        Span::styled(profile_display, if pr_focused {
             Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Palette::VALUE)
         }),
     ]));
-    let pr_area = Rect { x: area.x + 12, y: base_y + 3, width: area.width.saturating_sub(14), height: 1 };
+    let pr_area = Rect { x: area.x + 1, y: base_y + 3, width: area.width.saturating_sub(2), height: 1 };
     regions.push(ClickRegion { area: pr_area, action: ClickAction::CycleProfile });
 
     // --- Rate ---
     if show_rate {
         let rc_focused = app.export_focus == ExportFocus::RateControl && is_focused;
+        let rate_display = truncate_to_width(&app.active_rate_control.name(), max_value_width(area.width, "Rate:"));
         lines.push(Line::from(vec![
             Span::styled("  Rate:     ", Style::default().fg(Palette::LABEL)),
-            Span::styled(app.active_rate_control.name(), if rc_focused {
+            Span::styled(rate_display, if rc_focused {
                 Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Palette::VALUE)
             }),
         ]));
-        let rc_area = Rect { x: area.x + 12, y: base_y + 4, width: area.width.saturating_sub(14), height: 1 };
+        let rc_area = Rect { x: area.x + 1, y: base_y + 4, width: area.width.saturating_sub(2), height: 1 };
         regions.push(ClickRegion { area: rc_area, action: ClickAction::CycleRate });
     }
 
     lines.push(Line::from(""));
     if let Some(ref folder) = app.export_folder {
-        let disp = folder.to_string_lossy();
+        let disp = folder.to_string_lossy().to_string();
+        let out_max = max_value_width(area.width, "OutFolder:");
+        let out_display = truncate_to_width(&disp, out_max);
         lines.push(Line::from(vec![
             Span::styled("  OutFolder: ", Style::default().fg(Palette::LABEL)),
-            Span::styled(if disp.len() > 30 { format!("...{}", &disp[disp.len().saturating_sub(30)..]) } else { disp.to_string() }, Style::default().fg(Palette::VALUE)),
+            Span::styled(out_display, Style::default().fg(Palette::VALUE)),
         ]));
     } else {
-        lines.push(Line::from(Span::styled("  OutFolder: (default)  [o] set via browser", Style::default().fg(Palette::LABEL))));
+        let hint = "(default)  [o] set via browser";
+        let out_max = max_value_width(area.width, "OutFolder:");
+        let out_display = truncate_to_width(hint, out_max);
+        lines.push(Line::from(Span::styled(
+            format!("  OutFolder: {}", out_display),
+            Style::default().fg(Palette::LABEL),
+        )));
     }
-    lines.push(Line::from(Span::styled("  [c] Codec  [g] Gamut  [t] Transfer  [p] Profile  [r] Rate", Style::default().fg(Color::White))));
+    lines.push(Line::from(Span::styled("  [c] Codec  [g] Gamut  [t] Transfer  [r] Rate  [P] Pick preset  [p] Save preset", Style::default().fg(Color::White))));
 
     let panel = Paragraph::new(lines)
         .block(
@@ -973,6 +1137,34 @@ fn is_codec_hw_available(app: &App) -> bool {
         CodecFamily::ProRes => app.hardware_caps.prores_is_hw,
         CodecFamily::DNxHR | CodecFamily::VP9 => false,
     }
+}
+
+/// Maximum display width available for a value on a control row, accounting
+/// for the row's 2-space indent, label, padding, and the 1-col inner border
+/// on each side of the panel. Returns at least 1 so a single char always fits.
+fn max_value_width(panel_width: u16, label: &str) -> usize {
+    // panel_width includes both borders; inner is panel_width - 2.
+    // Row uses 2-space indent + label + 1-space minimum separator.
+    let inner = panel_width.saturating_sub(2) as usize;
+    let reserved = 2 + label.chars().count() + 1;
+    inner.saturating_sub(reserved).max(1)
+}
+
+/// Truncate `s` to at most `max_chars` characters, appending an ellipsis
+/// when truncation happens so the user sees the value was clipped (not
+/// silently cut off mid-word).
+fn truncate_to_width(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+    let keep = max_chars - 1;
+    let mut out: String = s.chars().take(keep).collect();
+    out.push('…');
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1180,8 +1372,8 @@ fn render_import_popup(frame: &mut Frame, area: Rect, app: &App, regions: &mut V
         Line::from(""),
     ];
 
-    let mut opt1_y = 0u16;
-    let mut opt2_y = 0u16;
+    let mut opt1_idx: Option<usize> = None;
+    let mut opt2_idx: Option<usize> = None;
 
     if let ImportPopupState::DroppedFiles { files, folder, all_in_folder } = &app.import_popup {
         let dropped_count = files.len();
@@ -1208,12 +1400,12 @@ fn render_import_popup(frame: &mut Frame, area: Rect, app: &App, regions: &mut V
         lines.push(Line::from(Span::styled(format!("  Total in folder: {} .mcraw files", folder_count), Style::default().fg(Color::DarkGray))));
         lines.push(Line::from(""));
 
-        opt1_y = popup_area.y + 9;
         lines.push(Line::from(Span::styled("  [1] Import dropped file(s) only", Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD))));
+        opt1_idx = Some(lines.len() - 1);
 
         if has_option2 {
-            opt2_y = popup_area.y + 10;
             lines.push(Line::from(Span::styled(format!("  [2] Import all {} file(s) in folder", folder_count), Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD))));
+            opt2_idx = Some(lines.len() - 1);
         }
 
         lines.push(Line::from(""));
@@ -1230,12 +1422,15 @@ fn render_import_popup(frame: &mut Frame, area: Rect, app: &App, regions: &mut V
         .wrap(Wrap { trim: false });
     frame.render_widget(popup, popup_area);
 
-    // Option 1 click region
-    if opt1_y > 0 {
+    // The Paragraph is wrapped in Borders::ALL, so the first line of content
+    // is at `popup_area.y + 1`. Derive each option's y from the line index
+    // recorded above so the click target always lands on the rendered text,
+    // regardless of how many dropped-file rows were pushed beforehand.
+    if let Some(idx) = opt1_idx {
         regions.push(ClickRegion {
             area: Rect {
                 x: popup_area.x + 2,
-                y: opt1_y,
+                y: popup_area.y + 1 + idx as u16,
                 width: popup_area.width.saturating_sub(4),
                 height: 1,
             },
@@ -1243,12 +1438,11 @@ fn render_import_popup(frame: &mut Frame, area: Rect, app: &App, regions: &mut V
         });
     }
 
-    // Option 2 click region
-    if opt2_y > 0 {
+    if let Some(idx) = opt2_idx {
         regions.push(ClickRegion {
             area: Rect {
                 x: popup_area.x + 2,
-                y: opt2_y,
+                y: popup_area.y + 1 + idx as u16,
                 width: popup_area.width.saturating_sub(4),
                 height: 1,
             },
@@ -1603,7 +1797,9 @@ fn render_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         Line::from(Span::styled("  Export Settings", Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD))),
         Line::from(Span::styled("  e          Focus export settings", Style::default().fg(Palette::VALUE))),
-        Line::from(Span::styled("  c/g/t/p/r  Cycle codec/gamut/transfer/profile/rate", Style::default().fg(Palette::VALUE))),
+        Line::from(Span::styled("  c/g/t/r    Cycle codec/gamut/transfer/rate", Style::default().fg(Palette::VALUE))),
+        Line::from(Span::styled("  P          Open preset picker (apply saved preset)", Style::default().fg(Palette::VALUE))),
+        Line::from(Span::styled("  p          Save current settings as preset", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  i          Edit custom rate (when export focused)", Style::default().fg(Palette::VALUE))),
         Line::from(""),
         Line::from(Span::styled("  Browser", Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD))),
@@ -1613,7 +1809,9 @@ fn render_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::styled("  I          Import selected .mcraw", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  L          Load all .mcraw in folder", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  o          Set export folder to browser path", Style::default().fg(Palette::VALUE))),
-        Line::from(Span::styled("  F          Toggle favourite folder", Style::default().fg(Palette::VALUE))),
+        Line::from(Span::styled("  F          Toggle favourite folder (current)", Style::default().fg(Palette::VALUE))),
+        Line::from(Span::styled("  f          Toggle favourites list view (keyboard nav)", Style::default().fg(Palette::VALUE))),
+        Line::from(Span::styled("  Delete     Remove selected favourite (in list view)", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  .          Toggle hidden files", Style::default().fg(Palette::VALUE))),
         Line::from(""),
         Line::from(Span::styled("  Culling", Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD))),
@@ -1732,4 +1930,181 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+// ---------------------------------------------------------------------------
+// Preset picker
+// ---------------------------------------------------------------------------
+
+fn render_preset_picker(frame: &mut Frame, area: Rect, app: &App) {
+    let popup = centered_rect(70, 70, area);
+    frame.render_widget(Clear, popup);
+
+    let total = app.presets.len();
+    let title = if total == 0 {
+        " Presets (none saved — press p in Export Settings to save current) ".to_string()
+    } else {
+        format!(" Presets ({}) — Enter applies · Delete removes · Esc closes ", total)
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    if total == 0 {
+        lines.push(Line::from(Span::styled(
+            "  No presets yet.",
+            Style::default().fg(Palette::LABEL),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  Focus the Export Settings panel and press [p] to save the current configuration.",
+            Style::default().fg(Palette::LABEL),
+        )));
+        lines.push(Line::from(""));
+    } else {
+        for (i, p) in app.presets.iter().enumerate() {
+            let is_sel = i == app.preset_picker.index;
+            let marker = if is_sel { "> " } else { "  " };
+            let active = app.active_preset.as_deref() == Some(p.name.as_str());
+            let synced = app.current_matches_preset(&p.name);
+            let dot = if active && synced { "●" } else if active { "○" } else { " " };
+            let summary = format!(
+                "{} · {} · {}",
+                p.codec_family.name(),
+                p.color_space.name(),
+                p.transfer_function.name()
+            );
+            let rate = p.rate_control.name();
+            let name_style = if is_sel {
+                Style::default()
+                    .fg(Palette::FOCUSED)
+                    .add_modifier(Modifier::BOLD)
+                    .bg(Palette::HIGHLIGHT_BG)
+            } else {
+                Style::default().fg(Palette::VALUE).add_modifier(Modifier::BOLD)
+            };
+            let meta_style = if is_sel {
+                Style::default().fg(Palette::FOCUSED).bg(Palette::HIGHLIGHT_BG)
+            } else {
+                Style::default().fg(Palette::LABEL)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{}{} ", marker, dot), name_style),
+                Span::styled(format!("{:<20}", truncate(&p.name, 20)), name_style),
+                Span::styled(format!("{:<40}", truncate(&summary, 40)), meta_style),
+                Span::styled(truncate(&rate, 18), meta_style),
+            ]));
+        }
+        lines.push(Line::from(""));
+        if let Some(p) = app.presets.get(app.preset_picker.index) {
+            lines.push(Line::from(vec![
+                Span::styled("  Codec: ", Style::default().fg(Palette::LABEL)),
+                Span::styled(p.codec_family.name(), Style::default().fg(Palette::VALUE)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  Gamut: ", Style::default().fg(Palette::LABEL)),
+                Span::styled(p.color_space.name(), Style::default().fg(Palette::VALUE)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  Trans: ", Style::default().fg(Palette::LABEL)),
+                Span::styled(p.transfer_function.name(), Style::default().fg(Palette::VALUE)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  Rate:  ", Style::default().fg(Palette::LABEL)),
+                Span::styled(p.rate_control.name(), Style::default().fg(Palette::VALUE)),
+            ]));
+            if let Some(folder) = &p.export_folder {
+                let disp = folder.display().to_string();
+                let trimmed = if disp.len() > 60 {
+                    format!("…{}", &disp[disp.len().saturating_sub(59)..])
+                } else {
+                    disp
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("  Out:   ", Style::default().fg(Palette::LABEL)),
+                    Span::styled(trimmed, Style::default().fg(Palette::VALUE)),
+                ]));
+            }
+        }
+    }
+
+    lines.push(Line::from(""));
+    if let Some(ref msg) = app.preset_picker.message {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", msg),
+            Style::default().fg(Palette::SUCCESS),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  ↑/↓ navigate · Enter apply · Delete remove · Esc close",
+            Style::default().fg(Palette::LABEL),
+        )));
+    }
+
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Palette::BORDER_FOCUSED))
+                .title_style(Style::default().fg(Palette::POPUP_TITLE).add_modifier(Modifier::BOLD)),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, popup);
+}
+
+fn render_preset_naming(frame: &mut Frame, area: Rect, app: &App) {
+    let popup = centered_rect(60, 25, area);
+    frame.render_widget(Clear, popup);
+
+    let naming = app.preset_naming.as_ref().expect("naming state set");
+    let display_name = if naming.name.is_empty() { " ".to_string() } else { naming.name.clone() };
+
+    let lines = vec![
+        Line::from(Span::styled("  Save current export settings as preset", Style::default().fg(Palette::POPUP_TITLE).add_modifier(Modifier::BOLD))),
+        Line::from(""),
+        Line::from(Span::styled("  Name:", Style::default().fg(Palette::LABEL))),
+        Line::from(Span::styled(
+            format!("  > {}_", display_name),
+            Style::default().fg(Palette::VALUE).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Summary (saved into preset):",
+            Style::default().fg(Palette::LABEL),
+        )),
+        Line::from(Span::styled(
+            format!("    {} · {} · {} · {}",
+                app.export_codec_family.name(),
+                app.export_color_space.name(),
+                app.export_transfer_function.name(),
+                app.active_rate_control.name(),
+            ),
+            Style::default().fg(Palette::VALUE),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Enter to save · Esc to cancel",
+            Style::default().fg(Palette::LABEL),
+        )),
+    ];
+
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Save Preset ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Palette::BORDER_FOCUSED)),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, popup);
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else if max <= 1 {
+        "…".to_string()
+    } else {
+        let mut out: String = s.chars().take(max - 1).collect();
+        out.push('…');
+        out
+    }
 }

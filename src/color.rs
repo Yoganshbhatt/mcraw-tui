@@ -17,21 +17,24 @@ pub trait TransferFunctionProcessor {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorSpace {
-    Rec709, Rec2020, DciP3, Srgb, SGamut3Cine, SGamut3, ARRIWideGamut3, ARRIWideGamut4,
-    CanonCinemaGamut, PanasonicVGamut, FGamut, FGamutC, DaVinciWideGamut, ACESAP1, DisplayP3,
+    ACESAP1, ARRIWideGamut3, ARRIWideGamut4, CanonCinemaGamut, DaVinciWideGamut,
+    DciP3, DisplayP3, FGamut, FGamutC, PanasonicVGamut, Rec2020, Rec709, SGamut3,
+    SGamut3Cine, Srgb,
 }
 
 impl ColorSpace {
     pub fn name(&self) -> &'static str {
         match self {
-            ColorSpace::Rec709 => "Rec.709", ColorSpace::Rec2020 => "Rec.2020",
-            ColorSpace::DciP3 => "DCI-P3", ColorSpace::Srgb => "sRGB",
-            ColorSpace::SGamut3Cine => "S-Gamut3.Cinema", ColorSpace::SGamut3 => "S-Gamut3",
+            ColorSpace::ACESAP1 => "ACES AP1",
             ColorSpace::ARRIWideGamut3 => "ARRI Wide Gamut 3", ColorSpace::ARRIWideGamut4 => "ARRI Wide Gamut 4",
-            ColorSpace::CanonCinemaGamut => "Canon Cinema Gamut", ColorSpace::PanasonicVGamut => "Panasonic V-Gamut",
+            ColorSpace::CanonCinemaGamut => "Canon Cinema Gamut",
+            ColorSpace::DaVinciWideGamut => "DaVinci Wide Gamut",
+            ColorSpace::DciP3 => "DCI-P3", ColorSpace::DisplayP3 => "Display P3",
             ColorSpace::FGamut => "F-Gamut", ColorSpace::FGamutC => "F-Gamut C",
-            ColorSpace::DaVinciWideGamut => "DaVinci Wide Gamut", ColorSpace::ACESAP1 => "ACES AP1",
-            ColorSpace::DisplayP3 => "Display P3",
+            ColorSpace::PanasonicVGamut => "Panasonic V-Gamut",
+            ColorSpace::Rec2020 => "Rec.2020", ColorSpace::Rec709 => "Rec.709",
+            ColorSpace::SGamut3 => "S-Gamut3", ColorSpace::SGamut3Cine => "S-Gamut3.Cinema",
+            ColorSpace::Srgb => "sRGB",
         }
     }
 
@@ -62,7 +65,12 @@ impl ColorSpace {
     }
 
     pub fn all() -> &'static [ColorSpace] {
-        &[ColorSpace::Rec709, ColorSpace::Rec2020, ColorSpace::DciP3, ColorSpace::Srgb, ColorSpace::SGamut3Cine, ColorSpace::SGamut3, ColorSpace::ARRIWideGamut3, ColorSpace::ARRIWideGamut4, ColorSpace::CanonCinemaGamut, ColorSpace::PanasonicVGamut, ColorSpace::FGamut, ColorSpace::FGamutC, ColorSpace::DaVinciWideGamut, ColorSpace::ACESAP1, ColorSpace::DisplayP3]
+        // Alphabetical order for deterministic, pleasing cycle order.
+        &[ColorSpace::ACESAP1, ColorSpace::ARRIWideGamut3, ColorSpace::ARRIWideGamut4,
+          ColorSpace::CanonCinemaGamut, ColorSpace::DaVinciWideGamut, ColorSpace::DciP3,
+          ColorSpace::DisplayP3, ColorSpace::FGamut, ColorSpace::FGamutC,
+          ColorSpace::PanasonicVGamut, ColorSpace::Rec2020, ColorSpace::Rec709,
+          ColorSpace::SGamut3, ColorSpace::SGamut3Cine, ColorSpace::Srgb]
     }
     pub fn next(self) -> Self { let all = Self::all(); let pos = all.iter().position(|&x| x == self).unwrap_or(0); all[(pos + 1) % all.len()] }
     pub fn prev(self) -> Self { let all = Self::all(); let pos = all.iter().position(|&x| x == self).unwrap_or(0); all[(pos + all.len() - 1) % all.len()] }
@@ -70,19 +78,22 @@ impl ColorSpace {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferFunction {
-    Linear, Rec709, SLog3, VLog, ARRIlog3, CLog3, FLog2, AppleLog, AppleLog2, ACESCCT, PQ, HLG, DaVinciIntermediate, Gamma24,
+    ACESCCT, ARRIlog3, ARRIlog4, AppleLog, AppleLog2, CLog3, DaVinciIntermediate,
+    FLog2, Gamma24, HLG, Linear, PQ, Rec709, SLog3, VLog,
 }
 
 impl TransferFunction {
     pub fn name(&self) -> &'static str {
         match self {
-            TransferFunction::Linear => "Linear", TransferFunction::Rec709 => "Rec.709",
+            TransferFunction::ACESCCT => "ACES CCT",
+            TransferFunction::ARRIlog3 => "ARRI LogC3", TransferFunction::ARRIlog4 => "ARRI LogC4",
+            TransferFunction::AppleLog => "Apple Log", TransferFunction::AppleLog2 => "Apple Log 2",
+            TransferFunction::CLog3 => "C-Log3",
+            TransferFunction::DaVinciIntermediate => "DaVinci Intermediate",
+            TransferFunction::FLog2 => "F-Log2", TransferFunction::Gamma24 => "Gamma 2.4",
+            TransferFunction::HLG => "HLG (BT.2100)", TransferFunction::Linear => "Linear",
+            TransferFunction::PQ => "PQ (ST.2084)", TransferFunction::Rec709 => "Rec.709",
             TransferFunction::SLog3 => "S-Log3", TransferFunction::VLog => "V-Log",
-            TransferFunction::ARRIlog3 => "ARRI LogC3", TransferFunction::CLog3 => "C-Log3",
-            TransferFunction::FLog2 => "F-Log2", TransferFunction::AppleLog => "Apple Log",
-            TransferFunction::AppleLog2 => "Apple Log 2", TransferFunction::ACESCCT => "ACES CCT",
-            TransferFunction::PQ => "PQ (ST.2084)", TransferFunction::HLG => "HLG (BT.2100)",
-            TransferFunction::DaVinciIntermediate => "DaVinci Intermediate", TransferFunction::Gamma24 => "Gamma 2.4",
         }
     }
 
@@ -96,6 +107,7 @@ impl TransferFunction {
     /// | `SLog3`          | Sony "S-Log3 Technical Summary" (Sept 2014) — coefficients `0.432699`, `10`, `0.037584`, knee at `0.01` |
     /// | `VLog`           | Panasonic "V-Log/V-Gamut Reference Manual" (2014) — `5.6x+0.125` / `0.241514*log10(x+0.00873)+0.598206`, knee at `0.01` |
     /// | `ARRIlog3`       | ARRI "LogC-3 Logarithmic Color Space" spec (2020), EI 800 variant |
+    /// | `ARRIlog4`       | ARRI "LogC4 Encoding Function" (Cooper & Brendel, 2022; ALEV4 / Alexa 35), EI-independent |
     /// | `CLog3`          | Canon Cinema EOS C-Log3 characteristics (2016) — three-segment with negative-side graft |
     /// | `FLog2`          | Fujifilm "F-Log2 Data Sheet" (2021) — Fujifilm-internal anchor at `0.000889` |
     /// | `AppleLog`/`AppleLog2` | Apple "Apple Log Profile White Paper" (Sept 2023) — `R0=-0.05641088`, `C=47.28711236` |
@@ -118,6 +130,23 @@ impl TransferFunction {
             TransferFunction::VLog => { pixels.par_iter_mut().for_each(|v| { let x = *v; *v = if x < 0.01 { 5.6_f32 * x + 0.125_f32 } else { 0.241514_f32 * (x + 0.00873_f32).log10() + 0.598206_f32 }; }); }
             // Source: ARRI LogC-3 spec (2020), EI 800.
             TransferFunction::ARRIlog3 => { pixels.par_iter_mut().for_each(|v| { let x = *v; *v = if x > 0.010591_f32 { 0.247190_f32 * (5.555556_f32 * x + 0.052272_f32).log10() + 0.385537_f32 } else { 5.367655_f32 * x + 0.092809_f32 }; }); }
+            // Source: ARRI "LogC4 Logarithmic Color Space SPECIFICATION"
+            // (Cooper & Brendel, 2022). EI-independent log encoding optimised
+            // for 12-bit ALEV4 sensors. Two-segment with a linear-to-log
+            // threshold at x = t ≈ -0.0180967. Constants a/b/c/s/t are
+            // defined in arri_logc4_constants() below; see also colour-
+            // science/colour (`log_encoding_ARRILogC4`).
+            TransferFunction::ARRIlog4 => {
+                let (a, b, c, s, t) = arri_logc4_constants();
+                pixels.par_iter_mut().for_each(|v| {
+                    let x = *v;
+                    *v = if x >= t {
+                        ((a * x + 64.0_f32).log2() - 6.0_f32) / 14.0_f32 * b + c
+                    } else {
+                        (x - t) / s
+                    };
+                });
+            }
             // Source: Canon C-Log3 characteristics (2016). Three-segment
             // with a negative-side log graft and a linear middle.
             TransferFunction::CLog3 => {
@@ -157,7 +186,15 @@ impl TransferFunction {
         }
     }
 
-    pub fn all() -> &'static [TransferFunction] { &[TransferFunction::Linear, TransferFunction::Rec709, TransferFunction::SLog3, TransferFunction::VLog, TransferFunction::ARRIlog3, TransferFunction::CLog3, TransferFunction::FLog2, TransferFunction::AppleLog, TransferFunction::AppleLog2, TransferFunction::ACESCCT, TransferFunction::PQ, TransferFunction::HLG, TransferFunction::DaVinciIntermediate, TransferFunction::Gamma24] }
+    pub fn all() -> &'static [TransferFunction] {
+        // Alphabetical order for deterministic, pleasing cycle order.
+        &[TransferFunction::ACESCCT, TransferFunction::ARRIlog3, TransferFunction::ARRIlog4,
+          TransferFunction::AppleLog, TransferFunction::AppleLog2, TransferFunction::CLog3,
+          TransferFunction::DaVinciIntermediate, TransferFunction::FLog2,
+          TransferFunction::Gamma24, TransferFunction::HLG, TransferFunction::Linear,
+          TransferFunction::PQ, TransferFunction::Rec709, TransferFunction::SLog3,
+          TransferFunction::VLog]
+    }
     pub fn next(self) -> Self { let all = Self::all(); let pos = all.iter().position(|&x| x == self).unwrap_or(0); all[(pos + 1) % all.len()] }
     pub fn prev(self) -> Self { let all = Self::all(); let pos = all.iter().position(|&x| x == self).unwrap_or(0); all[(pos + all.len() - 1) % all.len()] }
     pub fn is_log_bypass(&self) -> bool { !matches!(self, TransferFunction::Linear | TransferFunction::Rec709 | TransferFunction::Gamma24) }
@@ -166,6 +203,50 @@ impl TransferFunction {
 
 #[inline] pub fn rec709_oetf(x: f32) -> f32 { if x < 0.018 { 4.5 * x } else { 1.099 * x.powf(0.45) - 0.099 } }
 #[inline] pub fn rec709_eotf(x: f32) -> f32 { if x < 0.0812429 { x / 4.5 } else { ((x + 0.099) / 1.099).powf(1.0 / 0.45) } }
+
+/// ARRI LogC4 constants (a, b, c, s, t) from the 2022 LogC4 specification.
+///
+/// Derivation (Cooper & Brendel 2022, §4.1.1):
+///   a = (2^18 - 16) / 117.45
+///   b = (1023 - 95) / 1023
+///   c = 95 / 1023
+///   s = (7 · ln 2 · 2^(7 - 14·c/b)) / (a · b)
+///   t = (2^(14·(-c/b) + 6) - 64) / a
+///
+/// Cross-checked against colour-science/colour
+/// `colour.models.rgb.transfer_functions.arri` and antlerpost.com/colour-spaces/LogC4.
+pub fn arri_logc4_constants() -> (f32, f32, f32, f32, f32) {
+    let a: f32 = ((1u32 << 18) as f32 - 16.0) / 117.45;
+    let b: f32 = (1023.0 - 95.0) / 1023.0;
+    let c: f32 = 95.0 / 1023.0;
+    let s: f32 = (7.0 * std::f32::consts::LN_2 * (7.0 - 14.0 * c / b).exp2()) / (a * b);
+    let t: f32 = ((14.0 * (-c / b) + 6.0).exp2() - 64.0) / a;
+    (a, b, c, s, t)
+}
+
+/// ARRI LogC4 scene-linear → normalized log encoding (E_scene → E').
+/// Reference: ARRI "LogC4 Encoding Function" (Cooper & Brendel, 2022).
+#[inline]
+pub fn arri_logc4_oetf(x: f32) -> f32 {
+    let (a, b, c, s, t) = arri_logc4_constants();
+    if x >= t {
+        ((a * x + 64.0).log2() - 6.0) / 14.0 * b + c
+    } else {
+        (x - t) / s
+    }
+}
+
+/// ARRI LogC4 normalized log → scene-linear decoding (E' → E_scene).
+/// Reference: ARRI "LogC4 Decoding Function" (Cooper & Brendel, 2022).
+#[inline]
+pub fn arri_logc4_eotf(y: f32) -> f32 {
+    let (a, b, c, s, t) = arri_logc4_constants();
+    if y >= 0.0 {
+        ((14.0 * ((y - c) / b) + 6.0).exp2() - 64.0) / a
+    } else {
+        y * s + t
+    }
+}
 #[inline] pub fn apply_ccm(r: f32, g: f32, b: f32, ccm: &[f32; 9]) -> [f32; 3] { [r * ccm[0] + g * ccm[1] + b * ccm[2], r * ccm[3] + g * ccm[4] + b * ccm[5], r * ccm[6] + g * ccm[7] + b * ccm[8]] }
 pub fn identity_ccm() -> [f32; 9] { [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0] }
 
@@ -765,6 +846,55 @@ mod tests {
         assert!((v_low - 0.092809).abs() < 1e-4, "ARRI LogC3 at 0 = {} (want 0.092809)", v_low);
     }
 
+    /// ARRI LogC4 spot check. Cross-checked against colour-science/colour
+    /// `log_encoding_ARRILogC4` / `log_decoding_ARRILogC4`. Encoding of
+    /// 0.18 (18% grey) must be ≈ 0.2783958, and the round-trip must hold.
+    #[test]
+    fn arri_logc4_at_key_points() {
+        use crate::color::{arri_logc4_constants, arri_logc4_eotf, arri_logc4_oetf};
+        // Spot-check: constants from the spec (Cooper & Brendel, 2022).
+        // Reference values computed independently with Python and match
+        // colour-science/colour to 12+ decimal places.
+        let (a, b, c, s, t) = arri_logc4_constants();
+        assert!((a - 2231.8263091).abs() < 1e-3, "a = {} (want 2231.8263)", a);
+        assert!((b - 0.90713587).abs() < 1e-6, "b = {} (want 0.9071)", b);
+        assert!((c - 0.09286413).abs() < 1e-6, "c = {} (want 0.0929)", c);
+        assert!((s - 0.1135972).abs() < 1e-5, "s = {} (want 0.1135972)", s);
+        assert!((t - (-0.0180570)).abs() < 1e-5, "t = {} (want -0.0180570)", t);
+
+        // Spec: 18% grey → ≈ 0.2783958.
+        let v_18 = arri_logc4_oetf(0.18);
+        assert!((v_18 - 0.2783958).abs() < 1e-5, "LogC4 OETF(0.18) = {} (want 0.2783958)", v_18);
+
+        // Spec: scene-linear 1.0 → ≈ 0.4275194 (unbounded formula;
+        // the hardware form clamps to 1.0 for highlights).
+        let v_one = arri_logc4_oetf(1.0);
+        let expected_one = (((a * 1.0 + 64.0).log2() - 6.0) / 14.0) * b + c;
+        assert!((v_one - expected_one).abs() < 1e-5, "LogC4 OETF(1.0) = {} (want {})", v_one, expected_one);
+        assert!((v_one - 0.4275194).abs() < 1e-5, "LogC4 OETF(1.0) = {} (want 0.4275194)", v_one);
+
+        // Linear branch (x < t ≈ -0.018): pure slope.
+        let v_below = arri_logc4_oetf(t - 0.001);
+        let expected_below = (t - 0.001 - t) / s; // = -0.001 / s
+        assert!((v_below - expected_below).abs() < 1e-5, "LogC4 linear branch");
+
+        // Round-trip: decode the encoded 18% grey back to scene-linear.
+        let rt = arri_logc4_eotf(v_18);
+        assert!((rt - 0.18).abs() < 1e-4, "LogC4 round-trip: encode→decode(0.18) = {} (want 0.18)", rt);
+
+        // Round-trip for a couple more stops.
+        for x in [0.001_f32, 0.01, 0.1, 0.5, 2.0, 10.0] {
+            let enc = arri_logc4_oetf(x);
+            let dec = arri_logc4_eotf(enc);
+            assert!((dec - x).abs() < 1e-4, "LogC4 round-trip at x={}: encode→decode = {} (want {})", x, dec, x);
+        }
+
+        // Sanity-check the full TransferFunction::ARRIlog4 path agrees with
+        // the standalone helper (so the production code is correct).
+        let v_18_full = TransferFunction::ARRIlog4.process_apply(0.18);
+        assert!((v_18_full - v_18).abs() < 1e-5, "TransferFunction::ARRIlog4 disagrees with arri_logc4_oetf: {} vs {}", v_18_full, v_18);
+    }
+
     /// S-Log3 must follow Sony's canonical form, not the previous
     /// non-canonical coefficients. The Sony white paper gives:
     ///   x >= 0.01: V = 0.432699*log10(10x + 1) + 0.037584
@@ -803,6 +933,10 @@ impl TransferFunction {
             TransferFunction::SLog3 => if x >= 0.01_f32 { 0.432699_f32 * (10.0_f32 * x + 1.0_f32).log10() + 0.037584_f32 } else { (x * 261.5_f32 + 10.23_f32) / 1023.0_f32 },
             TransferFunction::VLog => if x < 0.01 { 5.6_f32 * x + 0.125_f32 } else { 0.241514_f32 * (x + 0.00873_f32).log10() + 0.598206_f32 },
             TransferFunction::ARRIlog3 => if x > 0.010591_f32 { 0.247190_f32 * (5.555556_f32 * x + 0.052272_f32).log10() + 0.385537_f32 } else { 5.367655_f32 * x + 0.092809_f32 },
+            TransferFunction::ARRIlog4 => {
+                let (a, b, c, s, t) = crate::color::arri_logc4_constants();
+                if x >= t { ((a * x + 64.0_f32).log2() - 6.0_f32) / 14.0_f32 * b + c } else { (x - t) / s }
+            },
             TransferFunction::CLog3 => {
                 let neg_graft_lin = (0.097465473_f32 - 0.12512219_f32) / 1.9754798_f32;
                 let pos_graft_lin = (0.15277891_f32 - 0.12512219_f32) / 1.9754798_f32;

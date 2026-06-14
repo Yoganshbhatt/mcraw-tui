@@ -53,3 +53,7 @@ dirs = "5"
 
 # URI percent-decoding for drag-drop file:// paths
 percent-encoding = "2.3"
+
+# Global allocator (D1) — mimalloc is faster than glibc malloc for
+# the large bursts the export path does (18MB + 9MB + 73MB allocs).
+mimalloc = "0.1"

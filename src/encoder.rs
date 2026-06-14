@@ -153,6 +153,17 @@ impl VideoEncoder {
             _ => {}
         }
 
+        // Move the `moov` atom to the front of the file on finalize. Without
+        // this, the MP4/MOV muxer writes `moov` after all `mdat` chunks, so
+        // players (VLC, mpv, browser <video>) have to scan the whole file
+        // before they can seek or start playback. Cost: ~1-2 s at finalize.
+        // Harmless for codecs that don't use a moov box (DNG, raw streams).
+        if output_path.to_lowercase().ends_with(".mp4")
+            || output_path.to_lowercase().ends_with(".mov")
+        {
+            cmd.args(["-movflags", "+faststart"]);
+        }
+
         // NOTE: VUI signalling (color_primaries / color_trc / colorspace) is
         // passed through `extra_args` and propagates automatically to libx264
         // and libx265. We deliberately do **not** emit hard-coded

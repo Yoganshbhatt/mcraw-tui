@@ -8,6 +8,7 @@ use crate::encoder::VideoEncoder;
 use crate::export::{Av1Profile, CodecFamily, DnxhrProfile, H264Profile, HevcProfile, ProResProfile, RateControl, Vp9Profile};
 use crate::file::McrawFileInfo;
 use crate::gpu;
+use crate::stats::{PhaseGuard, PipelineStats};
 use anyhow::{anyhow, Result};
 use crossbeam_channel::bounded;
 use rayon::prelude::*;
@@ -15,6 +16,7 @@ use std::fs;
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 const PIPELINE_DEPTH: usize = 3;
 struct FrameSlot { bayer: Vec<u16>, frame_bytes: Vec<u8>, as_shot_neutral: [f32; 3] }
@@ -73,6 +75,7 @@ pub fn get_ffmpeg_vui_tags(color_space: &ColorSpace, transfer: &TransferFunction
 
 pub fn run_naked(info: &McrawFileInfo, output_path: &str) -> Result<()> {
     tracing::info!("run_naked: input={} output={}", info.path, output_path);
+    let _stats = Arc::new(PipelineStats::new());
     let decoder = Decoder::new(&info.path)?; let timestamps = decoder.timestamps()?;
     if timestamps.is_empty() { return Err(anyhow!("No frames found in file")); }
     let mut out_file = fs::File::create(output_path)?;
@@ -82,12 +85,14 @@ pub fn run_naked(info: &McrawFileInfo, output_path: &str) -> Result<()> {
 
 pub fn run(info: &McrawFileInfo, output_path: &str) -> Result<()> {
     let never_cancel = Arc::new(AtomicBool::new(false));
-    run_export(info.clone(), output_path.to_string(), Arc::new(|_| {}), never_cancel, ColorSpace::Rec709, TransferFunction::Rec709, CodecFamily::ProRes, ProResProfile::HQ, DnxhrProfile::HQX, HevcProfile::Main10_420, H264Profile::Main8bit, Av1Profile::Profile0_420_10bit, Vp9Profile::Profile2_420_10bit, "libx265".to_string(), "libx264".to_string(), "libaom-av1".to_string(), "prores_ks".to_string(), RateControl::Lossless)
+    let stats = Arc::new(PipelineStats::new());
+    run_export(info.clone(), output_path.to_string(), Arc::new(|_| {}), never_cancel, stats, ColorSpace::Rec709, TransferFunction::Rec709, CodecFamily::ProRes, ProResProfile::HQ, DnxhrProfile::HQX, HevcProfile::Main10_420, H264Profile::Main8bit, Av1Profile::Profile0_420_10bit, Vp9Profile::Profile2_420_10bit, "libx265".to_string(), "libx264".to_string(), "libaom-av1".to_string(), "prores_ks".to_string(), RateControl::Lossless)
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn Fn(f64) + Send + Sync>, cancelled: Arc<AtomicBool>, export_cs: ColorSpace, export_tf: TransferFunction, codec_family: CodecFamily, prores_profile: ProResProfile, dnxhr_profile: DnxhrProfile, hevc_profile: HevcProfile, h264_profile: H264Profile, av1_profile: Av1Profile, vp9_profile: Vp9Profile, hevc_encoder: String, h264_encoder: String, av1_encoder: String, prores_encoder: String, rate_control: RateControl) -> Result<()> {
+pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn Fn(f64) + Send + Sync>, cancelled: Arc<AtomicBool>, stats: Arc<PipelineStats>, export_cs: ColorSpace, export_tf: TransferFunction, codec_family: CodecFamily, prores_profile: ProResProfile, dnxhr_profile: DnxhrProfile, hevc_profile: HevcProfile, h264_profile: H264Profile, av1_profile: Av1Profile, vp9_profile: Vp9Profile, hevc_encoder: String, h264_encoder: String, av1_encoder: String, prores_encoder: String, rate_control: RateControl) -> Result<()> {
     tracing::info!("run_export: input={} output={} codec={} cs={} tf={}", info.path, output_path, codec_family.name(), export_cs.name(), export_tf.name());
+    let setup_start = Instant::now();
     let decoder = Decoder::new(&info.path)?; let timestamps = decoder.timestamps()?;
     if timestamps.is_empty() { return Err(anyhow!("No frames found in file")); }
     let stride_width = info.width as u32; let offset_x = info.active_offset_x as u32; let offset_y = info.active_offset_y as u32;
@@ -216,15 +221,24 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
         Ok(ctx) => { let ctx = std::sync::Arc::new(ctx); match gpu::RcdPipeline::new(ctx, active_width, active_height) { Ok(pipeline) => { rcd_pipeline = Some(pipeline); } Err(_) => {} } }
         Err(_) => {}
     }
+    stats.setup.record(setup_start.elapsed());
     
     let loader_handle = std::thread::Builder::new().name("loader".into()).spawn({
         let cancelled = cancelled.clone();
+        let stats = Arc::clone(&stats);
         move || -> Result<()> {
-            for ts in &timestamps {
+            for (i, ts) in timestamps.iter().enumerate() {
                 if cancelled.load(Ordering::Relaxed) { break; }
                 let mut slot = free_rx.recv().map_err(|_| anyhow!("Loader: free pool closed"))?;
-                let (bayer, frame_meta) = decoder.load_frame(*ts)?;
-                slot.bayer = bayer; slot.as_shot_neutral = frame_meta.as_shot_neutral;
+                let as_shot_neutral = {
+                    let _g = PhaseGuard::new(&stats.decode);
+                    decoder.load_frame_into(*ts, &mut slot.bayer)?
+                };
+                slot.as_shot_neutral = as_shot_neutral;
+                // B4: hint the OS to prefetch the next frame's range.
+                if let Some(next_ts) = timestamps.get(i + 1) {
+                    decoder.prefetch(*next_ts);
+                }
                 loaded_tx.send(slot).map_err(|_| anyhow!("Loader: processor channel closed"))?;
             }
             drop(loaded_tx); Ok(())
@@ -237,10 +251,12 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
 
     let processor_handle = std::thread::Builder::new().name("processor".into()).spawn({
         let cancelled = cancelled.clone();
+        let stats = Arc::clone(&stats);
         move || -> Result<()> {
             let mut rgb = vec![0.0f32; pixel_count * 3]; let demosaic = BilinearDemosaic::new(pattern);
             for mut slot in loaded_rx {
                 if cancelled.load(Ordering::Relaxed) { break; }
+                stats.frames_total.fetch_add(1, Ordering::Relaxed);
                 slot.frame_bytes.fill(0); let as_shot = slot.as_shot_neutral;
 
                 // Per-frame fused matrix. Three cases:
@@ -294,20 +310,28 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
                 };
 
                 let gpu_ok = if let Some(ref mut pipeline) = rcd_pipeline {
-                    match pipeline.process(&slot.bayer, filters, black_level as f32, white_level as f32, stride_width, offset_x, offset_y, &fused, &slot.as_shot_neutral, &export_tf) {
-                        Ok(packed) => {
-                            slot.frame_bytes.par_chunks_exact_mut(6).enumerate().for_each(|(pi, out)| {
-                                let p0 = packed[pi * 2]; let p1 = packed[pi * 2 + 1];
-                                let r = (p0 & 0xFFFF) as u16; let g = ((p0 >> 16) & 0xFFFF) as u16; let b = (p1 & 0xFFFF) as u16;
-                                out[0] = r as u8; out[1] = (r >> 8) as u8; out[2] = g as u8; out[3] = (g >> 8) as u8; out[4] = b as u8; out[5] = (b >> 8) as u8;
-                            }); true
+                    let gpu_result = {
+                        let _g = PhaseGuard::new(&stats.gpu);
+                        pipeline.process(&slot.bayer, filters, black_level as f32, white_level as f32, stride_width, offset_x, offset_y, &fused, &slot.as_shot_neutral, &export_tf)
+                    };
+                    match gpu_result {
+                        Ok(rgb48le) => {
+                            stats.gpu_frames.fetch_add(1, Ordering::Relaxed);
+                            slot.frame_bytes.copy_from_slice(&rgb48le);
+                            true
                         } Err(_) => false
                     }
                 } else { false };
-                
+
                 if !gpu_ok {
-                    demosaic.process_par_into(&slot.bayer, stride_width, offset_x, offset_y, active_width, active_height, &pattern, &mut rgb)?;
-                    normalize_linear_f32(&mut rgb, black_level as f32, white_level as f32);
+                    {
+                        let _g = PhaseGuard::new(&stats.demosaic);
+                        demosaic.process_par_into(&slot.bayer, stride_width, offset_x, offset_y, active_width, active_height, &pattern, &mut rgb)?;
+                    }
+                    {
+                        let _g = PhaseGuard::new(&stats.normalize);
+                        normalize_linear_f32(&mut rgb, black_level as f32, white_level as f32);
+                    }
 
                     let raw_r_gain = if as_shot[0] > 1e-6 && as_shot[1] > 1e-6 { as_shot[1] / as_shot[0] } else { 1.0 };
                     let raw_b_gain = if as_shot[2] > 1e-6 && as_shot[1] > 1e-6 { as_shot[1] / as_shot[2] } else { 1.0 };
@@ -320,36 +344,45 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
                             as_shot, raw_r_gain, raw_b_gain, r_gain, b_gain
                         );
                     }
-                    rgb.par_chunks_exact_mut(3).for_each(|chunk| {
-                        // 1. Apply WB
-                        let r = chunk[0] * r_gain;
-                        let g = chunk[1];
-                        let b = chunk[2] * b_gain;
+                    {
+                        let _g = PhaseGuard::new(&stats.wb_hl_ccm);
+                        rgb.par_chunks_exact_mut(3).for_each(|chunk| {
+                            // 1. Apply WB
+                            let r = chunk[0] * r_gain;
+                            let g = chunk[1];
+                            let b = chunk[2] * b_gain;
 
-                        // 2. Highlight reconstruction — desaturate toward
-                        //    neutral (post-WB max clamped to 1) when the
-                        //    pixel is blown. Triggered per-pixel so
-                        //    single-channel clips no longer go magenta.
-                        let max_val = r.max(g).max(b);
-                        let neutral = max_val.min(1.0);
-                        let t = if max_val > 0.95f32 { ((max_val - 0.95) / 0.05).min(1.0) } else { 0.0 };
-                        let (r, g, b) = if t > 0.0 {
-                            (r + (neutral - r) * t, g + (neutral - g) * t, b + (neutral - b) * t)
-                        } else {
-                            (r, g, b)
-                        };
+                            // 2. Highlight reconstruction — desaturate toward
+                            //    neutral (post-WB max clamped to 1) when the
+                            //    pixel is blown. Triggered per-pixel so
+                            //    single-channel clips no longer go magenta.
+                            let max_val = r.max(g).max(b);
+                            let neutral = max_val.min(1.0);
+                            let t = if max_val > 0.95f32 { ((max_val - 0.95) / 0.05).min(1.0) } else { 0.0 };
+                            let (r, g, b) = if t > 0.0 {
+                                (r + (neutral - r) * t, g + (neutral - g) * t, b + (neutral - b) * t)
+                            } else {
+                                (r, g, b)
+                            };
 
-                        // 3. Apply CCM (on WB'd values — standard pipeline)
-                        let out = mat_mul_vec3(&fused, &[r, g, b]);
-                        chunk[0] = out[0].max(0.0); chunk[1] = out[1].max(0.0); chunk[2] = out[2].max(0.0);
-                    });
-                    export_tf.process(&mut rgb);
-                    
-                    slot.frame_bytes.par_chunks_exact_mut(6).enumerate().for_each(|(pi, out)| {
-                        let base = pi * 3;
-                        let ru = (rgb[base].clamp(0.0, 1.0) * 65535.0) as u16; let gu = (rgb[base + 1].clamp(0.0, 1.0) * 65535.0) as u16; let bu = (rgb[base + 2].clamp(0.0, 1.0) * 65535.0) as u16;
-                        out[0] = ru as u8; out[1] = (ru >> 8) as u8; out[2] = gu as u8; out[3] = (gu >> 8) as u8; out[4] = bu as u8; out[5] = (bu >> 8) as u8;
-                    });
+                            // 3. Apply CCM (on WB'd values — standard pipeline)
+                            let out = mat_mul_vec3(&fused, &[r, g, b]);
+                            chunk[0] = out[0].max(0.0); chunk[1] = out[1].max(0.0); chunk[2] = out[2].max(0.0);
+                        });
+                    }
+                    {
+                        let _g = PhaseGuard::new(&stats.oetf);
+                        export_tf.process(&mut rgb);
+                    }
+
+                    {
+                        let _g = PhaseGuard::new(&stats.pack);
+                        slot.frame_bytes.par_chunks_exact_mut(6).enumerate().for_each(|(pi, out)| {
+                            let base = pi * 3;
+                            let ru = (rgb[base].clamp(0.0, 1.0) * 65535.0) as u16; let gu = (rgb[base + 1].clamp(0.0, 1.0) * 65535.0) as u16; let bu = (rgb[base + 2].clamp(0.0, 1.0) * 65535.0) as u16;
+                            out[0] = ru as u8; out[1] = (ru >> 8) as u8; out[2] = gu as u8; out[3] = (gu >> 8) as u8; out[4] = bu as u8; out[5] = (bu >> 8) as u8;
+                        });
+                    }
                 }
                 processed_tx.send(slot).map_err(|_| anyhow!("Processor: writer channel closed"))?;
             }
@@ -365,14 +398,27 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
         if pid > 0 { #[cfg(target_os = "windows")] { let _ = std::process::Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).output(); } #[cfg(not(target_os = "windows"))] { let _ = std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).output(); } }
     }).ok();
     
-    let writer_handle = std::thread::Builder::new().name("writer".into()).spawn(move || -> Result<()> {
-        let mut frames_written: usize = 0;
-        for slot in processed_rx {
-            if writer_cancelled.load(Ordering::Relaxed) { let _ = free_tx_writer.send(slot); return Ok(()); }
-            encoder.push_frame(&slot.frame_bytes)?; frames_written += 1; on_progress(frames_written as f64 / total_frames as f64 * 100.0); let _ = free_tx_writer.send(slot);
+    let writer_handle = std::thread::Builder::new().name("writer".into()).spawn({
+        let stats = Arc::clone(&stats);
+        move || -> Result<()> {
+            let mut frames_written: usize = 0;
+            for slot in processed_rx {
+                if writer_cancelled.load(Ordering::Relaxed) { let _ = free_tx_writer.send(slot); return Ok(()); }
+                // C5: explicit start/end so we can tag the per-frame ring
+                // with the frame_id. The `encode_push` PhaseTimer is still
+                // updated (via record_encode_push_frame) for the histogram.
+                let encode_start = std::time::Instant::now();
+                encoder.push_frame(&slot.frame_bytes)?;
+                stats.record_encode_push_frame(frames_written as u32, encode_start.elapsed());
+                frames_written += 1; on_progress(frames_written as f64 / total_frames as f64 * 100.0); let _ = free_tx_writer.send(slot);
+            }
+            if writer_cancelled.load(Ordering::Relaxed) { return Ok(()); }
+            {
+                let _g = PhaseGuard::new(&stats.finalize);
+                encoder.finish()?;
+            }
+            Ok(())
         }
-        if writer_cancelled.load(Ordering::Relaxed) { return Ok(()); }
-        encoder.finish()?; Ok(())
     })?;
     
     let mut export_error: Option<anyhow::Error> = None;

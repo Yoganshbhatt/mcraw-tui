@@ -392,11 +392,20 @@ fn log_to_lin(v: [f32; 3], tf: Transfer) -> [f32; 3] {
                     0.18 * 2.0f32.powf((x - 0.385537) / 0.247190)
                 }
             }
+            // ARRI LogC4 decoding (E' → E_scene). Source: ARRI
+            // "LogC4 Logarithmic Color Space SPECIFICATION" (2022, Cooper &
+            // Brendel). EI-independent; two-segment with a linear-to-log
+            // threshold at the decoding boundary E' = 0.
             Transfer::ArriLogC4 => {
-                if x <= 0.010591 {
-                    (x - 0.005228) / 0.047491
+                let a: f32 = ((1u32 << 18) as f32 - 16.0) / 117.45;
+                let b: f32 = (1023.0 - 95.0) / 1023.0;
+                let c: f32 = 95.0 / 1023.0;
+                let s: f32 = (7.0 * std::f32::consts::LN_2 * (7.0 - 14.0 * c / b).exp2()) / (a * b);
+                let t: f32 = ((14.0 * (-c / b) + 6.0).exp2() - 64.0) / a;
+                if x >= 0.0 {
+                    ((14.0 * ((x - c) / b) + 6.0).exp2() - 64.0) / a
                 } else {
-                    0.18 * 2.0f32.powf((x - 0.385537) / 0.247190)
+                    x * s + t
                 }
             }
             Transfer::RedLog3G10 => {
@@ -541,11 +550,19 @@ fn lin_to_log(v: [f32; 3], tf: Transfer) -> [f32; 3] {
                     0.247190 * (x / 0.18).log2() + 0.385537
                 }
             }
+            // ARRI LogC4 encoding (E_scene → E'). Source: ARRI "LogC4
+            // Encoding Function" (2022, Cooper & Brendel). Two-segment
+            // with threshold at x = t ≈ -0.0180967.
             Transfer::ArriLogC4 => {
-                if x <= 0.005228 {
-                    x * 0.047491 + 0.005228
+                let a: f32 = ((1u32 << 18) as f32 - 16.0) / 117.45;
+                let b: f32 = (1023.0 - 95.0) / 1023.0;
+                let c: f32 = 95.0 / 1023.0;
+                let s: f32 = (7.0 * std::f32::consts::LN_2 * (7.0 - 14.0 * c / b).exp2()) / (a * b);
+                let t: f32 = ((14.0 * (-c / b) + 6.0).exp2() - 64.0) / a;
+                if x >= t {
+                    ((a * x + 64.0_f32).log2() - 6.0) / 14.0 * b + c
                 } else {
-                    0.247190 * (x / 0.18).log2() + 0.385537
+                    (x - t) / s
                 }
             }
             Transfer::RedLog3G10 => {
@@ -701,6 +718,7 @@ impl From<crate::color::TransferFunction> for Transfer {
             crate::color::TransferFunction::SLog3 => Transfer::SonySLog3,
             crate::color::TransferFunction::VLog => Transfer::VLog,
             crate::color::TransferFunction::ARRIlog3 => Transfer::ArriLogC3,
+            crate::color::TransferFunction::ARRIlog4 => Transfer::ArriLogC4,
             crate::color::TransferFunction::CLog3 => Transfer::CanonLog3,
             crate::color::TransferFunction::FLog2 => Transfer::FLog2,
             crate::color::TransferFunction::AppleLog | crate::color::TransferFunction::AppleLog2 => Transfer::Linear,

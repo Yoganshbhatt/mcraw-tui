@@ -302,6 +302,7 @@ fn main(
                 //   gm==10 DaVinci Intermediate — Blackmagic white paper
                 //   gm==11 Apple Log / Apple Log 2 — Apple "Apple Log Profile White Paper" (Sept 2023)
                 //   gm==12 Display gamma 1/2.4 (Rec.1886 EOTF approximation)
+                //   gm==13 ARRI LogC4 — ARRI "LogC4 Encoding Function" (Cooper & Brendel, 2022)
                 // ----------------------------------------------------------------
                 if (gm == 0u) { ro = rout; go = gout; bo = bout; }
                 else if (gm == 1u) {
@@ -360,6 +361,21 @@ fn main(
                     ro = pow(max(rout, 0.0), 1.0 / 2.4);
                     go = pow(max(gout, 0.0), 1.0 / 2.4);
                     bo = pow(max(bout, 0.0), 1.0 / 2.4);
+                } else if (gm == 13u) {
+                    // ARRI LogC4 (Cooper & Brendel, 2022). EI-independent.
+                    // a = (2^18 - 16) / 117.45
+                    // b = (1023 - 95) / 1023
+                    // c = 95 / 1023
+                    // s = (7 * ln 2 * 2^(7 - 14*c/b)) / (a * b)
+                    // t = (2^(-14*c/b + 6) - 64) / a
+                    let l4_a = 2231.8263091;
+                    let l4_b = 0.9071358749;
+                    let l4_c = 0.0928641251;
+                    let l4_s = 0.1135972086;
+                    let l4_t = -0.0180569961;
+                    ro = select((rout - l4_t) / l4_s, ((log2(l4_a * rout + 64.0) - 6.0) / 14.0) * l4_b + l4_c, rout >= l4_t);
+                    go = select((gout - l4_t) / l4_s, ((log2(l4_a * gout + 64.0) - 6.0) / 14.0) * l4_b + l4_c, gout >= l4_t);
+                    bo = select((bout - l4_t) / l4_s, ((log2(l4_a * bout + 64.0) - 6.0) / 14.0) * l4_b + l4_c, bout >= l4_t);
                 } else { ro = rout; go = gout; bo = bout; }
 
                 let ri = u32(clamp(ro * 65535.0, 0.0, 65535.0));

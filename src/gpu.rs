@@ -12,7 +12,8 @@ impl GpuContext {
 }
 
 pub struct RcdPipeline {
-    context: Arc<GpuContext>, width: u32, height: u32, cfa_texture: wgpu::Texture, vh_texture: wgpu::Texture,
+    context: Arc<GpuContext>, width: u32, height: u32, aligned_stride: u32, upload_data: Vec<u8>,
+    cfa_texture: wgpu::Texture, vh_texture: wgpu::Texture,
     pq_texture: wgpu::Texture, lp_texture: wgpu::Texture, out_buffer: wgpu::Buffer, readback_buffer: wgpu::Buffer,
     conv_pipeline: wgpu::ComputePipeline, conv_bind_group: wgpu::BindGroup, fill_pipeline: wgpu::ComputePipeline,
     fill_bind_group: wgpu::BindGroup, uniform_buffer: wgpu::Buffer, sampler: wgpu::Sampler,
@@ -34,8 +35,9 @@ fn transfer_to_gamma_mode(tf: &crate::color::TransferFunction) -> u32 {
     match tf {
         TransferFunction::Linear => 0, TransferFunction::Rec709 => 1,
         TransferFunction::SLog3 => 2, TransferFunction::VLog => 3, TransferFunction::ARRIlog3 => 4,
-        TransferFunction::CLog3 => 5, TransferFunction::FLog2 => 6, TransferFunction::ACESCCT => 7,
-        TransferFunction::PQ => 8, TransferFunction::HLG => 9, TransferFunction::DaVinciIntermediate => 10,
+        TransferFunction::ARRIlog4 => 13, TransferFunction::CLog3 => 5, TransferFunction::FLog2 => 6,
+        TransferFunction::ACESCCT => 7, TransferFunction::PQ => 8, TransferFunction::HLG => 9,
+        TransferFunction::DaVinciIntermediate => 10,
         TransferFunction::AppleLog | TransferFunction::AppleLog2 => 11,
         TransferFunction::Gamma24 => 12,
     }
@@ -98,7 +100,7 @@ impl RcdPipeline {
         ], label: None });
         
         let mut pipeline = Self {
-            context: context.clone(), width: 0, height: 0, cfa_texture: dummy_u16, vh_texture: dummy_f32, pq_texture: dummy_storage,
+            context: context.clone(), width: 0, height: 0, aligned_stride: 0, upload_data: Vec::new(), cfa_texture: dummy_u16, vh_texture: dummy_f32, pq_texture: dummy_storage,
             lp_texture: device.create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::R32Float, usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING, view_formats: &[] }),
             out_buffer, readback_buffer, conv_pipeline, conv_bind_group, fill_pipeline, fill_bind_group, conv_bgl, fill_bgl, uniform_buffer, sampler,
         };
@@ -106,7 +108,7 @@ impl RcdPipeline {
         Ok(pipeline)
     }
 
-    pub fn process(&mut self, bayer: &[u16], filters: u32, black_level: f32, white_level: f32, stride_width: u32, offset_x: u32, offset_y: u32, fused_ccm: &[f32; 9], as_shot_neutral: &[f32; 3], tf: &crate::color::TransferFunction) -> Result<Vec<u32>> {
+    pub fn process(&mut self, bayer: &[u16], filters: u32, black_level: f32, white_level: f32, stride_width: u32, offset_x: u32, offset_y: u32, fused_ccm: &[f32; 9], as_shot_neutral: &[f32; 3], tf: &crate::color::TransferFunction) -> Result<Vec<u8>> {
         let device = &self.context.device; let queue = &self.context.queue;
         let mut ccm_row0 = [0.0f32; 4]; let mut ccm_row1 = [0.0f32; 4]; let mut ccm_row2 = [0.0f32; 4];
         ccm_row0[..3].copy_from_slice(&fused_ccm[0..3]); ccm_row1[..3].copy_from_slice(&fused_ccm[3..6]); ccm_row2[..3].copy_from_slice(&fused_ccm[6..9]);
@@ -133,47 +135,28 @@ impl RcdPipeline {
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
         
-        const ALIGN: u32 = 256; let bayer_bytes = bytemuck::cast_slice(bayer); let src_stride = (stride_width * 2) as u32;
-        let aligned_stride = ((src_stride + ALIGN - 1) / ALIGN) * ALIGN; let row_bytes = self.width as usize * 2;
-        let mut upload_data = vec![0u8; aligned_stride as usize * self.height as usize];
+        let bayer_bytes = bytemuck::cast_slice(bayer); let row_bytes = self.width as usize * 2;
+        self.upload_data.fill(0);
         for row in 0..self.height as usize {
             let src_off = ((offset_y as usize + row) * stride_width as usize + offset_x as usize) * 2;
-            let dst_off = row * aligned_stride as usize;
-            upload_data[dst_off..dst_off + row_bytes].copy_from_slice(&bayer_bytes[src_off..src_off + row_bytes]);
+            let dst_off = row * self.aligned_stride as usize;
+            self.upload_data[dst_off..dst_off + row_bytes].copy_from_slice(&bayer_bytes[src_off..src_off + row_bytes]);
         }
-        queue.write_texture(wgpu::TexelCopyTextureInfo { texture: &self.cfa_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All }, &upload_data, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(aligned_stride), rows_per_image: Some(self.height) }, wgpu::Extent3d { width: self.width, height: self.height, depth_or_array_layers: 1 });
+        queue.write_texture(wgpu::TexelCopyTextureInfo { texture: &self.cfa_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All }, &self.upload_data, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(self.aligned_stride), rows_per_image: Some(self.height) }, wgpu::Extent3d { width: self.width, height: self.height, depth_or_array_layers: 1 });
         
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("RCD Encoder") });
         let wg_conv_x = (self.width + 15) / 16; let wg_conv_y = (self.height + 15) / 16;
         let valid_x = 128u32.saturating_sub(18); let valid_y = 32u32.saturating_sub(18);
         let wg_fill_x = (self.width + valid_x - 1) / valid_x; let wg_fill_y = (self.height + valid_y - 1) / valid_y;
         
-        let conv_bg = device.create_bind_group(&wgpu::BindGroupDescriptor { layout: &self.conv_bgl, entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.cfa_texture.create_view(&Default::default())) },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-            wgpu::BindGroupEntry { binding: 2, resource: self.uniform_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.vh_texture.create_view(&Default::default())) },
-            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.pq_texture.create_view(&Default::default())) },
-            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.lp_texture.create_view(&Default::default())) },
-        ], label: Some("RCD Conv BG") });
-        
-        let fill_bg = device.create_bind_group(&wgpu::BindGroupDescriptor { layout: &self.fill_bgl, entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.cfa_texture.create_view(&Default::default())) },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.vh_texture.create_view(&Default::default())) },
-            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.pq_texture.create_view(&Default::default())) },
-            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.lp_texture.create_view(&Default::default())) },
-            wgpu::BindGroupEntry { binding: 4, resource: self.out_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 5, resource: self.uniform_buffer.as_entire_binding() },
-        ], label: Some("RCD Fill BG") });
-        
-        { let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("RCD Conv"), timestamp_writes: None }); cpass.set_pipeline(&self.conv_pipeline); cpass.set_bind_group(0, &conv_bg, &[]); cpass.dispatch_workgroups(wg_conv_x, wg_conv_y, 1); }
-        { let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("RCD Fill"), timestamp_writes: None }); cpass.set_pipeline(&self.fill_pipeline); cpass.set_bind_group(0, &fill_bg, &[]); cpass.dispatch_workgroups(wg_fill_x.max(1), wg_fill_y.max(1), 1); }
-        
+        { let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("RCD Conv"), timestamp_writes: None }); cpass.set_pipeline(&self.conv_pipeline); cpass.set_bind_group(0, &self.conv_bind_group, &[]); cpass.dispatch_workgroups(wg_conv_x, wg_conv_y, 1); }
+        { let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("RCD Fill"), timestamp_writes: None }); cpass.set_pipeline(&self.fill_pipeline); cpass.set_bind_group(0, &self.fill_bind_group, &[]); cpass.dispatch_workgroups(wg_fill_x.max(1), wg_fill_y.max(1), 1); }
+
         // FIXED: 16-bit output size (8 bytes per pixel)
         let out_size = (self.width as u64) * (self.height as u64) * 8;
         encoder.copy_buffer_to_buffer(&self.out_buffer, 0, &self.readback_buffer, 0, out_size);
         queue.submit(Some(encoder.finish()));
-        
+
         let buffer_slice = self.readback_buffer.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         buffer_slice.map_async(wgpu::MapMode::Read, move |result| { let _ = tx.send(result); });
@@ -182,11 +165,26 @@ impl RcdPipeline {
         let data = buffer_slice.get_mapped_range();
         let u32_data: &[u32] = bytemuck::cast_slice(&data);
         let pixel_count = (self.width * self.height) as usize;
-        
-        // FIXED: Read 2 u32s per pixel
-        let result = u32_data[..pixel_count * 2].to_vec();
+
+        // A6: pack to RGB48LE bytes in a tight loop while the mapped range
+        // is live. Per the WGSL: first u32 = (R | G<<16), second u32 = (B | pad<<16).
+        let mut frame_bytes = vec![0u8; pixel_count * 6];
+        for pi in 0..pixel_count {
+            let p0 = u32_data[pi * 2];
+            let p1 = u32_data[pi * 2 + 1];
+            let r = (p0 & 0xFFFF) as u16;
+            let g = ((p0 >> 16) & 0xFFFF) as u16;
+            let b = (p1 & 0xFFFF) as u16;
+            let o = pi * 6;
+            frame_bytes[o]     = r as u8;
+            frame_bytes[o + 1] = (r >> 8) as u8;
+            frame_bytes[o + 2] = g as u8;
+            frame_bytes[o + 3] = (g >> 8) as u8;
+            frame_bytes[o + 4] = b as u8;
+            frame_bytes[o + 5] = (b >> 8) as u8;
+        }
         drop(data); self.readback_buffer.unmap();
-        Ok(result)
+        Ok(frame_bytes)
     }
 
     pub fn resize(&mut self, width: u32, height: u32) -> Result<()> {
@@ -207,6 +205,11 @@ impl RcdPipeline {
         let out_size = (width as u64) * (height as u64) * 8;
         self.out_buffer = device.create_buffer(&wgpu::BufferDescriptor { label: Some("RCD Out Buffer"), size: out_size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
         self.readback_buffer = device.create_buffer(&wgpu::BufferDescriptor { label: Some("RCD Readback Buffer"), size: out_size, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        // A3: Hoist upload_data Vec<u8> + aligned_stride to fields, allocated once per resize.
+        const ALIGN: u32 = 256;
+        let src_stride = width * 2;
+        self.aligned_stride = ((src_stride + ALIGN - 1) / ALIGN) * ALIGN;
+        self.upload_data = vec![0u8; self.aligned_stride as usize * height as usize];
         self.width = width; self.height = height;
         
         self.conv_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor { layout: &self.conv_pipeline.get_bind_group_layout(0), entries: &[

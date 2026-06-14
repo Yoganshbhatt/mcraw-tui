@@ -1,4 +1,5 @@
 mod agx;
+mod allocator;
 mod app;
 mod cli;
 mod color;
@@ -14,6 +15,8 @@ mod file_browser;
 mod hardware;
 mod metadata;
 mod pipeline;
+mod preset;
+mod stats;
 mod ui;
 
 use anyhow::Result;
