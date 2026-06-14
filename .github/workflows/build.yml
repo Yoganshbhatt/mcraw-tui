@@ -28,16 +28,16 @@ jobs:
       - name: Package (macOS / Linux)
         if: runner.os != 'Windows'
         run: |
-          cp target/${{ matrix.target }}/release/mcraw-tui mcraw-tui-${{ matrix.target }}
-          chmod +x mcraw-tui-${{ matrix.target }}
-          zip mcraw-tui-${{ matrix.target }}.zip mcraw-tui-${{ matrix.target }}
+          cp target/${{ matrix.target }}/release/mcraw-tui mcraw-tui
+          chmod +x mcraw-tui
+          zip mcraw-tui-${{ matrix.target }}.zip mcraw-tui
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Copy-Item "target/${{ matrix.target }}/release/mcraw-tui.exe" -Destination "mcraw-tui-${{ matrix.target }}.exe"
-          Compress-Archive -Path "mcraw-tui-${{ matrix.target }}.exe" -DestinationPath "mcraw-tui-${{ matrix.target }}.zip"
+          Copy-Item "target/${{ matrix.target }}/release/mcraw-tui.exe" -Destination "mcraw-tui.exe"
+          7z a mcraw-tui-${{ matrix.target }}.zip mcraw-tui.exe
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
