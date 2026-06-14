@@ -1,6 +1,6 @@
 [package]
 name = "mcraw-tui"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Cross-platform TUI for browsing and exploring MotionCam (.mcraw) files"
 authors = ["Terminal Developer"]
