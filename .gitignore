@@ -13,6 +13,8 @@ Cargo.lock
 
 # Documentation (not source)
 *.md
+!README.md
+!CREDITS.md
 
 # IDE
 .idea/
