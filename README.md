@@ -20,23 +20,36 @@ Cross-platform terminal UI for browsing and exporting MotionCam `.mcraw` files t
 - **FFmpeg 5.0+** on `PATH` (required at runtime for video encoding)
 - **motioncam-decoder-rust**: Clone alongside this repo (`git clone https://github.com/Yoganshbhatt/motioncam-decoder-rust ../motioncam-decoder-rust`)
 
-## Install
+## Quick install
 
+### Homebrew (macOS / Linux)
+```bash
+brew install https://raw.githubusercontent.com/Yoganshbhatt/mcraw-tui/main/mcraw-tui.rb
+```
+
+### Scoop (Windows)
+```bash
+scoop bucket add mcraw-tui https://github.com/Yoganshbhatt/mcraw-tui
+scoop install mcraw-tui
+```
+
+### Build from source
 ```bash
 cargo build --release
 cargo run -- -f <file.mcraw>
 ```
 
-### Headless export
+## Usage
 
 ```bash
-cargo run -- export -f <file.mcraw> -F prores -o <outdir>
-```
+# Open file in TUI
+mcraw-tui -f <file.mcraw>
 
-### View metadata
+# Headless export
+mcraw-tui export -f <file.mcraw> -F prores -o <outdir>
 
-```bash
-cargo run -- info -f <file.mcraw>
+# View metadata
+mcraw-tui info -f <file.mcraw>
 ```
 
 ## Quick help
@@ -44,14 +57,16 @@ cargo run -- info -f <file.mcraw>
 | Key | Action |
 |-----|--------|
 | `b` | Toggle file browser |
-| `Tab` | Cycle focus: Media Pool → Queue → Export Settings |
-| `Space` | Select / deselect items |
+| `Tab` | Cycle focus |
+| `Space` | Select / deselect |
 | `a` / `A` | Add selected / all to queue |
-| `v` / `R` | Render selected / all |
+| `v` / `R` | Render selected / all items |
 | `c/g/t/p/r` | Cycle codec / gamut / transfer / profile / rate |
+| `↑/↓/j/k` | Navigate lists |
+| `?` | Help overlay |
 | `q` / `Esc` | Quit / close overlay |
 
-Full keybinding reference available with `?`.
+Full keybinding reference: press `?` in the TUI or see the architecture doc.
 
 ## License
 
