@@ -15,7 +15,9 @@ Cargo.lock
 *.md
 !README.md
 !CREDITS.md
-!TODO.md
+
+# OpenCode tooling configuration
+.opencode/
 
 # IDE
 .idea/

@@ -21,8 +21,8 @@ use std::time::Instant;
 const PIPELINE_DEPTH: usize = 3;
 struct FrameSlot { bayer: Vec<u16>, frame_bytes: Vec<u8>, as_shot_neutral: [f32; 3] }
 
-pub fn build_ffmpeg_codec_args(family: CodecFamily, hevc_encoder: &str, h264_encoder: &str, av1_encoder: &str, prores_encoder: &str, prores: ProResProfile, dnxhr: DnxhrProfile, hevc: HevcProfile, h264: H264Profile, av1: Av1Profile, vp9: Vp9Profile, rate_control: &RateControl) -> (String, String, Vec<String>) {
-    family.to_ffmpeg_args(hevc_encoder, h264_encoder, av1_encoder, prores_encoder, prores, dnxhr, hevc, h264, av1, vp9, rate_control)
+pub fn build_ffmpeg_codec_args(family: CodecFamily, hevc_encoder: &str, h264_encoder: &str, av1_encoder: &str, prores_encoder: &str, prores: ProResProfile, dnxhr: DnxhrProfile, hevc: HevcProfile, h264: H264Profile, av1: Av1Profile, vp9: Vp9Profile, rate_control: &RateControl, is_wide_gamut: bool) -> (String, String, Vec<String>) {
+    family.to_ffmpeg_args(hevc_encoder, h264_encoder, av1_encoder, prores_encoder, prores, dnxhr, hevc, h264, av1, vp9, rate_control, is_wide_gamut)
 }
 
 /// Map our `ColorSpace` / `TransferFunction` to **valid** FFmpeg VUI codes.
@@ -196,9 +196,16 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
     let bradford_static = build_bradford_matrix(&cam_illuminant_xyz, &D65_XYZ);
     let cam_to_xyz_d65 = mat_mul_3x3(&bradford_static, &cam_to_xyz);
     let fused = mat_mul_3x3(&xyz_to_output, &cam_to_xyz_d65);
+    tracing::info!("fused matrix cs={}: [{:.6},{:.6},{:.6} | {:.6},{:.6},{:.6} | {:.6},{:.6},{:.6}]",
+        export_cs.name(),
+        fused[0], fused[1], fused[2],
+        fused[3], fused[4], fused[5],
+        fused[6], fused[7], fused[8],
+    );
     let pattern = info.bayer_pattern; let black_level = info.black_level; let white_level = info.white_level; let total_frames = timestamps.len();
+    let is_wide_gamut = export_cs != ColorSpace::Rec709 && export_cs != ColorSpace::Srgb;
     
-    let (codec_name, pix_fmt, mut extra_args) = build_ffmpeg_codec_args(codec_family, &hevc_encoder, &h264_encoder, &av1_encoder, &prores_encoder, prores_profile, dnxhr_profile, hevc_profile, h264_profile, av1_profile, vp9_profile, &rate_control);
+    let (codec_name, pix_fmt, mut extra_args) = build_ffmpeg_codec_args(codec_family, &hevc_encoder, &h264_encoder, &av1_encoder, &prores_encoder, prores_profile, dnxhr_profile, hevc_profile, h264_profile, av1_profile, vp9_profile, &rate_control, is_wide_gamut);
     let vui_tags = get_ffmpeg_vui_tags(&export_cs, &export_tf); extra_args.extend(vui_tags.into_iter().map(String::from));
     
     let audio_temp_path = if info.has_audio && info.audio_sample_rate > 0 && info.audio_channels > 0 {
@@ -346,28 +353,65 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
                     }
                     {
                         let _g = PhaseGuard::new(&stats.wb_hl_ccm);
+                        let is_display_referred = matches!(export_tf,
+                            TransferFunction::Rec709
+                            | TransferFunction::Gamma24
+                            | TransferFunction::Linear
+                        );
                         rgb.par_chunks_exact_mut(3).for_each(|chunk| {
                             // 1. Apply WB
                             let r = chunk[0] * r_gain;
                             let g = chunk[1];
                             let b = chunk[2] * b_gain;
 
-                            // 2. Highlight reconstruction — desaturate toward
-                            //    neutral (post-WB max clamped to 1) when the
-                            //    pixel is blown. Triggered per-pixel so
-                            //    single-channel clips no longer go magenta.
-                            let max_val = r.max(g).max(b);
-                            let neutral = max_val.min(1.0);
-                            let t = if max_val > 0.95f32 { ((max_val - 0.95) / 0.05).min(1.0) } else { 0.0 };
-                            let (r, g, b) = if t > 0.0 {
-                                (r + (neutral - r) * t, g + (neutral - g) * t, b + (neutral - b) * t)
-                            } else {
-                                (r, g, b)
-                            };
+                            if is_display_referred {
+                                // 2. Highlight reconstruction — desaturate toward
+                                //    neutral when the pixel is blown. Prevents
+                                //    magenta-shifted highlights when a single
+                                //    channel clips (common with speculars).
+                                let max_val = r.max(g).max(b);
+                                let neutral = max_val.min(1.0);
+                                let t = if max_val > 0.95_f32 { ((max_val - 0.95) / 0.05).min(1.0) } else { 0.0 };
+                                let (r, g, b) = if t > 0.0 {
+                                    (r + (neutral - r) * t, g + (neutral - g) * t, b + (neutral - b) * t)
+                                } else {
+                                    (r, g, b)
+                                };
 
-                            // 3. Apply CCM (on WB'd values — standard pipeline)
-                            let out = mat_mul_vec3(&fused, &[r, g, b]);
-                            chunk[0] = out[0].max(0.0); chunk[1] = out[1].max(0.0); chunk[2] = out[2].max(0.0);
+                                // 3. Apply CCM
+                                let out = mat_mul_vec3(&fused, &[r, g, b]);
+                                chunk[0] = out[0].max(0.0); chunk[1] = out[1].max(0.0); chunk[2] = out[2].max(0.0);
+                            } else {
+                                // 2. Log curve path: skip highlight reconstruction.
+                                //    Log OETFs encode 4-100× of dynamic range and
+                                //    naturally handle values above 1.0. No
+                                //    reconstruction needed — clamping would
+                                //    destroy highlight detail.
+                                // 3. Apply CCM
+                                let out = mat_mul_vec3(&fused, &[r, g, b]);
+                                let mut r_ccm = out[0].max(0.0);
+                                let mut g_ccm = out[1].max(0.0);
+                                let mut b_ccm = out[2].max(0.0);
+
+                                // Gamut soft-clip: desaturate extreme out-of-gamut
+                                // values (>1.0) toward luminance. Prevents "wild
+                                // highlight peaks" from wide-gamut matrices
+                                // (DWG, CanonCG, SG3C) while preserving in-gamut
+                                // colorimetry perfectly.
+                                let max_val = r_ccm.max(g_ccm.max(b_ccm));
+                                if max_val > 1.0 {
+                                    let lum = 0.2126_f32 * r_ccm + 0.7152_f32 * g_ccm + 0.0722_f32 * b_ccm;
+                                    let lum = lum.min(max_val).max(0.0);
+                                    let t = ((max_val - 1.0) * 1.0).min(1.0);
+                                    r_ccm += (lum - r_ccm) * t;
+                                    g_ccm += (lum - g_ccm) * t;
+                                    b_ccm += (lum - b_ccm) * t;
+                                }
+
+                                chunk[0] = r_ccm;
+                                chunk[1] = g_ccm;
+                                chunk[2] = b_ccm;
+                            }
                         });
                     }
                     {

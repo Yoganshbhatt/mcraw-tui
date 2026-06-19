@@ -14,7 +14,8 @@ contributions.
 
 The following transfer function implementations in `src/color.rs` are adapted
 from colour-science/colour:
-- Sony S-Log3
+- Sony S-Log3 (corrected to Sony's canonical form per the Sept 2014 tech
+  spec: code = (420 + 261.5×log₁₀((x+0.01)/0.19)) / 1023, 18% grey → code 420)
 - Panasonic V-Log
 - ARRI LogC3
 - Canon C-Log3
@@ -23,6 +24,19 @@ from colour-science/colour:
 - SMPTE ST.2084 (PQ)
 - HLG (BT.2100)
 - DaVinci Intermediate (Blackmagic Design)
+
+## Sony S-Log3 Canonical Reference
+
+- **Source**: Sony "S-Log3 Technical Specification" (September 2014)
+- **Used for**: Correcting the S-Log3 OETF from the earlier colour-science
+  coefficients to Sony's published canonical form. The canonical encoding maps
+  scene linear to 10-bit log code values: black → 95, 18% grey → 420,
+  100% white → ~610 (≈0.596 normalized). Previous implementations used
+  `0.432699×log₁₀(10x+1)+0.037584` which did not match Sony's specified output
+  at codec anchor points. Validated against the ACES CTL reference
+  implementation and DaVinci Resolve's S-Log3 encoder.
+- **Applied in**: `src/color.rs` (`TransferFunction::SLog3`), `shaders/rcd_fill.wgsl`
+  (`gamma_mode == 2u`)
 
 ## AgX / Troy Sobotka
 

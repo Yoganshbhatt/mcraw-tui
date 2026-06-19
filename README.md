@@ -1,294 +1,57 @@
 # mcraw-tui
 
-Cross Platform TUI for encoding your MotionCam MCRAW files to professional video formats. All in the Terminal.
+![Demo](assets/demo.gif)
+
+Cross-platform terminal UI for browsing and exporting MotionCam `.mcraw` files to professional video formats.
 
 ## Features
 
-- **In-browser file management**: file browser with directory navigation, favourites, hidden file toggle
-- **Selective import**: import individual, selected, or all `.mcraw` files from a directory
-- **Full color pipeline**: bilinear demosaic (RCD GPU with CPU fallback), white balance, color matrix, transfer function encoding
-- **Export to**: ProRes, DNxHR, H.264, HEVC, AV1, VP9, CinemaDNG
-- **Hardware encoder detection**: NVENC, AMF, QSV, VideoToolbox auto-selected when available
-- **Export presets**: save/load named preset configurations
-- **Batch queue**: add multiple files, render sequentially, track per-file progress
+- **Browser**: Navigate file system, import `.mcraw` files, view metadata (codec, resolution, FPS, white balance, camera make/model)
+- **Media Pool**: Select files, preview details, batch operations
+- **Render Queue**: Multi-file batch export with per-item status tracking
+- **Export Settings**: 15 color spaces (Rec.709, S-Gamut3, ARRI WG, Canon Cinema Gamut, DaVinci Wide Gamut, ACES AP1, etc.), 14 transfer functions (S-Log3, C-Log3, ARRI LogC3/C4, PQ, HLG, etc.)
+- **16 export codec profiles**: ProRes 4444/XQ, HEVC 10-bit 4:4:4, H.264, AV1 (SVT-AV1, NVENC), VP9, DNxHR
+- **Hardware acceleration**: Auto-detects NVENC, AMF, QSV, VideoToolbox encoders
+- **Pure Rust**: No C++ dependencies, no FFI
 
-## Quick install
+## Prerequisites
 
-Pre-built binaries for macOS (arm64 + x86_64), Linux, and Windows are available via package managers.
+- **Rust** (edition 2021, no toolchain pin)
+- **FFmpeg 5.0+** on `PATH` (required at runtime for video encoding)
+- **motioncam-decoder-rust**: Clone alongside this repo (`git clone https://github.com/Yoganshbhatt/motioncam-decoder-rust ../motioncam-decoder-rust`)
 
-### Homebrew (macOS / Linux)
-
-```bash
-brew install https://raw.githubusercontent.com/Yoganshbhatt/mcraw-tui/main/mcraw-tui.rb
-```
-
-Homebrew automatically installs FFmpeg as a dependency.
-
-### Scoop (Windows)
+## Install
 
 ```bash
-scoop bucket add mcraw-tui https://github.com/Yoganshbhatt/mcraw-tui
-scoop install mcraw-tui
-```
-
-Scoop automatically installs FFmpeg as a dependency.
-
-### Cargo (any platform, requires Rust)
-
-```bash
-cargo install mcraw-tui
-```
-
-FFmpeg must be installed separately (see below).
-
-## Build from source
-
-```bash
-git clone https://github.com/Yoganshbhatt/mcraw-tui.git
-cd mcraw-tui
 cargo build --release
+cargo run -- -f <file.mcraw>
 ```
 
-The binary is at `target/release/mcraw-tui` (or `mcraw-tui.exe` on Windows). The `motioncam-decoder` crate is pulled from crates.io — no sibling checkout needed.
-
-### Prerequisites for building / Cargo install
-
-- **Rust** 1.74+ (`rustup` recommended)
-- **FFmpeg** 5.0+ on `PATH` — required at runtime for video encoding
-
-| Platform | FFmpeg install |
-|---|---|
-| macOS | `brew install ffmpeg` |
-| Linux (Ubuntu/Debian) | `sudo apt install ffmpeg` |
-| Linux (Fedora) | `sudo dnf install ffmpeg` |
-| Windows (Scoop) | `scoop install ffmpeg` |
-| Windows (Winget) | `winget install ffmpeg` |
-
-### Platform notes
-
-| Platform | Notes |
-|---|---|
-| **macOS** | Gatekeeper warning on first run: `xattr -d com.apple.quarantine mcraw-tui` |
-| **Linux** | Requires glibc. No additional libraries needed beyond ffmpeg. |
-| **Windows** | Run in Windows Terminal for best results. |
-
-## CLI Usage
+### Headless export
 
 ```bash
-mcraw-tui [OPTIONS] [COMMAND]
+cargo run -- export -f <file.mcraw> -F prores -o <outdir>
 ```
 
-### Global options
+### View metadata
 
-| Flag | Description |
-|---|---|
-| `-f, --file <FILE>` | Open a `.mcraw` file |
-| `-n, --frames <N>` | Number of frames to load (default: all) |
-| `-v, --verbose` | Enable verbose logging |
-| `-o, --output <DIR>` | Output directory for extracted files |
-
-### Subcommands
-
-| Command | Description | Example |
-|---|---|---|
-| `open` | Open a file in the TUI (default) | `mcraw-tui open -f video.mcraw` |
-| `info` | Print file metadata and exit | `mcraw-tui info -f video.mcraw` |
-| `export` | Export to another format | `mcraw-tui export -f video.mcraw -F prores -o output.mov` |
-
-### Export format flags
-
-| Flag | Format | Codec |
-|---|---|---|
-| `dng` | CinemaDNG image sequence | LJ92-compressed DNG |
-| `prores` | Apple ProRes | ProRes 422/444 |
-| `h264` | H.264 | libx264 or hardware encoder |
-| `hevc` | H.265/HEVC | libx265 or hardware encoder |
-
-## TUI Usage
-
-### Panel layout
-
-```
-┌─────────────────────────────────────────────────────┐
-│ Header: file path, metadata, export status           │
-├──────────────┬──────────────────────┬────────────────┤
-│  Media Pool  │  Render Queue        │ Export Settings│
-│  (imported   │  (pending/           │  (color space, │
-│   .mcraw     │   rendering/         │   transfer fn, │
-│   files)     │   completed/failed)  │   codec, rate) │
-├──────────────┴──────────────────────┴────────────────┤
-│ Browser overlay (toggle with `b`)                    │
-└─────────────────────────────────────────────────────┘
+```bash
+cargo run -- info -f <file.mcraw>
 ```
 
-### Workflow
-
-1. **Open** with `mcraw-tui -f file.mcraw` — browser opens automatically if no file specified
-2. **Browse** files with the file browser — navigate directories, mark favourites, toggle hidden files
-3. **Import** individual files with `I` or load all `.mcraw` in current folder with `L`
-4. **Configure** export settings — cycle through codec, color space, transfer function, profile, rate control
-5. **Queue** items with `a` (selected) or `A` (all imported)
-6. **Render** with `v` (selected) or `R` (all queued)
-7. **Monitor** progress in the queue panel — cancel with `X`
-
-### Keybindings
-
-#### Navigation
+## Quick help
 
 | Key | Action |
-|---|---|
+|-----|--------|
+| `b` | Toggle file browser |
 | `Tab` | Cycle focus: Media Pool → Queue → Export Settings |
-| `↑` / `k` | Navigate up (list, browser, favourites) |
-| `↓` / `j` | Navigate down |
-| `PageUp` | Fast scroll up (10 items) |
-| `PageDown` | Fast scroll down |
-| `Home` | Jump to start of list |
-| `End` | Jump to end of list |
+| `Space` | Select / deselect items |
+| `a` / `A` | Add selected / all to queue |
+| `v` / `R` | Render selected / all |
+| `c/g/t/p/r` | Cycle codec / gamut / transfer / profile / rate |
+| `q` / `Esc` | Quit / close overlay |
 
-#### File management
-
-| Key | Action |
-|---|---|
-| `Space` | Toggle selection checkbox |
-| `a` | Add selected to render queue |
-| `A` | Add ALL imported to render queue |
-| `d` | Remove from focused panel |
-| `D` | Remove ALL selected from media pool |
-
-#### Browser
-
-| Key | Action |
-|---|---|
-| `b` | Toggle browser overlay |
-| `I` | Import selected `.mcraw` from browser |
-| `L` | Load all `.mcraw` in current folder |
-| `o` | Set export folder to current browser path |
-| `f` | Toggle favourites list view |
-| `F` | Toggle favourite on current path |
-| `.` | Toggle hidden files |
-| `Enter` | Navigate into directory / open favourite |
-
-#### Export settings (when focused)
-
-| Key | Action |
-|---|---|
-| `c` | Cycle codec family |
-| `g` | Cycle gamut (color space) |
-| `t` | Cycle transfer function |
-| `p` | Cycle profile or begin naming preset |
-| `P` | Open preset picker |
-| `r` | Cycle rate control |
-| `i` | Edit custom rate (when custom rate active) |
-
-#### Actions
-
-| Key | Action |
-|---|---|
-| `v` | Render selected queue items |
-| `R` | Render ALL queue items |
-| `x` / `X` | Cancel in-progress export OR clear completed/failed |
-| `n` | Print raw metadata dump of focused file |
-| `?` | Toggle help overlay |
-
-#### General
-
-| Key | Action |
-|---|---|
-| `q` | Quit |
-| `Ctrl+C` | Force quit |
-| `Ctrl+X` | Cancel in-progress export |
-| `Esc` | Close popup → Full info → Favourites → Browser → Help → Quit |
-
-## Export formats
-
-The TUI supports more codecs than the CLI. Full matrix:
-
-| Codec | Profile Options | Rate Control |
-|---|---|---|
-| **ProRes** | Proxy, LT, Standard, HQ, P4444, XQ4444 | Lossless, High, Standard |
-| **DNxHR** | SQ, HD, HDX, HQX, P444 | Lossless, High, Standard |
-| **HEVC** | Main10 420, Main10 444 | Lossless, High, Standard, Master 400M, Custom |
-| **H.264** | Main 8-bit, High 10-bit | Lossless, High, Standard, Standard 150M, Custom |
-| **AV1** | Profile0 420 10-bit, Profile1 444 10-bit | Lossless, High, Standard, Custom |
-| **VP9** | Profile2 420 10-bit, Profile3 444 10-bit | Lossless, High, Standard, Custom |
-| **DNG** | CinemaDNG image sequence (LJ92) | N/A |
-
-Hardware encoders (NVENC, AMF, QSV, VideoToolbox) are detected at startup and preferred over software encoders when available.
-
-## Export presets
-
-Save and load named preset configurations. Presets are stored in the platform config directory as `presets.json`.
-
-- Press `p` (export settings focused) to name and save the current configuration
-- Press `P` to open the preset picker
-- `Delete` removes a saved preset
-
-## Color science
-
-| Color spaces | Transfer functions |
-|---|---|
-| ACES AP1 | ACEScct |
-| ARRI Wide Gamut 3 | ARRI LogC3 |
-| ARRI Wide Gamut 4 | ARRI LogC4 |
-| Canon Cinema Gamut | Apple Log |
-| DaVinci Wide Gamut | Apple Log 2 |
-| DCI-P3 | C-Log3 |
-| Display P3 | DaVinci Intermediate |
-| F-Gamut | F-Log2 |
-| F-Gamut C | Gamma 2.4 |
-| Panasonic V-Gamut | HLG |
-| Rec.2020 | Linear |
-| Rec.709 | PQ (ST.2084) |
-| S-Gamut3 | Rec.709 |
-| S-Gamut3.Cine | S-Log3 |
-| sRGB | V-Log |
-
-### Pipeline order
-
-```
-Raw Bayer → Demosaic (bilinear / RCD GPU) → White balance → Color matrix (CCM) → Transfer function → RGB encoding
-```
-
-## Logging
-
-Logs are written to the platform-specific data directory:
-
-| Platform | Path |
-|---|---|
-| macOS | `~/Library/Application Support/mcraw-tui/logs/` |
-| Linux | `~/.local/share/mcraw-tui/logs/` |
-| Windows | `%LOCALAPPDATA%/mcraw-tui/logs/` |
-
-Logs rotate daily and are cleaned after 7 days. Set `MCRAW_TUI_LOG=<level>` to control verbosity.
-
-## Architecture
-
-Three-thread pipeline using bounded crossbeam channels:
-
-```
-┌──────────┐    ┌──────────────┐    ┌──────────┐
-│  Loader  │───→│  Processor   │───→│  Writer  │
-│ (decoder)│    │ (demosaic →  │    │ (ffmpeg  │
-│          │    │  WB → CCM →  │    │  stdin)  │
-│          │    │  OETF)       │    │          │
-└──────────┘    └──────┬───────┘    └──────────┘
-                       │ optional
-                       ↓
-                  ┌──────────┐
-                  │  GPU     │
-                  │ (wgpu)   │
-                  └──────────┘
-```
-
-The processor thread can optionally dispatch RCD demosaic to a GPU compute pipeline (wgpu + WGSL) with graceful CPU fallback.
-
-## Credits
-
-This project builds on several open-source colour science projects. Full details in [`CREDITS.md`](CREDITS.md).
-
-Key dependencies:
-- **colour-science/colour** (BSD-3-Clause) — transfer function implementations and color space conversions
-- **motioncam-decoder-rust** (Apache-2.0) — MotionCam RAW file decoding
+Full keybinding reference available with `?`.
 
 ## License
 

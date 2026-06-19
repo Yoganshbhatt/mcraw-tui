@@ -104,7 +104,7 @@ impl TransferFunction {
     /// | Variant | Spec / document |
     /// |---|---|
     /// | `Rec709`         | ITU-R BT.709-6 OETF |
-    /// | `SLog3`          | Sony "S-Log3 Technical Summary" (Sept 2014) — coefficients `0.432699`, `10`, `0.037584`, knee at `0.01` |
+    /// | `SLog3`          | Sony "S-Log3 Technical Specification" (Sept 2014) — canonical form: code = `(420 + 261.5×log₁₀((x+0.01)/0.19)) / 1023`, knee at `0.01125`, black code `95`, 18% grey code `420` |
     /// | `VLog`           | Panasonic "V-Log/V-Gamut Reference Manual" (2014) — `5.6x+0.125` / `0.241514*log10(x+0.00873)+0.598206`, knee at `0.01` |
     /// | `ARRIlog3`       | ARRI "LogC-3 Logarithmic Color Space" spec (2020), EI 800 variant |
     /// | `ARRIlog4`       | ARRI "LogC4 Encoding Function" (Cooper & Brendel, 2022; ALEV4 / Alexa 35), EI-independent |
@@ -123,9 +123,11 @@ impl TransferFunction {
             // Source: ITU-R BT.709-6 §3.
             TransferFunction::Rec709 => { pixels.par_iter_mut().for_each(|v| { *v = rec709_oetf(*v).min(1.0).max(0.0); }); }
             // Source: Sony "S-Log3 Technical Summary" (Sept 2014).
-            // Knee at 0.01; branches are intentionally discontinuous
-            // (different slopes at the joint — Sony's design).
-            TransferFunction::SLog3 => { pixels.par_iter_mut().for_each(|v| { let x = *v; *v = if x >= 0.01_f32 { 0.432699_f32 * (10.0_f32 * x + 1.0_f32).log10() + 0.037584_f32 } else { (x * 261.5_f32 + 10.23_f32) / 1023.0_f32 }; }); }
+            // Canonical form per colour-science and ACES CTL ref.
+            // Knee at 0.01125; above: log segment maps 18% grey (0.18) to
+            // code 420/1023; below: linear segment maps black (0.0) to
+            // code 95/1023.
+            TransferFunction::SLog3 => { pixels.par_iter_mut().for_each(|v| { let x = *v; *v = if x >= 0.01125_f32 { (420.0_f32 + 261.5_f32 * ((x + 0.01_f32) / 0.19_f32).log10()) / 1023.0_f32 } else { (x * (171.2102946929_f32 - 95.0_f32) / 0.01125_f32 + 95.0_f32) / 1023.0_f32 }; }); }
             // Source: Panasonic V-Log/V-Gamut Reference Manual (2014).
             TransferFunction::VLog => { pixels.par_iter_mut().for_each(|v| { let x = *v; *v = if x < 0.01 { 5.6_f32 * x + 0.125_f32 } else { 0.241514_f32 * (x + 0.00873_f32).log10() + 0.598206_f32 }; }); }
             // Source: ARRI LogC-3 spec (2020), EI 800.
@@ -172,12 +174,14 @@ impl TransferFunction {
             }
             // Source: AMPAS ACEScc specification (TB-2022-002).
             TransferFunction::ACESCCT => { pixels.par_iter_mut().for_each(|v| { let x = *v; *v = if x > 0.0078125_f32 { (x.log2() + 9.72_f32) / 17.52_f32 } else { 10.5402377416545_f32 * x + 0.0729055341958355_f32 }; }); }
-            // Source: ITU-R BT.2100-2 ST.2084 PQ.
-            TransferFunction::PQ => { pixels.par_iter_mut().for_each(|v| { let x = *v; let x_m1 = x.powf(0.1593017578125_f32); *v = ((0.8359375_f32 + 18.8515625_f32 * x_m1) / (1.0_f32 + 18.6875_f32 * x_m1)).powf(78.84375_f32); }); }
-            // Source: ITU-R BT.2100-2 HLG OETF.
+            // Source: ITU-R BT.2100-2 ST.2084 PQ. Input clamped to ≥0 to
+            // prevent NaN from negative values entering the power function.
+            TransferFunction::PQ => { pixels.par_iter_mut().for_each(|v| { let x = (*v).max(0.0_f32); let x_m1 = x.powf(0.1593017578125_f32); *v = ((0.8359375_f32 + 18.8515625_f32 * x_m1) / (1.0_f32 + 18.6875_f32 * x_m1)).powf(78.84375_f32); }); }
+            // Source: ITU-R BT.2100-2 HLG OETF. Input clamped to ≥0 to
+            // prevent NaN from negative values entering sqrt/ln.
             // Knee at L = 1/12; below the knee V = sqrt(3L), above
             // V = a*ln(12L - b) + c with a=0.17883277, b=0.28466892, c=0.55991073.
-            TransferFunction::HLG => { pixels.par_iter_mut().for_each(|v| { let x = *v; *v = if x < (1.0_f32 / 12.0_f32) { (3.0_f32 * x).sqrt() } else { 0.17883277_f32 * (12.0_f32 * x - 0.28466892_f32).ln() + 0.55991073_f32 }; }); }
+            TransferFunction::HLG => { pixels.par_iter_mut().for_each(|v| { let x = (*v).max(0.0_f32); *v = if x < (1.0_f32 / 12.0_f32) { (3.0_f32 * x).sqrt() } else { 0.17883277_f32 * (12.0_f32 * x - 0.28466892_f32).ln() + 0.55991073_f32 }; }); }
             // Source: Blackmagic DaVinci YRGB Intermediate white paper.
             TransferFunction::DaVinciIntermediate => { pixels.par_iter_mut().for_each(|v| { let x = *v; *v = if x <= 0.00262409_f32 { x * 10.44426855_f32 } else { 0.07329248_f32 * ((x + 0.0075_f32).log2() + 7.0_f32) }; }); }
             // Display gamma 1/2.4. Not a log curve; for 8-bit preview
@@ -895,28 +899,33 @@ mod tests {
         assert!((v_18_full - v_18).abs() < 1e-5, "TransferFunction::ARRIlog4 disagrees with arri_logc4_oetf: {} vs {}", v_18_full, v_18);
     }
 
-    /// S-Log3 must follow Sony's canonical form, not the previous
-    /// non-canonical coefficients. The Sony white paper gives:
-    ///   x >= 0.01: V = 0.432699*log10(10x + 1) + 0.037584
-    ///   x <  0.01: V = (261.5x + 0.01*1023) / 1023
+    /// S-Log3 must follow Sony's canonical form per the Sony specification
+    /// (2014), colour-science, and ACES CTL reference implementation.
+    /// Formula:
+    ///   x >= 0.01125: V = (420 + 261.5 * log10((x + 0.01) / 0.19)) / 1023
+    ///   x <  0.01125: V = (x * (knee_val - 95) / 0.01125 + 95) / 1023
+    ///                 where knee_val = 420 + 261.5 * log10((0.01125+0.01)/0.19)
     ///
-    /// Note: the two branches are intentionally discontinuous at x=0.01
-    /// (the knee point is where the curves meet, not where the slopes
-    /// match). We only assert monotonicity and finite outputs.
+    /// 18% grey (x=0.18) maps to code 420, normalized 420/1023 ≈ 0.4106.
+    /// Black (x=0) maps to code 95, normalized 95/1023 ≈ 0.0929.
+    /// These match the known Sony S-Log3 encoding and DaVinci Resolve.
     #[test]
     fn slog3_canonical_at_key_points() {
         let v_low = TransferFunction::SLog3.process_apply(0.009);
-        let v_at = TransferFunction::SLog3.process_apply(0.01);
-        let v_high = TransferFunction::SLog3.process_apply(0.011);
+        let v_at = TransferFunction::SLog3.process_apply(0.01125);
+        let v_high = TransferFunction::SLog3.process_apply(0.013);
         assert!(v_low.is_finite() && v_at.is_finite() && v_high.is_finite());
         assert!(v_low < v_high, "S-Log3 must be monotonic across the knee: low={} high={}", v_low, v_high);
-        // Spot-check x=0.18 (18% grey). Sony canonical form gives:
-        //   V(0.18) = 0.432699 * log10(2.8) + 0.037584 ≈ 0.2311
+        // Spot-check x=0.18 (18% grey). Canonical S-Log3 gives:
+        //   V(0.18) = 420/1023 ≈ 0.4106 (code 420)
         let v_18 = TransferFunction::SLog3.process_apply(0.18);
-        assert!((v_18 - 0.2311).abs() < 0.01, "S-Log3 at 0.18 = {} (want ~0.2311)", v_18);
-        // Spot-check x=1.0 (peak white in the canonical form, V ≈ 0.488).
+        assert!((v_18 - 0.4106).abs() < 0.01, "S-Log3 at 0.18 = {} (want ~0.4106)", v_18);
+        // Spot-check x=1.0 (peak white, V ≈ 0.596, code ~610).
         let v_1 = TransferFunction::SLog3.process_apply(1.0);
-        assert!((v_1 - 0.4881).abs() < 0.01, "S-Log3 at 1.0 = {} (want ~0.4881)", v_1);
+        assert!((v_1 - 0.596).abs() < 0.02, "S-Log3 at 1.0 = {} (want ~0.596)", v_1);
+        // Black (x=0) should be code 95.
+        let v_0 = TransferFunction::SLog3.process_apply(0.0);
+        assert!((v_0 - 0.0929).abs() < 0.001, "S-Log3 at 0 = {} (want ~0.0929)", v_0);
     }
 }
 
@@ -930,7 +939,7 @@ impl TransferFunction {
         match self {
             TransferFunction::Linear => x,
             TransferFunction::Rec709 => rec709_oetf(x).min(1.0).max(0.0),
-            TransferFunction::SLog3 => if x >= 0.01_f32 { 0.432699_f32 * (10.0_f32 * x + 1.0_f32).log10() + 0.037584_f32 } else { (x * 261.5_f32 + 10.23_f32) / 1023.0_f32 },
+            TransferFunction::SLog3 => if x >= 0.01125_f32 { (420.0_f32 + 261.5_f32 * ((x + 0.01_f32) / 0.19_f32).log10()) / 1023.0_f32 } else { (x * (171.2102946929_f32 - 95.0_f32) / 0.01125_f32 + 95.0_f32) / 1023.0_f32 },
             TransferFunction::VLog => if x < 0.01 { 5.6_f32 * x + 0.125_f32 } else { 0.241514_f32 * (x + 0.00873_f32).log10() + 0.598206_f32 },
             TransferFunction::ARRIlog3 => if x > 0.010591_f32 { 0.247190_f32 * (5.555556_f32 * x + 0.052272_f32).log10() + 0.385537_f32 } else { 5.367655_f32 * x + 0.092809_f32 },
             TransferFunction::ARRIlog4 => {

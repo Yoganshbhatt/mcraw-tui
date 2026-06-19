@@ -255,20 +255,24 @@ fn main(
                 let bw = bn * wb_b;
 
                 // 2. Highlight Reconstruction — desaturate toward neutral
-                //    when a single channel clips. Per-pixel trigger on
-                //    `max_raw > 0.95` (Section 1.6 of optimisation.md).
-                let max_raw = max(rn, max(gn, bn));
-                let max_wb  = max(rw, max(gw, bw));
-                let t_highlight = clamp((max_raw - 0.95) / 0.05, 0.0, 1.0);
-                let neutral = min(1.0, max_wb);
-
+                //    when a single channel clips. Only for display-referred
+                //    curves (Linear gm=0, Rec.709 gm=1, Gamma2.4 gm=12).
+                //    Log curves encode 4-100× of dynamic range — skip to
+                //    preserve highlight detail for the scene-referred OETF.
+                let is_display_referred = gm == 0u || gm == 1u || gm == 12u;
                 var final_rw = rw;
                 var final_gw = gw;
                 var final_bw = bw;
-                if (t_highlight > 0.0) {
-                    final_rw = mix(rw, neutral, t_highlight);
-                    final_gw = mix(gw, neutral, t_highlight);
-                    final_bw = mix(bw, neutral, t_highlight);
+                if (is_display_referred) {
+                    let max_raw = max(rn, max(gn, bn));
+                    let max_wb  = max(rw, max(gw, bw));
+                    let t_highlight = clamp((max_raw - 0.95) / 0.05, 0.0, 1.0);
+                    let neutral = min(1.0, max_wb);
+                    if (t_highlight > 0.0) {
+                        final_rw = mix(rw, neutral, t_highlight);
+                        final_gw = mix(gw, neutral, t_highlight);
+                        final_bw = mix(bw, neutral, t_highlight);
+                    }
                 }
 
                 // 3. Apply CCM (on WB'd values — standard pipeline)
@@ -279,6 +283,22 @@ fn main(
                 rout = max(rout, 0.0);
                 gout = max(gout, 0.0);
                 bout = max(bout, 0.0);
+
+                // 4. Gamut soft-clip (log curves only): desaturate extreme
+                //    out-of-gamut values (>1.0) toward luminance. Prevents
+                //    "wild highlight peaks" from wide-gamut CCM matrices
+                //    (DWG, CanonCG, SG3C) while preserving in-gamut colors.
+                if (!is_display_referred) {
+                    let max_val = max(rout, max(gout, bout));
+                    if (max_val > 1.0) {
+                        let lum = 0.2126 * rout + 0.7152 * gout + 0.0722 * bout;
+                        let lum_c = min(lum, max_val);
+                        let t_soft = min(max_val - 1.0, 1.0);
+                        rout = mix(rout, lum_c, t_soft);
+                        gout = mix(gout, lum_c, t_soft);
+                        bout = mix(bout, lum_c, t_soft);
+                    }
+                }
 
                 var ro: f32; var go: f32; var bo: f32;
 
@@ -310,9 +330,20 @@ fn main(
                     go = select(4.5 * gout, 1.099 * pow(gout, 0.45) - 0.099, gout >= 0.018);
                     bo = select(4.5 * bout, 1.099 * pow(bout, 0.45) - 0.099, bout >= 0.018);
                 } else if (gm == 2u) {
-                    ro = select((rout * 261.5 + 10.23) / 1023.0, 0.432699 * log10(10.0 * rout + 1.0) + 0.037584, rout >= 0.01);
-                    go = select((gout * 261.5 + 10.23) / 1023.0, 0.432699 * log10(10.0 * gout + 1.0) + 0.037584, gout >= 0.01);
-                    bo = select((bout * 261.5 + 10.23) / 1023.0, 0.432699 * log10(10.0 * bout + 1.0) + 0.037584, bout >= 0.01);
+                    // Sony S-Log3 (correct per "S-Log3 Technical Summary", Sept 2014)
+                    let slog3_cut = 0.01125;
+                    let slog3_linear_slope = (171.2102946929 - 95.0) / slog3_cut;
+                    let slog3_a = 420.0;
+                    let slog3_b = 261.5;
+                    ro = select((rout * slog3_linear_slope + 95.0) / 1023.0,
+                                (slog3_a + slog3_b * log10(max(1e-10, (rout + 0.01) / 0.19))) / 1023.0,
+                                rout >= slog3_cut);
+                    go = select((gout * slog3_linear_slope + 95.0) / 1023.0,
+                                (slog3_a + slog3_b * log10(max(1e-10, (gout + 0.01) / 0.19))) / 1023.0,
+                                gout >= slog3_cut);
+                    bo = select((bout * slog3_linear_slope + 95.0) / 1023.0,
+                                (slog3_a + slog3_b * log10(max(1e-10, (bout + 0.01) / 0.19))) / 1023.0,
+                                bout >= slog3_cut);
                 } else if (gm == 3u) {
                     ro = select(5.6 * rout + 0.125, 0.241514 * log10(rout + 0.00873) + 0.598206, rout >= 0.01);
                     go = select(5.6 * gout + 0.125, 0.241514 * log10(gout + 0.00873) + 0.598206, gout >= 0.01);
@@ -322,11 +353,13 @@ fn main(
                     go = select(5.367655 * gout + 0.092809, 0.247190 * log10(5.555556 * gout + 0.052272) + 0.385537, gout > 0.010591);
                     bo = select(5.367655 * bout + 0.092809, 0.247190 * log10(5.555556 * bout + 0.052272) + 0.385537, bout > 0.010591);
                 } else if (gm == 5u) {
+                    // Canon C-Log3 (Canon "C-Log3 characteristics", 2016).
+                    // Three segments: negative (log), linear mid, positive (log).
                     let neg = (0.097465473 - 0.12512219) / 1.9754798;
                     let pos = (0.15277891 - 0.12512219) / 1.9754798;
-                    ro = select(-0.36726845 * log10(max(1e-10, -rout * 14.98325 + 1.0)) + 0.12783901, select(1.9754798 * rout + 0.12512219, 0.36726845 * log10(rout * 14.98325 + 1.0) + 0.12240537, rout <= pos), rout < neg);
-                    go = select(-0.36726845 * log10(max(1e-10, -gout * 14.98325 + 1.0)) + 0.12783901, select(1.9754798 * gout + 0.12512219, 0.36726845 * log10(gout * 14.98325 + 1.0) + 0.12240537, gout <= pos), gout < neg);
-                    bo = select(-0.36726845 * log10(max(1e-10, -bout * 14.98325 + 1.0)) + 0.12783901, select(1.9754798 * bout + 0.12512219, 0.36726845 * log10(bout * 14.98325 + 1.0) + 0.12240537, bout <= pos), bout < neg);
+                    ro = select(select(-0.36726845 * log10(max(1e-10, -rout * 14.98325 + 1.0)) + 0.12783901, 1.9754798 * rout + 0.12512219, rout >= neg), 0.36726845 * log10(rout * 14.98325 + 1.0) + 0.12240537, rout > pos);
+                    go = select(select(-0.36726845 * log10(max(1e-10, -gout * 14.98325 + 1.0)) + 0.12783901, 1.9754798 * gout + 0.12512219, gout >= neg), 0.36726845 * log10(gout * 14.98325 + 1.0) + 0.12240537, gout > pos);
+                    bo = select(select(-0.36726845 * log10(max(1e-10, -bout * 14.98325 + 1.0)) + 0.12783901, 1.9754798 * bout + 0.12512219, bout >= neg), 0.36726845 * log10(bout * 14.98325 + 1.0) + 0.12240537, bout > pos);
                 } else if (gm == 6u) {
                     ro = select(8.799461 * rout + 0.092864, 0.245281 * log10(5.555556 * rout + 0.064829) + 0.384316, rout >= 0.000889);
                     go = select(8.799461 * gout + 0.092864, 0.245281 * log10(5.555556 * gout + 0.064829) + 0.384316, gout >= 0.000889);
@@ -347,9 +380,12 @@ fn main(
                     go = select(0.17883277 * log(max(1e-12, 12.0 * gout - 0.28466892)) + 0.55991073, sqrt(3.0 * gout), gout < (1.0 / 12.0));
                     bo = select(0.17883277 * log(max(1e-12, 12.0 * bout - 0.28466892)) + 0.55991073, sqrt(3.0 * bout), bout < (1.0 / 12.0));
                 } else if (gm == 10u) {
-                    ro = select(10.44426855 * rout, 0.07329248 * (log2(rout + 0.0075) + 7.0), rout <= 0.00262409);
-                    go = select(10.44426855 * gout, 0.07329248 * (log2(gout + 0.0075) + 7.0), gout <= 0.00262409);
-                    bo = select(10.44426855 * bout, 0.07329248 * (log2(bout + 0.0075) + 7.0), bout <= 0.00262409);
+                    // DaVinci Intermediate (BMD white paper).
+                    // select(f, t, cond) = cond ? t : f
+                    // Linear below knee, log above.
+                    ro = select(0.07329248 * (log2(rout + 0.0075) + 7.0), 10.44426855 * rout, rout <= 0.00262409);
+                    go = select(0.07329248 * (log2(gout + 0.0075) + 7.0), 10.44426855 * gout, gout <= 0.00262409);
+                    bo = select(0.07329248 * (log2(bout + 0.0075) + 7.0), 10.44426855 * bout, bout <= 0.00262409);
                 } else if (gm == 11u) {
                     let R0 = -0.05641088; let RT = 0.01; let C = 47.28711236;
                     let BETA = 0.00964052; let GAMMA = 0.08550479; let DELTA = 0.69336945;

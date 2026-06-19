@@ -139,19 +139,11 @@ impl VideoEncoder {
             "-pix_fmt", pix_fmt,
         ]);
 
-        // Append dynamic extra args (profile, crf, preset, color tags, etc.)
+        // Append dynamic extra args (profile, crf, preset, color tags,
+        // scale filter for wide-gamut YUV conversion, etc.).
+        // The scale filter (if needed) is injected by to_ffmpeg_args in
+        // export.rs — we pass it through as part of extra_args.
         cmd.args(extra_args);
-
-        // For ProRes, DNxHR, and VideoToolbox encoders, inject an explicit format
-        // filter so FFmpeg does not choke on the rgb48le rawvideo input.
-        // VideoToolbox encoders require explicit format conversion from RGB to YUV.
-        match codec {
-            "prores_ks" | "prores_videotoolbox" | "dnxhd"
-            | "hevc_videotoolbox" | "h264_videotoolbox" => {
-                cmd.args(["-vf", &format!("format={}", pix_fmt)]);
-            }
-            _ => {}
-        }
 
         // Move the `moov` atom to the front of the file on finalize. Without
         // this, the MP4/MOV muxer writes `moov` after all `mdat` chunks, so

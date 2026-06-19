@@ -61,6 +61,7 @@ impl CodecFamily {
         av1: Av1Profile,
         vp9: Vp9Profile,
         rate_control: &RateControl,
+        is_wide_gamut: bool,
     ) -> (String, String, Vec<String>) {
         let mut base_codec_name: String = String::new();
         let mut base_pix_fmt: String = String::new();
@@ -68,13 +69,18 @@ impl CodecFamily {
 
         match self {
             CodecFamily::ProRes => {
-                let (profile_v, pix_fmt) = match prores {
+                let (profile_v, base_pix) = match prores {
                     ProResProfile::Proxy => ("0", "yuv422p10le"),
                     ProResProfile::LT => ("1", "yuv422p10le"),
                     ProResProfile::Standard => ("2", "yuv422p10le"),
                     ProResProfile::HQ => ("3", "yuv422p10le"),
                     ProResProfile::P4444 => ("4", "yuva444p10le"),
                     ProResProfile::XQ4444 => ("5", "yuva444p12le"),
+                };
+                let pix_fmt = match (is_wide_gamut, prores) {
+                    (true, ProResProfile::P4444 | ProResProfile::XQ4444) => base_pix,
+                    (true, _) => "gbrp10le",
+                    (false, _) => base_pix,
                 };
                 base_codec_name = prores_encoder.to_string();
                 base_pix_fmt = pix_fmt.to_string();
@@ -94,6 +100,21 @@ impl CodecFamily {
             }
             CodecFamily::HEVC => {
                 match hevc_encoder {
+                    "libx265" => {
+                        if is_wide_gamut {
+                            base_codec_name = "libx265".to_string();
+                            base_pix_fmt = "gbrp10le".to_string();
+                            base_extra = vec![];
+                        } else {
+                            let pix_fmt = match hevc {
+                                HevcProfile::Main10_420 => "yuv420p10le",
+                                HevcProfile::Main10_444 => "yuv444p10le",
+                            };
+                            base_codec_name = "libx265".to_string();
+                            base_pix_fmt = pix_fmt.to_string();
+                            base_extra = vec!["-preset", "slow"];
+                        }
+                    }
                     "hevc_nvenc" => {
                         base_codec_name = "hevc_nvenc".to_string();
                         base_pix_fmt = "p010le".to_string();
@@ -114,92 +135,118 @@ impl CodecFamily {
                         base_extra = vec!["-realtime", "true"];
                     }
                     _ => {
-                        let pix_fmt = match hevc {
-                            HevcProfile::Main10_420 => "yuv420p10le",
-                            HevcProfile::Main10_444 => "yuv444p10le",
-                        };
-                        base_codec_name = "libx265".to_string();
-                        base_pix_fmt = pix_fmt.to_string();
-                        base_extra = vec!["-pix_fmt", pix_fmt];
+                        if is_wide_gamut {
+                            base_codec_name = "libx265".to_string();
+                            base_pix_fmt = "gbrp10le".to_string();
+                            base_extra = vec!["-preset", "slow"];
+                        } else {
+                            let pix_fmt = match hevc {
+                                HevcProfile::Main10_420 => "yuv420p10le",
+                                HevcProfile::Main10_444 => "yuv444p10le",
+                            };
+                            base_codec_name = "libx265".to_string();
+                            base_pix_fmt = pix_fmt.to_string();
+                            base_extra = vec!["-pix_fmt", pix_fmt, "-preset", "slow"];
+                        }
                     }
                 }
             }
             CodecFamily::H264 => {
-                match h264_encoder {
-                    "h264_nvenc" => {
-                        let (pf, ext) = match h264 {
-                            H264Profile::High10bit => ("p010le", vec!["-preset", "p6", "-profile:v", "high10"]),
-                            H264Profile::Main8bit => ("yuv420p", vec!["-preset", "p6"]),
-                        };
-                        base_codec_name = "h264_nvenc".to_string();
-                        base_pix_fmt = pf.to_string();
-                        base_extra = ext;
-                    }
-                    "h264_amf" => {
-                        let (pf, ext) = match h264 {
-                            H264Profile::High10bit => ("p010le", vec!["-quality", "quality"]),
-                            H264Profile::Main8bit => ("yuv420p", vec!["-quality", "quality"]),
-                        };
-                        base_codec_name = "h264_amf".to_string();
-                        base_pix_fmt = pf.to_string();
-                        base_extra = ext;
-                    }
-                    "h264_qsv" => {
-                        let pf = match h264 {
-                            H264Profile::High10bit => "p010le",
-                            H264Profile::Main8bit => "yuv420p",
-                        };
-                        base_codec_name = "h264_qsv".to_string();
-                        base_pix_fmt = pf.to_string();
-                    }
-                    "h264_videotoolbox" => {
-                        let pf = match h264 {
-                            H264Profile::High10bit => "p010le",
-                            H264Profile::Main8bit => "yuv420p",
-                        };
-                        base_codec_name = "h264_videotoolbox".to_string();
-                        base_pix_fmt = pf.to_string();
-                        base_extra = vec!["-realtime", "true"];
-                    }
-                    _ => {
-                        let (pf, ext) = match h264 {
-                            H264Profile::Main8bit => ("yuv420p", vec!["-preset", "slow"]),
-                            H264Profile::High10bit => ("yuv422p10le", vec!["-preset", "slow"]),
-                        };
-                        base_codec_name = "libx264".to_string();
-                        base_pix_fmt = pf.to_string();
-                        base_extra = ext;
+                if is_wide_gamut {
+                    // H264 has no 10-bit planar RGB support, and doesn't
+                    // encode wide-gamut properly. Use libx265 with gbrp10le.
+                    base_codec_name = "libx265".to_string();
+                    base_pix_fmt = "gbrp10le".to_string();
+                    base_extra = vec!["-pix_fmt", "gbrp10le"];
+                } else {
+                    match h264_encoder {
+                        "h264_nvenc" => {
+                            let (pf, ext) = match h264 {
+                                H264Profile::High10bit => ("p010le", vec!["-preset", "p6", "-profile:v", "high10"]),
+                                H264Profile::Main8bit => ("yuv420p", vec!["-preset", "p6"]),
+                            };
+                            base_codec_name = "h264_nvenc".to_string();
+                            base_pix_fmt = pf.to_string();
+                            base_extra = ext;
+                        }
+                        "h264_amf" => {
+                            let (pf, ext) = match h264 {
+                                H264Profile::High10bit => ("p010le", vec!["-quality", "quality"]),
+                                H264Profile::Main8bit => ("yuv420p", vec!["-quality", "quality"]),
+                            };
+                            base_codec_name = "h264_amf".to_string();
+                            base_pix_fmt = pf.to_string();
+                            base_extra = ext;
+                        }
+                        "h264_qsv" => {
+                            let pf = match h264 {
+                                H264Profile::High10bit => "p010le",
+                                H264Profile::Main8bit => "yuv420p",
+                            };
+                            base_codec_name = "h264_qsv".to_string();
+                            base_pix_fmt = pf.to_string();
+                        }
+                        "h264_videotoolbox" => {
+                            let pf = match h264 {
+                                H264Profile::High10bit => "p010le",
+                                H264Profile::Main8bit => "yuv420p",
+                            };
+                            base_codec_name = "h264_videotoolbox".to_string();
+                            base_pix_fmt = pf.to_string();
+                            base_extra = vec!["-realtime", "true"];
+                        }
+                        _ => {
+                            let (pf, ext) = match h264 {
+                                H264Profile::Main8bit => ("yuv420p", vec!["-preset", "slow"]),
+                                H264Profile::High10bit => ("yuv422p10le", vec!["-preset", "slow"]),
+                            };
+                            base_codec_name = "libx264".to_string();
+                            base_pix_fmt = pf.to_string();
+                            base_extra = ext;
+                        }
                     }
                 }
             }
             CodecFamily::AV1 => {
                 match av1_encoder {
+                    "libsvtav1" => {
+                        base_codec_name = "libsvtav1".to_string();
+                        base_pix_fmt = match av1 {
+                            Av1Profile::Profile0_420_10bit => "yuv420p10le",
+                            Av1Profile::Profile1_444_10bit => "yuv444p10le",
+                        }.to_string();
+                        base_extra = vec!["-preset", "8"];
+                    }
                     "av1_nvenc" => {
                         base_codec_name = "av1_nvenc".to_string();
-                        base_pix_fmt = "p010le".to_string();
+                        base_pix_fmt = match av1 {
+                            Av1Profile::Profile0_420_10bit => "p010le",
+                            Av1Profile::Profile1_444_10bit => "yuv444p10le",
+                        }.to_string();
                         base_extra = vec!["-preset", "p6"];
                     }
                     "av1_amf" => {
                         base_codec_name = "av1_amf".to_string();
-                        base_pix_fmt = "p010le".to_string();
+                        base_pix_fmt = match av1 {
+                            Av1Profile::Profile0_420_10bit => "p010le",
+                            Av1Profile::Profile1_444_10bit => "yuv444p10le",
+                        }.to_string();
                         base_extra = vec!["-quality", "quality"];
                     }
                     "av1_qsv" => {
                         base_codec_name = "av1_qsv".to_string();
-                        base_pix_fmt = "p010le".to_string();
-                    }
-                    "libsvtav1" => {
-                        base_codec_name = "libsvtav1".to_string();
-                        base_pix_fmt = "yuv420p10le".to_string();
-                        base_extra = vec!["-preset", "8"];
+                        base_pix_fmt = match av1 {
+                            Av1Profile::Profile0_420_10bit => "p010le",
+                            Av1Profile::Profile1_444_10bit => "yuv444p10le",
+                        }.to_string();
                     }
                     _ => {
-                        base_codec_name = "libaom-av1".to_string();
-                        base_pix_fmt = "yuv420p10le".to_string();
-                        // `-cpu-used 4` is libaom's speed preset.
-                        // `-b:v 0` is handled by `rate_control_args` for
-                        // CQ modes (so bitrate modes can override cleanly).
-                        base_extra = vec!["-cpu-used", "4"];
+                        base_codec_name = "libsvtav1".to_string();
+                        base_pix_fmt = match av1 {
+                            Av1Profile::Profile0_420_10bit => "yuv420p10le",
+                            Av1Profile::Profile1_444_10bit => "yuv444p10le",
+                        }.to_string();
+                        base_extra = vec!["-preset", "8"];
                     }
                 }
             }
@@ -218,6 +265,20 @@ impl CodecFamily {
 
         // Convert static extra args to owned Strings
         let mut extra: Vec<String> = base_extra.iter().map(|&s| s.to_string()).collect();
+
+        // Inject a scale filter for wide-gamut → YUV pixel formats.
+        // Planar RGB formats (gbrp*) bypass RGB→YUV conversion entirely,
+        // so no matrix correction is needed — the data stays in pure RGB
+        // through the entire encode pipeline.
+        // For YUV formats we force swscale to use the bt2020nc (non-constant
+        // luminance) matrix in full range so the mathematical rotation from
+        // RGB preserves 100% of the wide-gamut colorimetry. Without this,
+        // FFmpeg defaults to BT.601/BT.709 matrix coefficients which clip
+        // values outside the BT.709 gamut.
+        if is_wide_gamut && !base_pix_fmt.starts_with("gbrp") && !base_pix_fmt.starts_with("rgb") {
+            extra.push("-vf".into());
+            extra.push(format!("scale=flags=accurate_rnd+full_chroma_int:out_color_matrix=bt2020nc:out_range=full,format={}", base_pix_fmt));
+        }
 
         // Append rate-control flags. ProRes / DNxHR ignore CRF / bitrate
         // flags (they use the explicit `-profile:v` instead), so we skip
