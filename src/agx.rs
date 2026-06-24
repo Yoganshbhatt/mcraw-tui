@@ -749,6 +749,7 @@ impl From<crate::color::ColorSpace> for Gamut {
             crate::color::ColorSpace::FGamutC => Gamut::Ap0,
             crate::color::ColorSpace::DaVinciWideGamut => Gamut::DaVinciWg,
             crate::color::ColorSpace::DisplayP3 => Gamut::P3D65,
+            _ => Gamut::Rec709,
         }
     }
 }

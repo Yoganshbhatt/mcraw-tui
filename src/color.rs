@@ -17,15 +17,16 @@ pub trait TransferFunctionProcessor {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorSpace {
-    ACESAP1, ARRIWideGamut3, ARRIWideGamut4, CanonCinemaGamut, DaVinciWideGamut,
-    DciP3, DisplayP3, FGamut, FGamutC, PanasonicVGamut, Rec2020, Rec709, SGamut3,
-    SGamut3Cine, Srgb,
+    ACESAP1, AppleWideGamut, ARRIWideGamut3, ARRIWideGamut4, CanonCinemaGamut,
+    DaVinciWideGamut, DciP3, DisplayP3, FGamut, FGamutC, PanasonicVGamut, Rec2020,
+    Rec709, SGamut3, SGamut3Cine, Srgb,
 }
 
 impl ColorSpace {
     pub fn name(&self) -> &'static str {
         match self {
             ColorSpace::ACESAP1 => "ACES AP1",
+            ColorSpace::AppleWideGamut => "Apple Wide Gamut",
             ColorSpace::ARRIWideGamut3 => "ARRI Wide Gamut 3", ColorSpace::ARRIWideGamut4 => "ARRI Wide Gamut 4",
             ColorSpace::CanonCinemaGamut => "Canon Cinema Gamut",
             ColorSpace::DaVinciWideGamut => "DaVinci Wide Gamut",
@@ -48,6 +49,7 @@ impl ColorSpace {
 
     pub fn get_xyz_to_rgb_matrix(&self) -> [f32; 9] {
         match self {
+            ColorSpace::AppleWideGamut => xyz_to_rgb_from_primaries(0.725, 0.301, 0.221, 0.814, 0.068, -0.076, 0.3127, 0.3290),
             ColorSpace::Rec709 | ColorSpace::Srgb => xyz_to_rec709(),
             ColorSpace::Rec2020 | ColorSpace::FGamut => xyz_to_rgb_from_primaries(0.708, 0.292, 0.170, 0.797, 0.131, 0.046, 0.3127, 0.3290),
             ColorSpace::DciP3 => xyz_to_rgb_from_primaries(0.680, 0.320, 0.265, 0.690, 0.150, 0.060, 0.314, 0.351),
@@ -66,7 +68,7 @@ impl ColorSpace {
 
     pub fn all() -> &'static [ColorSpace] {
         // Alphabetical order for deterministic, pleasing cycle order.
-        &[ColorSpace::ACESAP1, ColorSpace::ARRIWideGamut3, ColorSpace::ARRIWideGamut4,
+        &[ColorSpace::ACESAP1, ColorSpace::AppleWideGamut, ColorSpace::ARRIWideGamut3, ColorSpace::ARRIWideGamut4,
           ColorSpace::CanonCinemaGamut, ColorSpace::DaVinciWideGamut, ColorSpace::DciP3,
           ColorSpace::DisplayP3, ColorSpace::FGamut, ColorSpace::FGamutC,
           ColorSpace::PanasonicVGamut, ColorSpace::Rec2020, ColorSpace::Rec709,
@@ -414,6 +416,67 @@ pub fn camera_to_xyz_matrix(color_matrix: &[f32; 9], calibration_matrix: Option<
 /// `ForwardMatrix1` (XYZ→Camera) is available.
 pub fn forward_to_camera_xyz(forward_matrix: &[f32; 9]) -> [f32; 9] {
     detect_camera_to_xyz(forward_matrix)
+}
+
+/// Build a fused Camera→Rec709 CCM for the preview thumbnail path.
+///
+/// Mirrors the export pipeline's CCM construction (pipeline.rs:128-204):
+///   1. Prefer ForwardMatrix1+2 (averaged) when available — already D50-adapted
+///   2. Fall back to ColorMatrix1+2 + calibration + chromatic adaptation
+///   3. Detect matrix orientation automatically (D50 white-point row-sum check)
+///   4. Bradford-adapt from reference illuminant to D65
+///   5. Fuse with Rec709 primaries
+///
+/// This fixes the green/pink tint on older MOTION files where the raw
+/// `ColorMatrix1` was applied without orientation detection or D50→D65
+/// chromatic adaptation.
+pub fn build_preview_ccm(
+    color_matrix: Option<&[f64; 9]>,
+    forward_matrix1: Option<&[f64; 9]>,
+    forward_matrix2: Option<&[f64; 9]>,
+    color_matrix2: Option<&[f64; 9]>,
+    calibration_matrix1: Option<&[f64; 9]>,
+) -> [f32; 9] {
+    let cm1_f32 = color_matrix.map(|m| [m[0] as f32, m[1] as f32, m[2] as f32, m[3] as f32, m[4] as f32, m[5] as f32, m[6] as f32, m[7] as f32, m[8] as f32]);
+    let cm2_f32 = color_matrix2.map(|m| [m[0] as f32, m[1] as f32, m[2] as f32, m[3] as f32, m[4] as f32, m[5] as f32, m[6] as f32, m[7] as f32, m[8] as f32]);
+    let fm1_f32 = forward_matrix1.map(|m| [m[0] as f32, m[1] as f32, m[2] as f32, m[3] as f32, m[4] as f32, m[5] as f32, m[6] as f32, m[7] as f32, m[8] as f32]);
+    let fm2_f32 = forward_matrix2.map(|m| [m[0] as f32, m[1] as f32, m[2] as f32, m[3] as f32, m[4] as f32, m[5] as f32, m[6] as f32, m[7] as f32, m[8] as f32]);
+    let cal1_f32 = calibration_matrix1.map(|m| [m[0] as f32, m[1] as f32, m[2] as f32, m[3] as f32, m[4] as f32, m[5] as f32, m[6] as f32, m[7] as f32, m[8] as f32]);
+
+    let cam_to_xyz: [f32; 9] = if let (Some(ref fm1), Some(ref fm2)) = (fm1_f32, fm2_f32) {
+        let fm_avg = interpolate_matrix(fm1, fm2, 0.5);
+        let rs = [fm_avg[0] + fm_avg[1] + fm_avg[2], fm_avg[3] + fm_avg[4] + fm_avg[5], fm_avg[6] + fm_avg[7] + fm_avg[8]];
+        let d = (rs[0] - D50_XYZ[0]).powi(2) + (rs[1] - D50_XYZ[1]).powi(2) + (rs[2] - D50_XYZ[2]).powi(2);
+        if d < 0.05 { fm_avg } else { detect_camera_to_xyz(&fm_avg) }
+    } else if let Some(ref fm1) = fm1_f32 {
+        let rs = [fm1[0] + fm1[1] + fm1[2], fm1[3] + fm1[4] + fm1[5], fm1[6] + fm1[7] + fm1[8]];
+        let d = (rs[0] - D50_XYZ[0]).powi(2) + (rs[1] - D50_XYZ[1]).powi(2) + (rs[2] - D50_XYZ[2]).powi(2);
+        if d < 0.05 { *fm1 } else { detect_camera_to_xyz(fm1) }
+    } else if let Some(ref cm1) = cm1_f32 {
+        let cal = cal1_f32;
+        match cm2_f32 {
+            Some(ref cm2) => {
+                let cm_avg = interpolate_matrix(cm1, cm2, 0.5);
+                camera_to_xyz_matrix(&cm_avg, cal.as_ref())
+            }
+            None => camera_to_xyz_matrix(cm1, cal.as_ref()),
+        }
+    } else {
+        identity_ccm()
+    };
+
+    // Determine reference illuminant from the selected matrix
+    let rs = [cam_to_xyz[0] + cam_to_xyz[1] + cam_to_xyz[2], cam_to_xyz[3] + cam_to_xyz[4] + cam_to_xyz[5], cam_to_xyz[6] + cam_to_xyz[7] + cam_to_xyz[8]];
+    let cam_illuminant_xyz = if fm1_f32.is_some() {
+        D50_XYZ
+    } else {
+        let l = rs[0].max(rs[1]).max(rs[2]);
+        if l < 0.1 || l > 5.0 { D50_XYZ } else { rs }
+    };
+
+    let bradford_static = build_bradford_matrix(&cam_illuminant_xyz, &D65_XYZ);
+    let cam_to_xyz_d65 = mat_mul_3x3(&bradford_static, &cam_to_xyz);
+    mat_mul_3x3(&xyz_to_rec709(), &cam_to_xyz_d65)
 }
 
 pub fn interpolate_matrix(a: &[f32; 9], b: &[f32; 9], t: f32) -> [f32; 9] {

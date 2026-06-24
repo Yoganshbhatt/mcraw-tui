@@ -11,6 +11,9 @@ Cross-platform terminal UI for browsing and exporting MotionCam `.mcraw` files t
 - **Render Queue**: Multi-file batch export with per-item status tracking
 - **Export Settings**: 15 color spaces (Rec.709, S-Gamut3, ARRI WG, Canon Cinema Gamut, DaVinci Wide Gamut, ACES AP1, etc.), 14 transfer functions (S-Log3, C-Log3, ARRI LogC3/C4, PQ, HLG, etc.)
 - **16 export codec profiles**: ProRes 4444/XQ, HEVC 10-bit 4:4:4, H.264, AV1 (SVT-AV1, NVENC), VP9, DNxHR
+- **TUI Preview**: Preview thumbnails with Sixel graphics (Kitty > Chafa fallback planned)
+- **Apple Wide Gamut**: Full color pipeline support for Apple Log media
+- **Custom FPS**: Per-item export frame rate override (23.976, 24, 25, 30, 50, 60, 120 fps)
 - **Hardware acceleration**: Auto-detects NVENC, AMF, QSV, VideoToolbox encoders
 - **Pure Rust**: No C++ dependencies, no FFI
 
@@ -57,12 +60,14 @@ mcraw-tui info -f <file.mcraw>
 | Key | Action |
 |-----|--------|
 | `b` | Toggle file browser |
+| `G` | Grade mode — full-screen RAW adjustments (8 sliders) |
 | `Tab` | Cycle focus |
 | `Space` | Select / deselect |
 | `a` / `A` | Add selected / all to queue |
 | `v` / `R` | Render selected / all items |
 | `c/g/t/p/r` | Cycle codec / gamut / transfer / profile / rate |
-| `↑/↓/j/k` | Navigate lists |
+| `↑/↓/j/k` | Navigate lists / grade sliders |
+| `←/→/h/l` | Frame navigation / grade slider selection |
 | `?` | Help overlay |
 | `q` / `Esc` | Quit / close overlay |
 

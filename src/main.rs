@@ -21,6 +21,8 @@ mod pipeline;
 mod preset;
 mod preview;
 mod stats;
+mod thumbnail;
+mod thumbnail_worker;
 mod ui;
 
 use anyhow::Result;

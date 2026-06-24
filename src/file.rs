@@ -395,21 +395,22 @@ fn parse_motion_header(data: &[u8], path: &Path) -> Result<McrawFileInfo> {
     let extra_data = json.extra_data;
     let device_profile = json.device_specific_profile;
 
-    let camera_model_opt: Option<String> = json.unique_camera_model
-        .or_else(|| device_profile.as_ref().and_then(|p| p.device_model.clone()));
-    let camera_model = camera_model_opt.unwrap_or_default();
+    let build_model = extra_data
+        .as_ref()
+        .and_then(|e| e.metadata.as_ref())
+        .and_then(|m| m.build_model.clone());
+
+    let camera_model: Option<String> = device_profile.as_ref()
+        .and_then(|p| p.device_model.clone())
+        .filter(|s| !s.is_empty())
+        .or_else(|| json.unique_camera_model.filter(|s| !s.is_empty()))
+        .or_else(|| build_model.filter(|s| !s.is_empty()));
 
     let sensor_make = extra_data
         .as_ref()
         .and_then(|e| e.metadata.as_ref())
         .and_then(|m| m.build_manufacturer.clone())
         .unwrap_or_default();
-
-    let build_model = extra_data
-        .as_ref()
-        .and_then(|e| e.metadata.as_ref())
-        .and_then(|m| m.build_model.clone())
-        .unwrap_or(camera_model.clone());
 
     let aperture = json.apertures.and_then(|mut a| a.pop());
     let focal_length = json.focal_lengths.and_then(|mut a| a.pop());
@@ -455,6 +456,16 @@ fn parse_motion_header(data: &[u8], path: &Path) -> Result<McrawFileInfo> {
     let mut height: u16 = 0;
     let mut fps: f64 = 0.0;
 
+    let black_level = json.black_level
+        .as_ref()
+        .map(|levels| {
+            if levels.is_empty() { 0.0 }
+            else { levels.iter().sum::<f64>() / levels.len() as f64 }
+        })
+        .unwrap_or(0.0);
+
+    let white_level = json.white_level.unwrap_or(16383.0);
+
     if let Some((num_offsets, offsets, timestamps)) = parse_buffer_index(data) {
         frame_count = num_offsets;
         if num_offsets >= 2 {
@@ -483,7 +494,7 @@ fn parse_motion_header(data: &[u8], path: &Path) -> Result<McrawFileInfo> {
         camera_metadata: CameraMetadata {
             sensor_make: if sensor_make.is_empty() { None } else { Some(sensor_make) },
             sensor_model: None,
-            camera_model: if build_model.is_empty() { None } else { Some(build_model) },
+            camera_model,
             lens_model: None,
             focal_length,
             aperture,
@@ -511,8 +522,8 @@ fn parse_motion_header(data: &[u8], path: &Path) -> Result<McrawFileInfo> {
         active_offset_y: 0,
         active_width: 0,
         active_height: 0,
-        white_level: 16383.0,
-        black_level: 0.0,
+        white_level,
+        black_level,
     })
 }
 
@@ -1041,8 +1052,8 @@ mod tests {
             active_offset_y: 0,
             active_width: 0,
             active_height: 0,
-            white_level: 16383.0,
-            black_level: 0.0,
+white_level: 16383.0,
+        black_level: 0.0,
         };
 
         assert_eq!(make_info(1920, 1080).resolution_label(), "1080p");

@@ -54,17 +54,9 @@ pub fn format_camera_section(info: &McrawFileInfo) -> Vec<Line<'static>> {
     )));
 
     if let Some(ref model) = info.camera_metadata.camera_model {
-        lines.push(Line::from(format!("  Camera:       {}", model)));
-    }
-    if let Some(ref sensor_make) = info.camera_metadata.sensor_make {
-        lines.push(Line::from(format!("  Sensor Make:  {}", sensor_make)));
-    }
-    if let Some(ref sensor_model) = info.camera_metadata.sensor_model {
-        lines.push(Line::from(format!(
-            "  Sensor:       {} {}",
-            info.camera_metadata.sensor_make.as_deref().unwrap_or(""),
-            sensor_model
-        )));
+        if !model.is_empty() {
+            lines.push(Line::from(format!("  Camera:       {}", model)));
+        }
     }
     if let Some(ref lens) = info.camera_metadata.lens_model {
         lines.push(Line::from(format!("  Lens:         {}", lens)));
@@ -131,12 +123,6 @@ pub fn format_video_section(info: &McrawFileInfo) -> Vec<Line<'static>> {
         info.bayer_pattern.name()
     )));
 
-    if info.sensor_width > 0 || info.sensor_height > 0 {
-        lines.push(Line::from(format!(
-            "  Sensor:       {}x{}",
-            info.sensor_width, info.sensor_height
-        )));
-    }
     if info.active_width > 0 && info.active_height > 0 {
         lines.push(Line::from(format!(
             "  Active Area:  {}x{} @({},{})",

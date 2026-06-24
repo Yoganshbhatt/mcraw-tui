@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use crate::app::{App, ExportFocus, FocusTarget, ImportPopupState, QueueStatus};
 use crate::export::CodecFamily;
+use crate::file::McrawFileInfo;
 use crate::gradient::{multi_stop_color, GRADIENT_COOL, GRADIENT_WARM};
 
 
@@ -95,7 +96,6 @@ pub enum ClickAction {
     FocusMediaPool,
     FocusQueue,
     FocusExport,
-    FocusPreview,
     AddSelectedToQueue,
     AddAllToQueue,
     RenderSelected,
@@ -120,6 +120,8 @@ pub enum ClickAction {
     OpenPresetPicker,
     GradeSlider(usize),
     FocusGrade,
+    ToggleSelectAll,
+    CycleFps,
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +131,13 @@ pub enum ClickAction {
 pub fn render(frame: &mut Frame, app: &App, regions: &mut Vec<ClickRegion>) {
     let size = frame.area();
     frame.render_widget(Clear, size);
+
+    // Ghost Widget: unconditionally clear sixel state at the start of each render.
+    // Individual render paths (render_body → render_preview_or_progress → render_preview_panel)
+    // set sixel_pending=true only when PreviewState::Ready and not in export/summary mode.
+    // This prevents stale sixel data from appearing after screen transitions.
+    app.sixel_pending.set(false);
+    app.sixel_write_pos.set(None);
 
     let vert = Layout::default()
         .direction(Direction::Vertical)
@@ -142,16 +151,26 @@ pub fn render(frame: &mut Frame, app: &App, regions: &mut Vec<ClickRegion>) {
     render_header(frame, vert[0], app, regions);
 
     if app.imported_files.is_empty() && !app.show_browser {
+        // Welcome screen — clear sixel state so Ghost Widget doesn't write stale data
+        app.sixel_pending.set(false);
+        app.sixel_write_pos.set(None);
         render_empty_state(frame, vert[1], app, regions);
     } else if app.imported_files.is_empty() {
+        // Browser visible but no files — clear sixel state
+        app.sixel_pending.set(false);
+        app.sixel_write_pos.set(None);
         // Show a minimal body so browser overlay has something to render over
         let body_block = ratatui::widgets::Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Palette::BORDER));
         frame.render_widget(body_block, vert[1]);
     } else if app.show_culling {
+        app.sixel_pending.set(false);
+        app.sixel_write_pos.set(None);
         render_culling_screen(frame, vert[1], app, regions);
     } else if app.show_grade_screen {
+        app.sixel_pending.set(false);
+        app.sixel_write_pos.set(None);
         render_grade_screen_body(frame, vert[1], app, regions);
     } else {
         render_body(frame, vert[1], app, regions);
@@ -357,6 +376,16 @@ fn render_body(frame: &mut Frame, area: Rect, app: &App, regions: &mut Vec<Click
         ])
         .split(vert[0]);
 
+    let preview_split = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(50),
+            Constraint::Percentage(50),
+        ])
+        .split(top[1]);
+    let preview_left = preview_split[0];
+    let preview_right = preview_split[1];
+
     if app.focus_target == FocusTarget::Grade {
         let bottom = Layout::default()
             .direction(Direction::Horizontal)
@@ -366,7 +395,8 @@ fn render_body(frame: &mut Frame, area: Rect, app: &App, regions: &mut Vec<Click
             ])
             .split(vert[1]);
         render_media_pool(frame, app, top[0], regions);
-        render_preview_or_progress(frame, app, top[1], regions);
+        render_info_panel(frame, app, preview_left);
+        render_thumbnail_panel(frame, app, preview_right);
         render_export_settings(frame, app, bottom[0], regions);
         render_queue_panel(frame, app, bottom[1], regions);
     } else {
@@ -379,7 +409,8 @@ fn render_body(frame: &mut Frame, area: Rect, app: &App, regions: &mut Vec<Click
             ])
             .split(vert[1]);
         render_media_pool(frame, app, top[0], regions);
-        render_preview_or_progress(frame, app, top[1], regions);
+        render_info_panel(frame, app, preview_left);
+        render_thumbnail_panel(frame, app, preview_right);
         render_export_settings(frame, app, bottom[0], regions);
         render_queue_panel(frame, app, bottom[1], regions);
     }
@@ -414,7 +445,8 @@ fn render_grade_screen_body(frame: &mut Frame, area: Rect, app: &App, regions: &
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(canvas_border)),
+            .border_style(Style::default().fg(canvas_border))
+            .style(Style::default().bg(Palette::BG_VOID)),
         preview_area,
     );
 
@@ -534,7 +566,7 @@ fn render_culling_screen(frame: &mut Frame, area: Rect, app: &App, regions: &mut
     frame.render_stateful_widget(list, horiz[0], &mut state);
 
     // Right panel: large preview / info for the selected file
-    let right_border = if app.focus_target == FocusTarget::Preview { Palette::BORDER_FOCUSED } else { Palette::BORDER };
+    let right_border = Palette::BORDER;
     if let Some(info) = app.focused_file_info().or(app.file_info.as_ref()) {
         let name = info.path.split(std::path::MAIN_SEPARATOR).last().unwrap_or(&info.path);
         let text = vec![
@@ -932,14 +964,22 @@ fn render_media_pool(frame: &mut Frame, app: &App, area: Rect, regions: &mut Vec
             let add_all_btn = Rect { x: btn_row.x + 13, y: btn_row.y, width: 10, height: 1 };
             regions.push(ClickRegion { area: add_all_btn, action: ClickAction::AddAllToQueue });
 
-            let del_btn = Rect { x: btn_row.x + 24, y: btn_row.y, width: 10, height: 1 };
+            let sel_btn = Rect { x: btn_row.x + 24, y: btn_row.y, width: 10, height: 1 };
+            regions.push(ClickRegion { area: sel_btn, action: ClickAction::ToggleSelectAll });
+
+            let del_btn = Rect { x: btn_row.x + 35, y: btn_row.y, width: 10, height: 1 };
             regions.push(ClickRegion { area: del_btn, action: ClickAction::RemoveSelectedFromMediaPool });
+
+            let all_selected = app.imported_files.iter().all(|f| f.selected);
+            let sel_label = if all_selected { "None" } else { "All" };
 
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled(" [a] Add ", Style::default().fg(Palette::BUTTON_FG).bg(Palette::BUTTON_BG).add_modifier(Modifier::BOLD)),
                     Span::raw(" "),
                     Span::styled(" [A] All ", Style::default().fg(Palette::BUTTON_FG).bg(Palette::BUTTON_BG).add_modifier(Modifier::BOLD)),
+                    Span::raw(" "),
+                    Span::styled(format!(" [s] {} ", sel_label), Style::default().fg(Palette::BUTTON_FG).bg(Palette::BUTTON_BG).add_modifier(Modifier::BOLD)),
                     Span::raw(" "),
                     Span::styled(" [D] Del ", Style::default().fg(Palette::BUTTON_FG).bg(Palette::BUTTON_BG).add_modifier(Modifier::BOLD)),
                 ])),
@@ -972,8 +1012,10 @@ fn render_media_pool(frame: &mut Frame, app: &App, area: Rect, regions: &mut Vec
 // Preview or render progress panel
 // ---------------------------------------------------------------------------
 
-fn render_preview_or_progress(frame: &mut Frame, app: &App, area: Rect, _regions: &mut Vec<ClickRegion>) {
-    let is_focused = app.focus_target == FocusTarget::Preview || app.focus_target == FocusTarget::Grade;
+/// Renders the left half of the upper-right quadrant.
+/// Priority: export progress → export summary → file info → blank.
+fn render_info_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let is_focused = app.focus_target == FocusTarget::Grade;
     let base_color = if is_focused { Palette::BORDER_FOCUSED } else { Palette::BORDER };
     let border_color = shockwave_border(app.shockwave_ticks_remaining, base_color);
 
@@ -981,9 +1023,20 @@ fn render_preview_or_progress(frame: &mut Frame, app: &App, area: Rect, _regions
         render_render_progress(frame, app, area, border_color);
     } else if app.last_export_summary.is_some() {
         render_export_summary(frame, app, area, border_color);
+    } else if app.focused_file_info().or(app.file_info.as_ref()).is_some() {
+        render_file_info_panel(frame, app, area, border_color);
     } else {
-        render_preview_panel(frame, app, area, border_color);
+        render_file_info_panel(frame, app, area, border_color);
     }
+}
+
+/// Renders the right half of the upper-right quadrant — the sixel thumbnail area.
+/// Ghost Widget writes sixel bytes after terminal.draw() returns.
+fn render_thumbnail_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let is_focused = app.focus_target == FocusTarget::Grade;
+    let base_color = if is_focused { Palette::BORDER_FOCUSED } else { Palette::BORDER };
+    let border_color = shockwave_border(app.shockwave_ticks_remaining, base_color);
+    render_preview_panel(frame, app, area, border_color);
 }
 
 /// Post-render summary panel. Shown after an export finishes (success,
@@ -1101,6 +1154,143 @@ fn render_export_summary(frame: &mut Frame, app: &App, area: Rect, border_color:
     frame.render_widget(panel, area);
 }
 
+/// Renders the file info text in the left panel (no sixel).
+/// Shown when no export is in progress and no export summary is displayed.
+fn render_file_info_panel(frame: &mut Frame, app: &App, area: Rect, border_color: Color) {
+    app.sixel_pending.set(false);
+    app.sixel_write_pos.set(None);
+
+    let label_style = Style::default().fg(Palette::LABEL);
+    let value_style = Style::default().fg(Palette::VALUE);
+    let info = app.focused_file_info().or(app.file_info.as_ref());
+    let lines = info_panel_lines(info, label_style, value_style, app, area.width);
+    let panel = Paragraph::new(lines)
+        .block(Block::default()
+            .title(" Info ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color)))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(panel, area);
+}
+
+/// Renders the preview panel (sixel thumbnail) in the right half.
+fn render_preview_panel(frame: &mut Frame, app: &App, area: Rect, border_color: Color) {
+    let inner = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+
+    // Always publish panel dimensions so poll_thumbnail can compute the
+    // correct target size — even on Empty/Loading states before the first
+    // thumbnail arrives. Flag changes so stale cached entries are replaced.
+    let prev = app.preview_panel_chars.get();
+    let curr = (inner.width, inner.height);
+    if prev != Some(curr) {
+        app.needs_rethumbnail.set(true);
+    }
+    app.preview_panel_chars.set(Some(curr));
+
+    match &app.preview_state {
+        crate::preview::PreviewState::Empty => {
+            app.sixel_pending.set(false);
+            app.sixel_write_pos.set(None);
+            frame.render_widget(Clear, inner);
+
+            let placeholder = Paragraph::new(Line::from(vec![
+                Span::styled("Thumbnail", Style::default().fg(Palette::POPUP_TITLE).add_modifier(Modifier::BOLD)),
+                Span::raw("  "),
+                Span::styled("— no preview —", Style::default().fg(Color::DarkGray)),
+            ]))
+            .block(Block::default()
+                .title(" Preview ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color)))
+            .wrap(Wrap { trim: false });
+            frame.render_widget(placeholder, area);
+        }
+
+        crate::preview::PreviewState::Loading { .. } => {
+            app.sixel_pending.set(false);
+            app.sixel_write_pos.set(None);
+            frame.render_widget(Clear, inner);
+
+            let panel = Paragraph::new(Line::from(vec![
+                Span::styled("Preview", Style::default().fg(Palette::POPUP_TITLE).add_modifier(Modifier::BOLD)),
+                Span::raw("  "),
+                Span::styled("Loading thumbnail...", Style::default().fg(Palette::TEXT_SECONDARY)),
+            ]))
+            .block(Block::default()
+                .title(" Preview ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color)))
+            .wrap(Wrap { trim: false });
+            frame.render_widget(panel, area);
+        }
+
+        crate::preview::PreviewState::Ready { width, height, .. } => {
+            frame.render_widget(Clear, inner);
+
+            // Convert sixel pixel size to character-cell footprint using terminal cell size
+            let (cell_w, cell_h) = app.term_cell_size.get();
+            let sixel_chars_w = *width as f32 / cell_w;
+            let sixel_chars_h = *height as f32 / cell_h;
+
+            // Center the sixel in the available character area
+            let offset_x = ((inner.width as f32 - sixel_chars_w) / 2.0).max(0.0).round();
+            let offset_y = ((inner.height as f32 - sixel_chars_h) / 2.0).max(0.0).round();
+
+            let sixel_x = (inner.x as i32 + offset_x as i32).max(0) as u16;
+            let sixel_y = (inner.y as i32 + offset_y as i32).max(0) as u16;
+
+            // Store occupy size for Ghost Widget clearing, then write position
+            let occupy_w = (sixel_chars_w.ceil() as u16).max(1);
+            let occupy_h = (sixel_chars_h.ceil() as u16).max(1);
+            app.sixel_occupy_size.set(Some((sixel_x, sixel_y, occupy_w, occupy_h)));
+            app.sixel_write_pos.set(Some((sixel_x, sixel_y)));
+            app.sixel_pending.set(true);
+
+            let label_panel = Paragraph::new(Line::from(vec![Span::styled(
+                " Preview ",
+                Style::default().fg(Palette::POPUP_TITLE).add_modifier(Modifier::BOLD),
+            )]))
+            .block(Block::default()
+                .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
+                .border_style(Style::default().fg(border_color)));
+            frame.render_widget(label_panel, Rect {
+                x: inner.x,
+                y: inner.y.saturating_sub(1),
+                width: inner.width,
+                height: 1,
+            });
+        }
+
+        crate::preview::PreviewState::Error(ref msg) => {
+            app.sixel_pending.set(false);
+            app.sixel_write_pos.set(None);
+            frame.render_widget(Clear, inner);
+
+            let lines = vec![
+                Line::from(vec![Span::styled(" Preview", Style::default().fg(Palette::POPUP_TITLE).add_modifier(Modifier::BOLD))]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled(" ⚠ ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                    Span::styled(msg.as_str(), Style::default().fg(Color::Red)),
+                ]),
+            ];
+            let panel = Paragraph::new(lines)
+                .block(Block::default()
+                    .title(" Preview ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(border_color)))
+                .wrap(Wrap { trim: false });
+            frame.render_widget(Clear, area);
+            frame.render_widget(panel, area);
+        }
+    }
+}
+
 /// Convert a frame index and frame rate to a timecode string HH:MM:SS:FF.
 fn frames_to_timecode(frame: usize, total: usize, fps: f64) -> (String, String) {
     let tc = |f: usize| -> String {
@@ -1115,33 +1305,24 @@ fn frames_to_timecode(frame: usize, total: usize, fps: f64) -> (String, String) 
 }
 
 /// Build the sprocket-hole timeline row:
-/// `┊╎..╎..╎..╎..╎●╎..╎..╎..╎..╎..╎..╎..╎..╎┊`
-///
-/// The playhead (`●`) leaves a 1-frame phosphor trail (`░`)
-/// to simulate persistence of vision.
-fn sprocket_track(frame: usize, total: usize, width: usize, prev_playhead: Option<usize>) -> Line<'static> {
+/// `┊╎..╎●╎..╎┊`
+fn sprocket_track(frame: usize, total: usize, width: usize, _prev_playhead: Option<usize>) -> Line<'static> {
     if width < 8 || total == 0 {
         return Line::from("");
     }
-    let capacity = width.saturating_sub(2); // minus end caps
+    let capacity = width.saturating_sub(2);
     let playhead_pos = if total > 0 {
         (frame as f64 / total as f64) * capacity as f64
     } else {
         0.0
     };
     let playhead_idx = (playhead_pos as usize).min(capacity.saturating_sub(1));
-
-    // Frame tick interval
     let tick_interval = (capacity / total.min(capacity)).max(1);
-
     let mut chars = Vec::with_capacity(width);
     chars.push(Span::raw("┊"));
-
     for i in 0..capacity {
         if i == playhead_idx {
             chars.push(Span::styled("●", Style::default().fg(Palette::ACCENT_AMBER)));
-        } else if prev_playhead == Some(i) {
-            chars.push(Span::styled("░", Style::default().fg(Palette::ACCENT_AMBER)));
         } else if i % tick_interval == 0 && i < capacity - 1 {
             chars.push(Span::styled("╎", Style::default().fg(Palette::TEXT_SECONDARY)));
         } else {
@@ -1152,51 +1333,49 @@ fn sprocket_track(frame: usize, total: usize, width: usize, prev_playhead: Optio
     Line::from(chars)
 }
 
-fn render_preview_panel(frame: &mut Frame, app: &App, area: Rect, border_color: Color) {
-    let info = app.focused_file_info().or(app.file_info.as_ref());
-    let inner_w = area.width.saturating_sub(4) as usize;
-
-    let mut lines: Vec<Line> = Vec::new();
-
+/// Shared metadata lines for the info section.
+fn info_panel_lines<'a>(info: Option<&'a McrawFileInfo>, label_style: Style, value_style: Style, app: &'a App, avail_w: u16) -> Vec<Line<'a>> {
+    let mut lines = Vec::new();
     if let Some(info) = info {
-        let name = info.path.split(std::path::MAIN_SEPARATOR).last().unwrap_or(&info.path);
         let duration_secs = if info.fps > 0.0 { info.frame_count as f64 / info.fps } else { 0.0 };
         let mins = duration_secs as u64 / 60;
         let secs = duration_secs as u64 % 60;
+        let inner_w = (info.width.max(info.height) as f32 / info.width.min(info.height) as f32).round() as usize;
 
-        lines.push(Line::from(Span::styled(format!(" PREVIEW: {}", name), Style::default().fg(Palette::POPUP_TITLE).add_modifier(Modifier::BOLD))));
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![Span::styled("  Resolution:  ", Style::default().fg(Palette::LABEL)), Span::styled(format!("{} x {}", info.width, info.height), Style::default().fg(Palette::VALUE))]));
-        lines.push(Line::from(vec![Span::styled("  Frames:      ", Style::default().fg(Palette::LABEL)), Span::styled(format!("{}", info.frame_count), Style::default().fg(Palette::VALUE))]));
-        lines.push(Line::from(vec![Span::styled("  Frame Rate:  ", Style::default().fg(Palette::LABEL)), Span::styled(format!("{:.1} fps", info.fps), Style::default().fg(Palette::VALUE))]));
-        lines.push(Line::from(vec![Span::styled("  Duration:    ", Style::default().fg(Palette::LABEL)), Span::styled(format!("{:02}:{:02}", mins, secs), Style::default().fg(Palette::VALUE))]));
-        lines.push(Line::from(vec![Span::styled("  Camera:      ", Style::default().fg(Palette::LABEL)), Span::styled(info.camera_metadata.camera_model.as_deref().unwrap_or("MotionCam"), Style::default().fg(Palette::VALUE))]));
-        lines.push(Line::from(vec![Span::styled("  Sensor:      ", Style::default().fg(Palette::LABEL)), Span::styled(info.camera_metadata.sensor_model.as_deref().unwrap_or("Unknown"), Style::default().fg(Palette::VALUE))]));
-        lines.push(Line::from(vec![Span::styled("  ISO:         ", Style::default().fg(Palette::LABEL)), Span::styled(info.camera_metadata.iso.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()), Style::default().fg(Palette::VALUE))]));
-
-        // Sprocket timeline
-        if inner_w >= 16 {
-            lines.push(Line::from(""));
-            let (current_tc, total_tc) = frames_to_timecode(app.frame_index, info.frame_count as usize, info.fps);
-            let tc_str = format!("  {} / {}  ", current_tc, total_tc);
-            lines.push(Line::from(Span::styled(tc_str, Style::default().fg(Palette::TEXT_PRIMARY))));
-            lines.push(sprocket_track(app.frame_index, info.frame_count as usize, inner_w, None));
+        lines.push(Line::from(vec![
+            Span::styled("Resolution:  ", label_style),
+            Span::styled(format!("{} x {}", info.width, info.height), value_style),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Frames:      ", label_style),
+            Span::styled(format!("{}", info.frame_count), value_style),
+            Span::raw("  "),
+            Span::styled("FPS:   ", label_style),
+            Span::styled(format!("{:.1}", info.fps), value_style),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Duration:    ", label_style),
+            Span::styled(format!("{:02}:{:02}", mins, secs), value_style),
+        ]));
+        if let Some(ref cam) = info.camera_metadata.camera_model {
+            if !cam.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("Camera:      ", label_style),
+                    Span::styled(cam.as_str(), value_style),
+                ]));
+            }
         }
+        if let Some(iso) = info.camera_metadata.iso {
+            lines.push(Line::from(vec![
+                Span::styled("ISO:         ", label_style),
+                Span::styled(iso.to_string(), value_style),
+            ]));
+        }
+
     } else {
-        lines.push(Line::from(Span::styled(" PREVIEW", Style::default().fg(Palette::LABEL).add_modifier(Modifier::BOLD))));
-        lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("  Select a file from media pool", Style::default().fg(Color::DarkGray))));
     }
-
-    let panel = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .title(" Preview / Info ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color)),
-        )
-        .wrap(Wrap { trim: false });
-    frame.render_widget(panel, area);
+    lines
 }
 
 /// Gradient slider for the Grade panel.
@@ -1619,6 +1798,21 @@ fn render_export_settings(frame: &mut Frame, app: &App, area: Rect, regions: &mu
     let pr_area = Rect { x: area.x + 1, y: base_y + 3, width: area.width.saturating_sub(2), height: 1 };
     regions.push(ClickRegion { area: pr_area, action: ClickAction::CycleProfile });
 
+    // --- FPS ---
+    let fps_focused = app.export_focus == ExportFocus::Fps && is_focused;
+    let fps_label_val = crate::app::App::fps_label(app.export_fps);
+    let fps_display = truncate_to_width(&fps_label_val, max_value_width(area.width, "FPS:"));
+    lines.push(Line::from(vec![
+        Span::styled("  FPS:      ", Style::default().fg(Palette::LABEL)),
+        Span::styled(fps_display, if fps_focused {
+            Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Palette::VALUE)
+        }),
+    ]));
+    let fps_area = Rect { x: area.x + 1, y: base_y + 4, width: area.width.saturating_sub(2), height: 1 };
+    regions.push(ClickRegion { area: fps_area, action: ClickAction::CycleFps });
+
     // --- Rate ---
     if show_rate {
         let rc_focused = app.export_focus == ExportFocus::RateControl && is_focused;
@@ -1631,7 +1825,7 @@ fn render_export_settings(frame: &mut Frame, app: &App, area: Rect, regions: &mu
                 Style::default().fg(Palette::VALUE)
             }),
         ]));
-        let rc_area = Rect { x: area.x + 1, y: base_y + 4, width: area.width.saturating_sub(2), height: 1 };
+        let rc_area = Rect { x: area.x + 1, y: base_y + 5, width: area.width.saturating_sub(2), height: 1 };
         regions.push(ClickRegion { area: rc_area, action: ClickAction::CycleRate });
     }
 
@@ -1653,7 +1847,7 @@ fn render_export_settings(frame: &mut Frame, app: &App, area: Rect, regions: &mu
             Style::default().fg(Palette::LABEL),
         )));
     }
-    lines.push(Line::from(Span::styled("  [c] Codec  [g] Gamut  [t] Transfer  [r] Rate  [P] Pick preset  [p] Save preset", Style::default().fg(Color::White))));
+    lines.push(Line::from(Span::styled("  [c] Codec  [g] Gamut  [t] Transfer  [f] FPS  [r] Rate  [P] Preset  [p] Save", Style::default().fg(Color::White))));
 
     let panel = Paragraph::new(lines)
         .block(
@@ -2111,23 +2305,12 @@ fn render_full_info_overlay(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(Palette::POPUP_TITLE).add_modifier(Modifier::BOLD),
         )));
         if let Some(ref model) = info.camera_metadata.camera_model {
-            lines.push(Line::from(vec![
-                Span::styled("  Camera:       ", Style::default().fg(Palette::LABEL)),
-                Span::styled(model, Style::default().fg(Palette::VALUE)),
-            ]));
-        }
-        if let Some(ref sensor_make) = info.camera_metadata.sensor_make {
-            lines.push(Line::from(vec![
-                Span::styled("  Sensor Make:  ", Style::default().fg(Palette::LABEL)),
-                Span::styled(sensor_make, Style::default().fg(Palette::VALUE)),
-            ]));
-        }
-        if let Some(ref sensor_model) = info.camera_metadata.sensor_model {
-            let make = info.camera_metadata.sensor_make.as_deref().unwrap_or("");
-            lines.push(Line::from(vec![
-                Span::styled("  Sensor:       ", Style::default().fg(Palette::LABEL)),
-                Span::styled(format!("{} {}", make, sensor_model), Style::default().fg(Palette::VALUE)),
-            ]));
+            if !model.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("  Camera:       ", Style::default().fg(Palette::LABEL)),
+                    Span::styled(model, Style::default().fg(Palette::VALUE)),
+                ]));
+            }
         }
         if let Some(ref lens) = info.camera_metadata.lens_model {
             lines.push(Line::from(vec![
@@ -2219,12 +2402,6 @@ fn render_full_info_overlay(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled("  Bayer:        ", Style::default().fg(Palette::LABEL)),
             Span::styled(info.bayer_pattern.name(), Style::default().fg(Palette::VALUE)),
         ]));
-        if info.sensor_width > 0 || info.sensor_height > 0 {
-            lines.push(Line::from(vec![
-                Span::styled("  Sensor Size:  ", Style::default().fg(Palette::LABEL)),
-                Span::styled(format!("{}x{}", info.sensor_width, info.sensor_height), Style::default().fg(Palette::VALUE)),
-            ]));
-        }
         if info.active_width > 0 && info.active_height > 0 {
             lines.push(Line::from(vec![
                 Span::styled("  Active Area:  ", Style::default().fg(Palette::LABEL)),

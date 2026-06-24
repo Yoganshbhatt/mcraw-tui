@@ -43,6 +43,10 @@ pub struct Cli {
     #[arg(short = 'n', long)]
     pub frames: Option<usize>,
 
+    /// Path to custom placeholder sixel file (for idle/loading animation)
+    #[arg(long)]
+    pub placeholder_path: Option<String>,
+
     /// Enable verbose logging
     #[arg(short, long, global = true)]
     pub verbose: bool,

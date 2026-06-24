@@ -85,6 +85,7 @@ fn export_pipeline_emits_per_phase_stats() {
         "libaom-av1".to_string(),
         "prores_ks".to_string(),
         RateControl::Lossless,
+        None,
     );
 
     let wall = start.elapsed();

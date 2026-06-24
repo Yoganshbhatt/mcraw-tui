@@ -1,8 +1,11 @@
 use anyhow::Result;
 use crossterm::{
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    cursor::MoveTo,
+    terminal::{disable_raw_mode, enable_raw_mode, window_size, EnterAlternateScreen, LeaveAlternateScreen},
     event::{Event, KeyEventKind, EnableBracketedPaste, DisableBracketedPaste, EnableMouseCapture, DisableMouseCapture},
+    QueueableCommand,
 };
+use std::io::Write;
 use percent_encoding::percent_decode_str;
 use ratatui::backend::CrosstermBackend;
 use std::cell::Cell;
@@ -12,7 +15,7 @@ use std::time::{Duration, Instant};
 use tokio::time;
 
 use crate::cli::{Cli, CliCommands, ResolvedCli};
-use crate::color::{ColorSpace, TransferFunction};
+use crate::color::{build_preview_ccm, ColorSpace, TransferFunction};
 use crate::export::{
     Av1Profile, CodecFamily, DnxhrProfile, H264Profile, HevcProfile,
     ProResProfile, RateControl, Vp9Profile,
@@ -25,7 +28,12 @@ use crate::encoder::{EncodeJob, EncodeStatus, Encoder, OutputFormat};
 use crate::file::McrawFileInfo;
 use crate::file_browser::FileBrowser;
 use crate::preset::ExportPreset;
+use crate::preview::pipeline::{GpuPreviewPipeline, PreviewParams, PreviewGpuContext, Ready};
+use crate::preview::PreviewState;
+use crate::preview::pipeline::params::{transfer_to_u32, color_space_to_u32, bayer_phase_to_u32};
 use crate::stats::PipelineStats;
+use crate::thumbnail::ThumbnailCache;
+use crate::thumbnail_worker::{ThumbnailWorkerPool, ThumbnailRequest};
 
 /// Braille spinner frames for the rendering indicator (500ms cycle at 50ms/tick).
 pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -40,6 +48,7 @@ pub struct ImportedFile {
     pub path: String,
     pub info: McrawFileInfo,
     pub selected: bool,
+    pub first_timestamp: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,7 +73,6 @@ pub enum FocusTarget {
     MediaPool,
     Queue,
     ExportSettings,
-    Preview,
     Grade,
 }
 
@@ -367,6 +375,7 @@ pub struct App {
     pub export_transfer_function: TransferFunction,
     pub export_codec_family: CodecFamily,
     pub export_focus: ExportFocus,
+    pub export_fps: Option<f64>,
     pub export_start_time: Option<Instant>,
 
     // Sticky per-codec profiles
@@ -456,6 +465,35 @@ pub struct App {
     /// the live text and the cursor position. Esc cancels, Enter saves.
     pub preset_naming: Option<PresetNamingState>,
 
+    // Preview pipeline state (Phase 1)
+    pub decoder: Option<Decoder>,
+    pub timestamps: Vec<i64>,
+    pub preview_state: PreviewState,
+    pub preview_pipeline: Option<GpuPreviewPipeline<Ready>>,
+    pub preview_gpu_context: Option<Arc<PreviewGpuContext>>,
+    pub thumbnail_cache: ThumbnailCache,
+    pub pending_preview_ts: Option<i64>,
+    /// Background worker pool for async thumbnail generation.
+    pub thumbnail_worker: Option<ThumbnailWorkerPool>,
+    /// (Path, timestamp) of the last thumbnail submitted to the worker — used
+    /// for deduplication so rapid navigation doesn't flood the workers.
+    pub thumbnail_requested: Option<(PathBuf, i64)>,
+
+    // Sixel write-back state for Ghost Widget pattern
+    pub sixel_pending: Cell<bool>,
+    pub sixel_write_pos: Cell<Option<(u16, u16)>>,
+    /// Character-cell footprint of the last written sixel (x, y, chars_w, chars_h).
+    pub sixel_occupy_size: Cell<Option<(u16, u16, u16, u16)>>,
+    /// Index of the media pool item whose sixel was last written to the terminal.
+    pub last_written_media_index: Cell<Option<usize>>,
+    /// Terminal character cell size in pixels — updated at each loop iteration.
+    pub term_cell_size: Cell<(f32, f32)>,
+    /// Character dimensions of the thumbnail panel area (cols, rows).
+    pub preview_panel_chars: Cell<Option<(u16, u16)>>,
+    /// Set to true by render_preview_panel when panel chars change from the
+    /// pre-computed estimate to the real layout value, triggering a re-generation.
+    pub needs_rethumbnail: Cell<bool>,
+
     // Animation state
     pub spinner_frame: u8,
     pub progress_anim_offset: u8,
@@ -476,6 +514,7 @@ pub struct App {
     pub grade_before_snapshot: Option<GradeSliders>,
     // Focus strip idle counter: decrements each tick
     pub grade_strip_idle_ticks: u8,
+
 }
 
 /// Overlay state for the preset-picker. `Shown` holds the list, cursor
@@ -495,7 +534,7 @@ pub struct PresetNamingState {
 
 /// Event from async drag-drop import worker
 pub enum DropImportEvent {
-    FileReady { path: String, info: McrawFileInfo },
+    FileReady { path: String, info: McrawFileInfo, first_timestamp: i64 },
     Failed { path: String, error: String },
     Complete { imported: usize, failed: usize },
 }
@@ -513,6 +552,7 @@ pub enum ExportFocus {
     CodecFamily,
     Profile,
     RateControl,
+    Fps,
 }
 
 impl App {
@@ -546,7 +586,7 @@ impl App {
         }
     }
 
-    pub fn new() -> Self {
+    pub fn new_with_placeholder(placeholder_path: Option<PathBuf>) -> Self {
         let caps = probe_hardware();
         App {
             running: true,
@@ -573,6 +613,7 @@ impl App {
             export_transfer_function: TransferFunction::Gamma24,
             export_codec_family: CodecFamily::HEVC,
             export_focus: ExportFocus::CodecFamily,
+            export_fps: None,
             export_start_time: None,
 
             prores_profile: ProResProfile::HQ,
@@ -618,6 +659,22 @@ impl App {
 
             spinner_frame: 0,
             progress_anim_offset: 0,
+            decoder: None,
+            timestamps: Vec::new(),
+            preview_state: PreviewState::Empty,
+            preview_pipeline: None,
+            preview_gpu_context: None,
+            thumbnail_cache: ThumbnailCache::new_with_placeholder(placeholder_path.as_deref()),
+            pending_preview_ts: None,
+            thumbnail_worker: Some(ThumbnailWorkerPool::new(2)),
+            thumbnail_requested: None,
+            sixel_pending: Cell::new(false),
+            sixel_write_pos: Cell::new(None),
+            sixel_occupy_size: Cell::new(None),
+            last_written_media_index: Cell::new(None),
+            term_cell_size: Cell::new((10.0, 20.0)),
+            preview_panel_chars: Cell::new(None),
+            needs_rethumbnail: Cell::new(false),
             fps_counter: FPSCounter::new(),
             shockwave_ticks_remaining: 0,
             grade_sliders: GradeSliders::default(),
@@ -631,6 +688,11 @@ impl App {
         }
     }
 
+    /// Create App with bundled placeholder (no custom sixel file).
+    pub fn new() -> Self {
+        Self::new_with_placeholder(None)
+    }
+
     // -----------------------------------------------------------------------
     // File loading
     // -----------------------------------------------------------------------
@@ -642,38 +704,48 @@ impl App {
         match McrawFileInfo::from_path(&path) {
             Ok(mut info) => {
                 tracing::debug!("file parsed: frames={} {}x{} fps={}", info.frame_count, info.width, info.height, info.fps);
-                if let Ok(decoder) = Decoder::new(&path) {
-                    if let Ok(container_meta) = decoder.container_metadata() {
-                        let as_f64 = |v: &[f32; 9]| -> [f64; 9] {
-                            let mut r = [0.0; 9];
-                            for (i, &x) in v.iter().enumerate() { r[i] = x as f64; }
-                            r
-                        };
-                        let non_zero = |m: &[f32; 9]| m.iter().any(|&x| x != 0.0);
-
-                        info.camera_metadata.color_matrix = Some(as_f64(&container_meta.color_matrix1));
-                        if non_zero(&container_meta.color_matrix2) {
-                            info.camera_metadata.color_matrix2 = Some(as_f64(&container_meta.color_matrix2));
-                        }
-                        if non_zero(&container_meta.forward_matrix1) {
-                            info.camera_metadata.forward_matrix1 = Some(as_f64(&container_meta.forward_matrix1));
-                        }
-                        if non_zero(&container_meta.forward_matrix2) {
-                            info.camera_metadata.forward_matrix2 = Some(as_f64(&container_meta.forward_matrix2));
-                        }
-                        if container_meta.has_calibration_illuminants {
-                            info.camera_metadata.calibration_illuminant1 = Some(container_meta.calibration_illuminant1);
-                            info.camera_metadata.calibration_illuminant2 = Some(container_meta.calibration_illuminant2);
-                        }
-
-                        if container_meta.white_level > 0.0 {
-                            info.white_level = container_meta.white_level;
-                        }
-                        if container_meta.black_level_count > 0 {
-                            info.black_level = container_meta.black_level[0];
-                        }
+                let (decoder, timestamps) = match Decoder::new(&path) {
+                    Ok(decoder) => {
+                        let ts = decoder.timestamps().unwrap_or_default();
+                        (Some(decoder), ts)
                     }
-                    if let Ok(timestamps) = decoder.timestamps() {
+                    Err(e) => {
+                        tracing::warn!("decoder init failed (OK for non-RAW): {}", e);
+                        (None, Vec::new())
+                    }
+                };
+
+                    if let Some(ref decoder) = decoder {
+                        if let Ok(container_meta) = decoder.container_metadata() {
+                            let as_f64 = |v: &[f32; 9]| -> [f64; 9] {
+                                let mut r = [0.0; 9];
+                                for (i, &x) in v.iter().enumerate() { r[i] = x as f64; }
+                                r
+                            };
+                            let non_zero = |m: &[f32; 9]| m.iter().any(|&x| x != 0.0);
+
+                            info.camera_metadata.color_matrix = Some(as_f64(&container_meta.color_matrix1));
+                            if non_zero(&container_meta.color_matrix2) {
+                                info.camera_metadata.color_matrix2 = Some(as_f64(&container_meta.color_matrix2));
+                            }
+                            if non_zero(&container_meta.forward_matrix1) {
+                                info.camera_metadata.forward_matrix1 = Some(as_f64(&container_meta.forward_matrix1));
+                            }
+                            if non_zero(&container_meta.forward_matrix2) {
+                                info.camera_metadata.forward_matrix2 = Some(as_f64(&container_meta.forward_matrix2));
+                            }
+                            if container_meta.has_calibration_illuminants {
+                                info.camera_metadata.calibration_illuminant1 = Some(container_meta.calibration_illuminant1);
+                                info.camera_metadata.calibration_illuminant2 = Some(container_meta.calibration_illuminant2);
+                            }
+
+                            if container_meta.white_level > 0.0 {
+                                info.white_level = container_meta.white_level;
+                            }
+                            if container_meta.black_level_count > 0 {
+                                info.black_level = container_meta.black_level[0];
+                            }
+                        }
                         info.frame_count = timestamps.len() as u32;
                         if timestamps.len() >= 2 {
                             let duration_ns = timestamps[timestamps.len() - 1] - timestamps[0];
@@ -682,24 +754,53 @@ impl App {
                                 info.fps = (info.frame_count.saturating_sub(1)) as f64 / duration_in_seconds;
                             }
                         }
-                        if let Ok(first_frame_meta) = decoder.load_frame_metadata(timestamps[0]) {
-                            info.width = first_frame_meta.width as u16;
-                            info.height = first_frame_meta.height as u16;
-                        }
-                        // Initialize grade temperature from file white balance
-                        if let Some(wb) = info.camera_metadata.wb_multipliers {
-                            let r_gain = wb[0];
-                            let b_gain = wb[2];
-                            let ratio = (r_gain / b_gain.max(1e-6)).clamp(0.1, 10.0);
-                            let temp = if ratio >= 1.0 {
-                                5200.0 + (ratio - 1.0) * 3000.0
+                        if !timestamps.is_empty() {
+                            if let Ok(first_frame_meta) = decoder.load_frame_metadata(timestamps[0]) {
+                                info.width = first_frame_meta.width as u16;
+                                info.height = first_frame_meta.height as u16;
+                            }
+                            // Initialize grade temperature from file white balance
+                            if let Some(wb) = info.camera_metadata.wb_multipliers {
+                                let r_gain = wb[0];
+                                let b_gain = wb[2];
+                                let ratio = (r_gain / b_gain.max(1e-6)).clamp(0.1, 10.0);
+                                let temp = if ratio >= 1.0 {
+                                    5200.0 + (ratio - 1.0) * 3000.0
+                                } else {
+                                    5200.0 - (1.0 - ratio) * 3000.0
+                                };
+                                self.grade_sliders.set(5, temp.clamp(2000.0, 10000.0));
                             } else {
-                                5200.0 - (1.0 - ratio) * 3000.0
-                            };
-                            self.grade_sliders.set(5, temp.clamp(2000.0, 10000.0));
-                        } else {
-                            self.grade_sliders.set(5, 5200.0);
+                                self.grade_sliders.set(5, 5200.0);
+                            }
                         }
+                    }
+
+                // Store decoder + timestamps for on-demand preview frame decode
+                self.decoder = decoder;
+                self.timestamps = timestamps;
+
+                // Reset preview state for new file
+                self.preview_state = PreviewState::Empty;
+                self.pending_preview_ts = None;
+
+                // Init GPU preview pipeline (lazy — reuses on next file)
+                if self.preview_pipeline.is_none() {
+                    if let Ok(context) = PreviewGpuContext::new() {
+                        let ctx_arc = Arc::new(context);
+                        match GpuPreviewPipeline::new().init(ctx_arc.clone()) {
+                            Ok(pipeline) => {
+                                self.preview_pipeline = Some(pipeline);
+                                self.preview_gpu_context = Some(ctx_arc);
+                            }
+                            Err(e) => {
+                                tracing::warn!("GPU preview pipeline init failed: {}", e);
+                                self.preview_state = PreviewState::Error(format!("GPU: {}", e));
+                            }
+                        }
+                    } else {
+                        tracing::warn!("No GPU adapter found — preview disabled");
+                        self.preview_state = PreviewState::Error("No GPU available".into());
                     }
                 }
 
@@ -707,21 +808,32 @@ impl App {
                 self.frame_count = info.frame_count as usize;
                 self.file_path = Some(path.clone());
 
-                let already = self.imported_files.iter().any(|f| f.path == path);
-                if !already {
-                    self.imported_files.push(ImportedFile {
-                        path: path.clone(),
-                        info: info.clone(),
-                        selected: true,
-                    });
+                let already_pos = self.imported_files.iter().position(|f| f.path == path);
+                if let Some(pos) = already_pos {
+                    self.media_pool_index = pos;
+                    tracing::debug!("file already in media pool at index={}, switching to it", pos);
+                } else {
+                        self.imported_files.push(ImportedFile {
+                            path: path.clone(),
+                            info: info.clone(),
+                            selected: true,
+                            first_timestamp: self.timestamps.first().copied().unwrap_or(0),
+                        });
                     self.media_pool_index = self.imported_files.len() - 1;
                     tracing::info!("file added to media pool: index={}", self.media_pool_index);
-                } else {
-                    tracing::debug!("file already in media pool, skipping");
                 }
 
                 self.status_message = format!("Imported: {}", path);
                 tracing::info!("file loaded successfully: {}", path);
+
+                // Reset Ghost Widget index so it writes the new thumbnail
+                self.last_written_media_index.set(None);
+
+                // Auto-request preview for the first frame
+                if self.decoder.is_some() && !self.timestamps.is_empty() {
+                    self.frame_index = 0;
+                    self.request_frame_decode(0);
+                }
             }
             Err(e) => {
                 tracing::error!("failed to load file {}: {}", path, e);
@@ -729,6 +841,300 @@ impl App {
                 self.status_message = format!("Error: {}", e);
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Preview pipeline (Phase 1)
+    // -----------------------------------------------------------------------
+
+    /// Request a decode + GPU process for the given frame_index.
+    /// The actual work happens in `poll_preview()` on the next tick.
+    pub fn request_frame_decode(&mut self, new_index: usize) {
+        if new_index >= self.timestamps.len() {
+            self.preview_state = PreviewState::Empty;
+            self.pending_preview_ts = None;
+            return;
+        }
+        let ts = self.timestamps[new_index];
+        self.preview_state = PreviewState::Loading { started: Instant::now() };
+        self.pending_preview_ts = Some(ts);
+    }
+
+    /// Poll the thumbnail worker for results and submit pending requests.
+    /// Called every tick in the main loop. Never blocks.
+    pub fn poll_thumbnail(&mut self) {
+        // 1. Drain completed results from worker threads — zero blocking
+        if let Some(ref worker) = self.thumbnail_worker {
+            while let Ok(result) = worker.result_rx.try_recv() {
+                // Cache every completed thumbnail
+                if let Some(cached) = result.to_cached() {
+                    self.thumbnail_cache.insert(result.path.clone(), cached);
+                }
+                // Update preview state only if this result is for the current file
+                let is_current = self.file_path.as_ref().map_or(false, |fp| *fp == *result.path.to_string_lossy());
+                if is_current {
+                    if let Some(sixel) = result.sixel {
+                        self.sixel_pending.set(true);
+                        self.preview_state = PreviewState::Ready {
+                            sixel,
+                            width: result.width,
+                            height: result.height,
+                        };
+                    } else {
+                        let msg = result.error.unwrap_or_else(|| "Unknown error".into());
+                        self.preview_state = PreviewState::Error(msg);
+                    }
+                }
+            }
+        }
+
+        // 2. Check if there is a pending frame to generate
+        let ts = match self.pending_preview_ts.take() {
+            Some(ts) => ts,
+            None => return,
+        };
+
+        // 3. Check cache — skip worker if already cached (unless panel size
+        //    changed, requiring re-generation at the new dimensions).
+        let path_buf = match self.file_path.as_ref() {
+            Some(p) => PathBuf::from(p),
+            None => {
+                self.preview_state = PreviewState::Empty;
+                return;
+            }
+        };
+        let needs_regen = self.needs_rethumbnail.get();
+        if !needs_regen {
+            if let Some(cached) = self.thumbnail_cache.get(&path_buf) {
+                self.sixel_pending.set(true);
+                self.preview_state = PreviewState::Ready {
+                    sixel: cached.sixel,
+                    width: cached.width,
+                    height: cached.height,
+                };
+                return;
+            }
+        }
+
+        // 4. Deduplicate: don't re-submit if we already sent the same (path, ts)
+        if !needs_regen && self.thumbnail_requested.as_ref() == Some(&(path_buf.clone(), ts)) {
+            return;
+        }
+
+        // 4a. Defer until panel dimensions are known from an actual render.
+        //     Without this, the first thumbnail would use 320x180 fallback.
+        if self.preview_panel_chars.get().is_none() {
+            self.pending_preview_ts = Some(ts);  // restore so next tick retries
+            return;
+        }
+
+        // 4b. Timeout check: if preview has been Loading for >5s, show error
+        if let PreviewState::Loading { started } = &self.preview_state {
+            if started.elapsed() > Duration::from_secs(5) {
+                self.preview_state = PreviewState::Error("Timed out".into());
+                return;
+            }
+        }
+
+        // 5. Build params on the main thread (fast — no I/O)
+        let frame_meta_width;
+        let frame_meta_height;
+        let (cm_f32, bayer_phase, bl, wl) = match self.file_info.as_ref() {
+            Some(info) => {
+                let cm = build_preview_ccm(
+                    info.camera_metadata.color_matrix.as_ref(),
+                    info.camera_metadata.forward_matrix1.as_ref(),
+                    info.camera_metadata.forward_matrix2.as_ref(),
+                    info.camera_metadata.color_matrix2.as_ref(),
+                    info.camera_metadata.calibration_matrix1.as_ref(),
+                );
+                frame_meta_width = info.width as u32;
+                frame_meta_height = info.height as u32;
+                let bp = bayer_phase_to_u32(&info.bayer_pattern);
+                let bl = info.black_level as f32;
+                let wl = if info.white_level > 0.0 { info.white_level as f32 } else { 4095.0 };
+                (cm, bp, bl, wl)
+            }
+            None => {
+                // Without file info, we can't build proper params
+                self.preview_state = PreviewState::Empty;
+                return;
+            }
+        };
+
+        let (target_w, target_h) = match self.preview_panel_chars.get() {
+            Some((panel_cols, panel_rows)) => {
+                let (cell_w, cell_h) = self.term_cell_size.get();
+                let avail_px_w = (panel_cols as f32 * cell_w).ceil() as u32;
+                let avail_px_h = (panel_rows as f32 * cell_h).ceil() as u32;
+                (avail_px_w.max(16), avail_px_h.max(16))
+            }
+            None => (crate::thumbnail::THUMBNAIL_WIDTH, crate::thumbnail::THUMBNAIL_HEIGHT),
+        };
+
+        let params = self.build_preview_params(&cm_f32, bayer_phase, bl, wl,
+            frame_meta_width, frame_meta_height, target_w, target_h);
+
+        // 6. Submit to worker — non-blocking
+        if let Some(ref worker) = self.thumbnail_worker {
+            worker.submit(ThumbnailRequest {
+                path: path_buf.clone(),
+                timestamp_ns: ts,
+                params,
+            });
+            self.thumbnail_requested = Some((path_buf, ts));
+            self.preview_state = PreviewState::Loading { started: Instant::now() };
+        }
+        self.needs_rethumbnail.set(false);
+    }
+
+    /// Build PreviewParams from current grade sliders + file metadata + target dimensions.
+    fn build_preview_params(
+        &self,
+        ccm: &[f32; 9],
+        bayer_phase: u32,
+        black_level: f32,
+        white_level: f32,
+        raw_width: u32,
+        raw_height: u32,
+        target_w: u32,
+        target_h: u32,
+    ) -> PreviewParams {
+        // Aspect-ratio-fit target dimensions
+        let bayer_aspect = raw_width as f64 / raw_height as f64;
+        let target_aspect = target_w as f64 / target_h as f64;
+
+        let (width, height) = if bayer_aspect > target_aspect {
+            let h = (target_w as f64 / bayer_aspect) as u32;
+            (target_w, h.max(1))
+        } else {
+            let w = (target_h as f64 * bayer_aspect) as u32;
+            (w.max(1), target_h)
+        };
+
+        // White balance gains from grade sliders combined with as-shot neutral
+        let as_shot = self.file_info.as_ref()
+            .and_then(|info| info.camera_metadata.wb_multipliers)
+            .unwrap_or([1.0, 1.0, 1.0]);
+
+        // Temperature/tint adjustment: modulate the as-shot neutral gains
+        let temp_offset = self.grade_sliders.temperature - 5200.0;
+        let tint_offset = self.grade_sliders.tint;
+        let wb_gain_r = as_shot[0] * (1.0 + temp_offset / 10000.0);
+        let wb_gain_g = as_shot[1];
+        let wb_gain_b = as_shot[2] * (1.0 - temp_offset / 10000.0 + tint_offset / 100.0);
+
+        // Exposure: send stops directly — shader applies exp2(stops)
+        let exposure_stops = self.grade_sliders.exposure;
+
+        // Determine if any non-default grade is active
+        let adjust_enabled = (self.grade_sliders.exposure.abs() > 0.01
+            || (self.grade_sliders.contrast - 1.0).abs() > 0.01
+            || (self.grade_sliders.saturation - 1.0).abs() > 0.01
+            || self.grade_sliders.shadows.abs() > 0.01
+            || self.grade_sliders.highlights.abs() > 0.01
+            || (self.grade_sliders.temperature - 5200.0).abs() > 50.0
+            || self.grade_sliders.tint.abs() > 0.5) as u32;
+
+        PreviewParams {
+            width,
+            height,
+            bayer_width: raw_width,
+            bayer_height: raw_height,
+            black_level,
+            white_level,
+            exposure: exposure_stops,
+            wb_r: wb_gain_r,
+            wb_g: wb_gain_g,
+            wb_b: wb_gain_b,
+            contrast: self.grade_sliders.contrast,
+            saturation: self.grade_sliders.saturation,
+            shadows: self.grade_sliders.shadows,
+            highlights: self.grade_sliders.highlights,
+            _align0: 0.0,
+            _align1: 0.0,
+            ccm_row0: [ccm[0], ccm[1], ccm[2], 0.0],
+            ccm_row1: [ccm[3], ccm[4], ccm[5], 0.0],
+            ccm_row2: [ccm[6], ccm[7], ccm[8], 0.0],
+            color_space: color_space_to_u32(&ColorSpace::Rec709),
+            transfer: transfer_to_u32(&TransferFunction::Gamma24),
+            adjust_enabled,
+            bayer_phase,
+            compute_histogram: 0,
+            _pad0: 0, _pad1: 0, _pad2: 0, _pad3: 0, _pad4: 0, _pad5: 0, _pad6: 0,
+        }
+    }
+
+    /// Submit a thumbnail generation request to the background worker for
+    /// any file in the media pool, identified by path + timestamp.
+    fn request_thumbnail_for(&self, path: &str, timestamp_ns: i64) {
+        let worker = match self.thumbnail_worker.as_ref() {
+            Some(w) => w,
+            None => return,
+        };
+        let imported = match self.imported_files.iter().find(|f| f.path == path) {
+            Some(f) => f,
+            None => return,
+        };
+        let cm = build_preview_ccm(
+            imported.info.camera_metadata.color_matrix.as_ref(),
+            imported.info.camera_metadata.forward_matrix1.as_ref(),
+            imported.info.camera_metadata.forward_matrix2.as_ref(),
+            imported.info.camera_metadata.color_matrix2.as_ref(),
+            imported.info.camera_metadata.calibration_matrix1.as_ref(),
+        );
+        let bp = bayer_phase_to_u32(&imported.info.bayer_pattern);
+        let bl = imported.info.black_level as f32;
+        let wl = if imported.info.white_level > 0.0 { imported.info.white_level as f32 } else { 4095.0 };
+        let (target_w, target_h) = match self.preview_panel_chars.get() {
+            Some((pc, pr)) => {
+                let (cw, ch) = self.term_cell_size.get();
+                ((pc as f32 * cw).ceil() as u32, (pr as f32 * ch).ceil() as u32)
+            }
+            None => (crate::thumbnail::THUMBNAIL_WIDTH, crate::thumbnail::THUMBNAIL_HEIGHT),
+        };
+        let params = self.build_preview_params(&cm, bp, bl, wl,
+            imported.info.width as u32, imported.info.height as u32, target_w, target_h);
+        worker.submit(ThumbnailRequest {
+            path: PathBuf::from(path),
+            timestamp_ns,
+            params,
+        });
+    }
+
+    /// Bilinear RGBA (u8) resize — scales src to dst dimensions. Returns a new Vec.
+    fn resize_rgba(&self, src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
+        if src_w == dst_w && src_h == dst_h {
+            return src.to_vec();
+        }
+        let mut dst = vec![0u8; (dst_w * dst_h * 4) as usize];
+        for y in 0..dst_h {
+            let src_y = y as f32 * src_h as f32 / dst_h as f32;
+            let y0 = (src_y.floor() as u32).min(src_h.saturating_sub(1));
+            let y1 = (y0 + 1).min(src_h.saturating_sub(1));
+            let fy = src_y - y0 as f32;
+            for x in 0..dst_w {
+                let src_x = x as f32 * src_w as f32 / dst_w as f32;
+                let x0 = (src_x.floor() as u32).min(src_w.saturating_sub(1));
+                let x1 = (x0 + 1).min(src_w.saturating_sub(1));
+                let fx = src_x - x0 as f32;
+                let idx00 = ((y0 * src_w + x0) * 4) as usize;
+                let idx01 = ((y0 * src_w + x1) * 4) as usize;
+                let idx10 = ((y1 * src_w + x0) * 4) as usize;
+                let idx11 = ((y1 * src_w + x1) * 4) as usize;
+                let didx = ((y * dst_w + x) * 4) as usize;
+                for c in 0..4 {
+                    let v00 = src[idx00 + c] as f32;
+                    let v01 = src[idx01 + c] as f32;
+                    let v10 = src[idx10 + c] as f32;
+                    let v11 = src[idx11 + c] as f32;
+                    let v0 = v00 + (v01 - v00) * fx;
+                    let v1 = v10 + (v11 - v10) * fx;
+                    dst[didx + c] = (v0 + (v1 - v0) * fy).round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        dst
     }
 
     /// Add multiple files to the media pool (used by drag-drop).
@@ -741,6 +1147,7 @@ impl App {
             self.error = None;
             match McrawFileInfo::from_path(path) {
                 Ok(mut info) => {
+                    let mut first_ts = 0i64;
                     if let Ok(decoder) = Decoder::new(path) {
                         if let Ok(container_meta) = decoder.container_metadata() {
                             let as_f64 = |v: &[f32; 9]| -> [f64; 9] {
@@ -771,6 +1178,7 @@ impl App {
                             }
                         }
                         if let Ok(timestamps) = decoder.timestamps() {
+                            first_ts = timestamps.first().copied().unwrap_or(0);
                             info.frame_count = timestamps.len() as u32;
                             if timestamps.len() >= 2 {
                                 let duration_ns = timestamps[timestamps.len() - 1] - timestamps[0];
@@ -792,6 +1200,7 @@ impl App {
                             path: path.clone(),
                             info: info.clone(),
                             selected: true,
+                            first_timestamp: first_ts,
                         });
                         imported += 1;
                         tracing::debug!("batch imported: {} ({} total)", path, self.imported_files.len());
@@ -851,8 +1260,12 @@ impl App {
                 let path_clone = path.clone();
                 match McrawFileInfo::from_path(&path) {
                     Ok(mut info) => {
+                        let mut first_ts: i64 = 0;
                         // Enhance with decoder metadata (same as load_file)
                         if let Ok(decoder) = Decoder::new(&path) {
+                            first_ts = decoder.timestamps().ok()
+                                .and_then(|ts| ts.first().copied())
+                                .unwrap_or(0);
                             if let Ok(container_meta) = decoder.container_metadata() {
                                 let as_f64 = |v: &[f32; 9]| -> [f64; 9] {
                                     let mut r = [0.0; 9];
@@ -897,7 +1310,7 @@ impl App {
                             }
                         }
 
-                        let _ = tx.send(DropImportEvent::FileReady { path: path_clone, info });
+                        let _ = tx.send(DropImportEvent::FileReady { path: path_clone, info, first_timestamp: first_ts });
                         imported += 1;
                     }
                     Err(e) => {
@@ -925,13 +1338,14 @@ impl App {
         let mut keep_rx = true;
         while let Ok(event) = rx.try_recv() {
             match event {
-                DropImportEvent::FileReady { path, info } => {
+                DropImportEvent::FileReady { path, info, first_timestamp } => {
                     let already = self.imported_files.iter().any(|f| f.path == path);
                     if !already {
                         self.imported_files.push(ImportedFile {
                             path: path.clone(),
                             info: info.clone(),
                             selected: true,
+                            first_timestamp,
                         });
                         // Select the first imported file
                         if self.imported_files.len() == 1 {
@@ -1004,6 +1418,56 @@ impl App {
     pub fn toggle_media_pool_selection(&mut self) {
         if let Some(f) = self.imported_files.get_mut(self.media_pool_index) {
             f.selected = !f.selected;
+        }
+    }
+
+    /// Toggle all media pool items between selected and unselected.
+    /// If any file is unselected, selects all; if all are selected, deselects all.
+    pub fn toggle_select_all(&mut self) {
+        if self.imported_files.is_empty() {
+            return;
+        }
+        let all_selected = self.imported_files.iter().all(|f| f.selected);
+        for f in &mut self.imported_files {
+            f.selected = !all_selected;
+        }
+        let msg = if all_selected { "Deselected all" } else { "Selected all" };
+        self.status_message = format!("{} ({} files)", msg, self.imported_files.len());
+    }
+
+    /// Switch the active decoder and preview to the file at `new_index`.
+    pub fn switch_media_pool_item(&mut self, new_index: usize) {
+        if new_index >= self.imported_files.len() {
+            return;
+        }
+        if new_index == self.media_pool_index {
+            return;
+        }
+        let path = self.imported_files[new_index].path.clone();
+        self.media_pool_index = new_index;
+        self.last_export_summary = None;
+        self.sixel_pending.set(false);
+        self.sixel_write_pos.set(None);
+        self.last_written_media_index.set(None);
+        if self.file_path.as_deref() != Some(&path) {
+            self.load_file(path);
+        } else {
+            // Same file, just update preview for current frame
+            self.preview_state = PreviewState::Empty;
+            if self.decoder.is_some() && !self.timestamps.is_empty() {
+                self.request_frame_decode(self.frame_index.min(self.timestamps.len() - 1));
+            }
+        }
+
+        // Prefetch ±3 neighbor thumbnails for smooth scrolling
+        let start = new_index.saturating_sub(3);
+        let end = self.imported_files.len().min(new_index + 4);
+        for i in start..end {
+            if i == new_index { continue; }
+            let n = &self.imported_files[i];
+            if n.first_timestamp > 0 {
+                self.request_thumbnail_for(&n.path, n.first_timestamp);
+            }
         }
     }
 
@@ -1216,6 +1680,36 @@ impl App {
         self.status_message = format!("Rate: {}", self.active_rate_control.name());
     }
 
+    pub fn fps_label(fps: Option<f64>) -> String {
+        match fps {
+            None => "Original".to_string(),
+            Some(v) if (v - 23.976).abs() < 0.001 => "23.976".to_string(),
+            Some(v) if (v - 24.0).abs() < 0.001 => "24".to_string(),
+            Some(v) if (v - 25.0).abs() < 0.001 => "25".to_string(),
+            Some(v) if (v - 30.0).abs() < 0.001 => "30".to_string(),
+            Some(v) if (v - 50.0).abs() < 0.001 => "50".to_string(),
+            Some(v) if (v - 60.0).abs() < 0.001 => "60".to_string(),
+            Some(v) if (v - 120.0).abs() < 0.001 => "120".to_string(),
+            Some(v) => format!("{:.3}", v),
+        }
+    }
+
+    /// Cycle through FPS presets: Original → 23.976 → 24 → 25 → 30 → 50 → 60 → 120
+    pub fn cycle_export_fps(&mut self) {
+        self.export_fps = match self.export_fps {
+            None => Some(23.976),
+            Some(v) if (v - 23.976).abs() < 0.001 => Some(24.0),
+            Some(v) if (v - 24.0).abs() < 0.001 => Some(25.0),
+            Some(v) if (v - 25.0).abs() < 0.001 => Some(30.0),
+            Some(v) if (v - 30.0).abs() < 0.001 => Some(50.0),
+            Some(v) if (v - 50.0).abs() < 0.001 => Some(60.0),
+            Some(v) if (v - 60.0).abs() < 0.001 => Some(120.0),
+            _ => None,
+        };
+        self.export_focus = ExportFocus::Fps;
+        self.status_message = format!("FPS: {}", Self::fps_label(self.export_fps));
+    }
+
     pub fn cycle_codec(&mut self, forward: bool) {
         self.export_codec_family = if forward {
             self.export_codec_family.next()
@@ -1363,6 +1857,7 @@ impl App {
         };
 
         let rate_control = self.active_rate_control.clone();
+        let custom_fps = self.export_fps;
         let stats = Arc::new(PipelineStats::new());
         let stats_for_event = Arc::clone(&stats);
 
@@ -1372,7 +1867,7 @@ impl App {
                     info, output_path, progress_cb, cancel_flag, stats,
                     cs, tf, cf, pp, dp, hp, h4p, ap, vp,
                     hevc_enc, h264_enc, av1_enc, prores_enc,
-                    rate_control,
+                    rate_control, custom_fps,
                 )
             }));
             // Always emit stats before Done so the UI can persist them,
@@ -1705,8 +2200,32 @@ impl App {
                 self.show_favourites_bar = false;
             } else if name.ends_with(".mcraw") {
                 let path_str = path.to_string_lossy().to_string();
-                self.load_file(path_str);
+                self.load_file(path_str.clone());
                 self.show_browser = false;
+
+                // Add to media pool if not already present
+                if let Some(ref info) = self.file_info {
+                    if !self.imported_files.iter().any(|f| f.path == path_str) {
+                        self.imported_files.push(ImportedFile {
+                            path: path_str.clone(),
+                            info: info.clone(),
+                            selected: true,
+                            first_timestamp: self.timestamps.first().copied().unwrap_or(0),
+                        });
+                    }
+                }
+
+                // Set media pool index and trigger thumbnail decode
+                if let Some(idx) = self.imported_files.iter().position(|f| f.path == path_str) {
+                    self.media_pool_index = idx;
+                }
+                self.last_written_media_index.set(None);
+                self.sixel_pending.set(false);
+                self.sixel_write_pos.set(None);
+                self.sixel_occupy_size.set(None);
+                if self.decoder.is_some() && !self.timestamps.is_empty() {
+                    self.request_frame_decode(self.frame_index.min(self.timestamps.len() - 1));
+                }
             } else {
                 self.status_message = format!("Cannot open: {} (not a .mcraw file)", name);
             }
@@ -1791,15 +2310,13 @@ impl App {
 
     pub fn cycle_focus(&mut self) {
         self.focus_target = match self.focus_target {
-            FocusTarget::MediaPool => FocusTarget::Preview,
-            FocusTarget::Preview => FocusTarget::Grade,
+            FocusTarget::MediaPool => FocusTarget::Grade,
             FocusTarget::Grade => FocusTarget::ExportSettings,
             FocusTarget::ExportSettings => FocusTarget::Queue,
             FocusTarget::Queue => FocusTarget::MediaPool,
         };
         let label = match self.focus_target {
             FocusTarget::MediaPool => "Media Pool",
-            FocusTarget::Preview => "Preview",
             FocusTarget::Grade => "Grade",
             FocusTarget::ExportSettings => "Export Settings",
             FocusTarget::Queue => "Render Queue",
@@ -1811,7 +2328,6 @@ impl App {
         self.focus_target = target;
         let label = match target {
             FocusTarget::MediaPool => "Media Pool",
-            FocusTarget::Preview => "Preview",
             FocusTarget::Grade => "Grade",
             FocusTarget::ExportSettings => "Export Settings",
             FocusTarget::Queue => "Render Queue",
@@ -1839,8 +2355,7 @@ fn execute_click_action(app: &mut App, action: ClickAction) {
         }
         ClickAction::SelectMediaPoolItem(i) => {
             if i < app.imported_files.len() {
-                app.media_pool_index = i;
-                app.set_focus(FocusTarget::MediaPool);
+                app.switch_media_pool_item(i);
             }
         }
         ClickAction::SelectQueueItem(i) => {
@@ -1858,9 +2373,6 @@ fn execute_click_action(app: &mut App, action: ClickAction) {
         ClickAction::FocusExport => {
             app.set_focus(FocusTarget::ExportSettings);
         }
-        ClickAction::FocusPreview => {
-            app.set_focus(FocusTarget::Preview);
-        }
         ClickAction::FocusGrade => {
             app.show_grade_screen = !app.show_grade_screen;
             if app.show_grade_screen {
@@ -1868,13 +2380,14 @@ fn execute_click_action(app: &mut App, action: ClickAction) {
                 app.status_message = "Grade screen — Esc to exit".to_string();
             } else {
                 app.grade_dragging = None;
-                app.set_focus(FocusTarget::Preview);
+                app.set_focus(FocusTarget::MediaPool);
                 app.status_message = "Normal view".to_string();
             }
         }
         ClickAction::AddSelectedToQueue => app.add_selected_to_queue(),
         ClickAction::AddAllToQueue => app.add_all_to_queue(),
         ClickAction::RemoveSelectedFromMediaPool => app.remove_selected_from_media_pool(),
+        ClickAction::ToggleSelectAll => app.toggle_select_all(),
         ClickAction::ToggleBrowserSelection(i) => {
             if let Some(entry) = app.browser.entries.get_mut(i) {
                 if entry.name.to_lowercase().ends_with(".mcraw") {
@@ -1909,6 +2422,10 @@ fn execute_click_action(app: &mut App, action: ClickAction) {
             app.set_focus(FocusTarget::ExportSettings);
             app.export_focus = ExportFocus::RateControl;
             app.cycle_rate_control();
+        }
+        ClickAction::CycleFps => {
+            app.set_focus(FocusTarget::ExportSettings);
+            app.cycle_export_fps();
         }
         ClickAction::ImportOption1 => {
             if app.import_popup != ImportPopupState::Hidden {
@@ -2019,7 +2536,15 @@ pub enum BrowserDirection {
 }
 
 pub async fn run(args: Cli) -> Result<()> {
-    let mut app = App::new();
+    // Resolve placeholder path: CLI --placeholder-path > env MCRAW_TUI_PLACEHOLDER
+    let placeholder_path = args.placeholder_path.clone()
+        .or_else(|| std::env::var("MCRAW_TUI_PLACEHOLDER").ok())
+        .map(std::path::PathBuf::from);
+    if let Some(ref p) = placeholder_path {
+        tracing::info!("custom placeholder: {}", p.display());
+    }
+
+    let mut app = App::new_with_placeholder(placeholder_path);
     tracing::info!("app initialized: hardware_caps={:?}", app.hardware_caps);
 
     match args.resolve() {
@@ -2098,8 +2623,28 @@ pub async fn run(args: Cli) -> Result<()> {
     tracing::info!("entering main event loop");
 
     while app.running {
+        // Update terminal cell size for sixel positioning
+        if let Ok(ws) = window_size() {
+            if ws.width > 0 && ws.height > 0 && ws.columns > 0 && ws.rows > 0 {
+                app.term_cell_size.set((
+                    ws.width as f32 / ws.columns as f32,
+                    ws.height as f32 / ws.rows as f32,
+                ));
+            }
+        }
+
         app.poll_export();
         app.poll_drop_import();
+        // Only generate thumbnails when on the normal (main) screen.
+        // On Grade / Culling / Welcome, poll_thumbnail would poll GPU and set
+        // PreviewState::Ready, causing the Ghost Widget to draw sixel over
+        // those screens via the unconditional Ready check below.
+        let on_normal_main = !app.show_grade_screen
+            && !app.show_culling
+            && !app.imported_files.is_empty();
+        if on_normal_main {
+            app.poll_thumbnail();
+        }
         app.browser.try_refresh();
 
         // Record render timestamp BEFORE drawing so the FPS meter includes
@@ -2109,6 +2654,42 @@ pub async fn run(args: Cli) -> Result<()> {
 
         let mut click_regions = Vec::new();
         terminal.draw(|frame| ui::render(frame, &app, &mut click_regions))?;
+
+        // Ghost Widget: clear stale sixel when navigating to a different file,
+        // then write the new sixel bytes after ratatui has flushed its buffer.
+        let current_idx = app.media_pool_index;
+        let file_changed = app.last_written_media_index.get() != Some(current_idx);
+
+        // Clear old sixel area when file changes
+        if file_changed {
+            if let Some((lx, ly, lw, lh)) = app.sixel_occupy_size.get() {
+                let clear_line: Vec<u8> = vec![b' '; lw as usize];
+                for row in ly..(ly + lh).min(9999) {
+                    let _ = std::io::stdout()
+                        .queue(MoveTo(lx, row))
+                        .and_then(|out| out.write_all(&clear_line));
+                }
+                app.sixel_occupy_size.set(None);
+            }
+        }
+
+        if app.sixel_pending.get()
+            && !app.is_exporting
+            && (app.last_export_summary.is_none() || app.focused_file_info().or(app.file_info.as_ref()).is_some())
+            && !app.show_grade_screen
+            && !app.show_culling {
+            if let Some((x, y)) = app.sixel_write_pos.get() {
+                if let PreviewState::Ready { ref sixel, .. } = app.preview_state {
+                    let _ = std::io::stdout()
+                        .queue(MoveTo(x, y))
+                        .and_then(|out| out.write_all(sixel));
+                }
+            }
+            app.sixel_pending.set(false);
+            app.last_written_media_index.set(Some(current_idx));
+        }
+
+        // Advance animation state
 
         // Advance animation state
         app.spinner_frame = app.spinner_frame.wrapping_add(1);
@@ -2432,6 +3013,16 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
         }
 
         // -------------------------------------------------------------------
+        // Terminal resize — clear stale sixel output and re-request preview
+        // -------------------------------------------------------------------
+        crossterm::event::Event::Resize(_, _) => {
+            app.preview_state = PreviewState::Empty;
+            if app.decoder.is_some() && !app.timestamps.is_empty() {
+                app.request_frame_decode(app.frame_index.min(app.timestamps.len() - 1));
+            }
+        }
+
+        // -------------------------------------------------------------------
         // Mouse events
         // -------------------------------------------------------------------
         Event::Mouse(mouse_event) => {
@@ -2478,7 +3069,7 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                         }
                     } else {
                         match app.focus_target {
-                            FocusTarget::MediaPool => { if app.media_pool_index > 0 { app.media_pool_index -= 1; } }
+                            FocusTarget::MediaPool => { if app.media_pool_index > 0 { let ni = app.media_pool_index - 1; app.switch_media_pool_item(ni); } }
                             FocusTarget::Queue => { if app.queue_index > 0 { app.queue_index -= 1; } }
                             FocusTarget::ExportSettings => {
                                 // Cycle VALUES of the currently focused setting
@@ -2497,9 +3088,9 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                                         app.active_rate_control = app.active_rate_control.prev();
                                         app.status_message = format!("Rate: {}", app.active_rate_control.name());
                                     }
+                                    ExportFocus::Fps => app.cycle_export_fps(),
                                 }
                             }
-                            FocusTarget::Preview => {}
                             FocusTarget::Grade => {
                                 let step = if mouse_event.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
                                     GradeSliders::step_large(app.grade_focus)
@@ -2524,8 +3115,8 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                     } else {
                         match app.focus_target {
                             FocusTarget::MediaPool => {
-                                let len = app.imported_files.len();
-                                if len > 0 { app.media_pool_index = (app.media_pool_index + 1).min(len - 1); }
+                                let ni = (app.media_pool_index + 1).min(app.imported_files.len().saturating_sub(1));
+                                if ni != app.media_pool_index { app.switch_media_pool_item(ni); }
                             }
                             FocusTarget::Queue => {
                                 let len = app.queue.len();
@@ -2544,9 +3135,9 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                                     }
                                     ExportFocus::Profile => app.cycle_profile(true),
                                     ExportFocus::RateControl => app.cycle_rate_control(),
+                                    ExportFocus::Fps => app.cycle_export_fps(),
                                 }
                             }
-                            FocusTarget::Preview => {}
                             FocusTarget::Grade => {
                                 let step = if mouse_event.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
                                     GradeSliders::step_large(app.grade_focus)
@@ -2866,7 +3457,6 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                             FocusTarget::MediaPool => app.remove_from_media_pool(),
                             FocusTarget::Queue => app.remove_from_queue(),
                             FocusTarget::ExportSettings => {}
-                            FocusTarget::Preview => {}
                             FocusTarget::Grade => {}
                         }
                     }
@@ -2947,6 +3537,8 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                                 app.favourites_scroll_offset = Cell::new(0);
                                 app.status_message = "Favourites view (press [f] or [Esc] to return)".to_string();
                             }
+                        } else if app.focus_target == FocusTarget::ExportSettings {
+                            app.cycle_export_fps();
                         }
                     }
                     'F' => {
@@ -2984,7 +3576,7 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                         app.open_preset_picker();
                     }
                     's' => {
-                        app.status_message = "Settings (coming soon)".to_string();
+                        app.toggle_select_all();
                     }
                     'n' => {
                         if let Some(info) = app.focused_file_info().cloned().or_else(|| app.file_info.clone()) {
@@ -3029,11 +3621,21 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                     'G' => {
                         app.show_grade_screen = !app.show_grade_screen;
                         if app.show_grade_screen {
+                            // Clear stale sixel thumbnail from terminal canvas
+                            if let Some((lx, ly, lw, lh)) = app.sixel_occupy_size.get() {
+                                let clear_line: Vec<u8> = vec![b' '; lw as usize];
+                                for row in ly..(ly + lh).min(9999) {
+                                    let _ = std::io::stdout()
+                                        .queue(MoveTo(lx, row))
+                                        .and_then(|out| out.write_all(&clear_line));
+                                }
+                                app.sixel_occupy_size.set(None);
+                            }
                             app.set_focus(FocusTarget::Grade);
                             app.status_message = "Grade screen — Esc to exit".to_string();
                         } else {
                             app.grade_dragging = None;
-                            app.set_focus(FocusTarget::Preview);
+                            app.set_focus(FocusTarget::MediaPool);
                             app.status_message = "Normal view".to_string();
                         }
                     }
@@ -3058,7 +3660,7 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                     } else if app.show_grade_screen {
                         app.show_grade_screen = false;
                         app.grade_dragging = None;
-                        app.set_focus(FocusTarget::Preview);
+                        app.set_focus(FocusTarget::MediaPool);
                         app.status_message = "Normal view".to_string();
                     } else if app.show_help {
                         app.show_help = false;
@@ -3100,8 +3702,6 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                         app.phosphor_trail.push((old_norm, 4));
                         app.grade_strip_active = true;
                         app.grade_strip_idle_ticks = 15;
-                    } else if app.frame_index < app.frame_count.saturating_sub(1) {
-                        app.frame_index += 1;
                     }
                 }
                 crossterm::event::KeyCode::Left | crossterm::event::KeyCode::Char('h') => {
@@ -3116,8 +3716,6 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                         app.phosphor_trail.push((old_norm, 4));
                         app.grade_strip_active = true;
                         app.grade_strip_idle_ticks = 15;
-                    } else if app.frame_index > 0 {
-                        app.frame_index -= 1;
                     }
                 }
                 crossterm::event::KeyCode::Char('L') => {
@@ -3128,9 +3726,6 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                         app.phosphor_trail.push((old_norm, 4));
                         app.grade_strip_active = true;
                         app.grade_strip_idle_ticks = 15;
-                    } else {
-                        let jump = 10.min(app.frame_count.saturating_sub(app.frame_index + 1));
-                        app.frame_index = app.frame_index.saturating_add(jump);
                     }
                 }
                 crossterm::event::KeyCode::Char('H') => {
@@ -3141,8 +3736,6 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                         app.phosphor_trail.push((old_norm, 4));
                         app.grade_strip_active = true;
                         app.grade_strip_idle_ticks = 15;
-                    } else {
-                        app.frame_index = app.frame_index.saturating_sub(10);
                     }
                 }
                 crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
@@ -3156,7 +3749,7 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                         match app.focus_target {
                             FocusTarget::MediaPool => {
                                 if app.media_pool_index > 0 {
-                                    app.media_pool_index -= 1;
+                                    app.switch_media_pool_item(app.media_pool_index - 1);
                                 }
                             }
                             FocusTarget::Queue => {
@@ -3166,14 +3759,14 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                             }
                             FocusTarget::ExportSettings => {
                                 app.export_focus = match app.export_focus {
-                                    ExportFocus::ColorSpace => ExportFocus::RateControl,
+                                    ExportFocus::ColorSpace => ExportFocus::Fps,
+                                    ExportFocus::Fps => ExportFocus::RateControl,
                                     ExportFocus::TransferFunction => ExportFocus::ColorSpace,
                                     ExportFocus::CodecFamily => ExportFocus::TransferFunction,
                                     ExportFocus::Profile => ExportFocus::CodecFamily,
                                     ExportFocus::RateControl => ExportFocus::Profile,
                                 };
                             }
-                            FocusTarget::Preview => {}
                             FocusTarget::Grade => {
                                 if app.grade_focus > 0 {
                                     app.grade_morph = Some((app.grade_focus, 4));
@@ -3196,7 +3789,7 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                         match app.focus_target {
                             FocusTarget::MediaPool => {
                                 if app.media_pool_index + 1 < app.imported_files.len() {
-                                    app.media_pool_index += 1;
+                                    app.switch_media_pool_item(app.media_pool_index + 1);
                                 }
                             }
                             FocusTarget::Queue => {
@@ -3210,10 +3803,10 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                                     ExportFocus::TransferFunction => ExportFocus::CodecFamily,
                                     ExportFocus::CodecFamily => ExportFocus::Profile,
                                     ExportFocus::Profile => ExportFocus::RateControl,
-                                    ExportFocus::RateControl => ExportFocus::ColorSpace,
+                                    ExportFocus::RateControl => ExportFocus::Fps,
+                                    ExportFocus::Fps => ExportFocus::ColorSpace,
                                 };
                             }
-                            FocusTarget::Preview => {}
                             FocusTarget::Grade => {
                                 if app.grade_focus + 1 < GradeSliders::count() {
                                     app.grade_morph = Some((app.grade_focus, 4));
@@ -3233,7 +3826,6 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                             FocusTarget::MediaPool => app.toggle_media_pool_selection(),
                             FocusTarget::Queue => app.toggle_queue_selection(),
                             FocusTarget::ExportSettings => {}
-                            FocusTarget::Preview => {}
                             FocusTarget::Grade => {}
                         }
                     }
@@ -3252,7 +3844,8 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                     } else if app.focus_target == FocusTarget::MediaPool {
                         let len = app.imported_files.len();
                         if len > 0 {
-                            app.media_pool_index = app.media_pool_index.saturating_sub(10.min(len));
+                            let new_index = app.media_pool_index.saturating_sub(10.min(len));
+                            app.switch_media_pool_item(new_index);
                         }
                     } else if app.focus_target == FocusTarget::Queue {
                         let len = app.queue.len();
@@ -3275,7 +3868,8 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                     } else if app.focus_target == FocusTarget::MediaPool {
                         let len = app.imported_files.len();
                         if len > 0 {
-                            app.media_pool_index = (app.media_pool_index + 10).min(len - 1);
+                            let new_index = (app.media_pool_index + 10).min(len - 1);
+                            app.switch_media_pool_item(new_index);
                         }
                     } else if app.focus_target == FocusTarget::Queue {
                         let len = app.queue.len();
@@ -3290,11 +3884,9 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                     } else if app.show_browser {
                         app.browser.selected_index = 0;
                     } else if app.focus_target == FocusTarget::MediaPool {
-                        app.media_pool_index = 0;
+                        app.switch_media_pool_item(0);
                     } else if app.focus_target == FocusTarget::Queue {
                         app.queue_index = 0;
-                    } else {
-                        app.frame_index = 0;
                     }
                 }
                 crossterm::event::KeyCode::End => {
@@ -3310,14 +3902,12 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                         }
                     } else if app.focus_target == FocusTarget::MediaPool {
                         if !app.imported_files.is_empty() {
-                            app.media_pool_index = app.imported_files.len() - 1;
+                            app.switch_media_pool_item(app.imported_files.len() - 1);
                         }
                     } else if app.focus_target == FocusTarget::Queue {
                         if !app.queue.is_empty() {
                             app.queue_index = app.queue.len() - 1;
                         }
-                    } else {
-                        app.frame_index = app.frame_count.saturating_sub(1);
                     }
                 }
                 crossterm::event::KeyCode::Backspace => {
@@ -3334,3 +3924,5 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
         _ => {}
     }
 }
+
+

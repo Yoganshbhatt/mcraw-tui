@@ -1,6 +1,6 @@
 [package]
 name = "mcraw-tui"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Cross-platform TUI for browsing and exploring MotionCam (.mcraw) files"
 authors = ["Terminal Developer"]
@@ -58,3 +58,9 @@ percent-encoding = "2.3"
 # Global allocator (D1) — mimalloc is faster than glibc malloc for
 # the large bursts the export path does (18MB + 9MB + 73MB allocs).
 mimalloc = "0.1"
+
+# Wu-quantized sixel encoder for static thumbnails (not live video)
+icy_sixel = "0.5"
+
+# LRU eviction cache for thumbnails
+lru = "0.12"

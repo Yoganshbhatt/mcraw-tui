@@ -54,7 +54,8 @@ pub fn get_ffmpeg_vui_tags(color_space: &ColorSpace, transfer: &TransferFunction
         | ColorSpace::CanonCinemaGamut
         | ColorSpace::PanasonicVGamut
         | ColorSpace::DaVinciWideGamut
-        | ColorSpace::ACESAP1 => ("bt2020", "bt2020nc"),
+        | ColorSpace::ACESAP1
+        | ColorSpace::AppleWideGamut => ("bt2020", "bt2020nc"),
     };
     let trc = match transfer {
         TransferFunction::Rec709 => "bt709",
@@ -86,11 +87,11 @@ pub fn run_naked(info: &McrawFileInfo, output_path: &str) -> Result<()> {
 pub fn run(info: &McrawFileInfo, output_path: &str) -> Result<()> {
     let never_cancel = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(PipelineStats::new());
-    run_export(info.clone(), output_path.to_string(), Arc::new(|_| {}), never_cancel, stats, ColorSpace::Rec709, TransferFunction::Rec709, CodecFamily::ProRes, ProResProfile::HQ, DnxhrProfile::HQX, HevcProfile::Main10_420, H264Profile::Main8bit, Av1Profile::Profile0_420_10bit, Vp9Profile::Profile2_420_10bit, "libx265".to_string(), "libx264".to_string(), "libaom-av1".to_string(), "prores_ks".to_string(), RateControl::Lossless)
+    run_export(info.clone(), output_path.to_string(), Arc::new(|_| {}), never_cancel, stats, ColorSpace::Rec709, TransferFunction::Rec709, CodecFamily::ProRes, ProResProfile::HQ, DnxhrProfile::HQX, HevcProfile::Main10_420, H264Profile::Main8bit, Av1Profile::Profile0_420_10bit, Vp9Profile::Profile2_420_10bit, "libx265".to_string(), "libx264".to_string(), "libaom-av1".to_string(), "prores_ks".to_string(), RateControl::Lossless, None)
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn Fn(f64) + Send + Sync>, cancelled: Arc<AtomicBool>, stats: Arc<PipelineStats>, export_cs: ColorSpace, export_tf: TransferFunction, codec_family: CodecFamily, prores_profile: ProResProfile, dnxhr_profile: DnxhrProfile, hevc_profile: HevcProfile, h264_profile: H264Profile, av1_profile: Av1Profile, vp9_profile: Vp9Profile, hevc_encoder: String, h264_encoder: String, av1_encoder: String, prores_encoder: String, rate_control: RateControl) -> Result<()> {
+pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn Fn(f64) + Send + Sync>, cancelled: Arc<AtomicBool>, stats: Arc<PipelineStats>, export_cs: ColorSpace, export_tf: TransferFunction, codec_family: CodecFamily, prores_profile: ProResProfile, dnxhr_profile: DnxhrProfile, hevc_profile: HevcProfile, h264_profile: H264Profile, av1_profile: Av1Profile, vp9_profile: Vp9Profile, hevc_encoder: String, h264_encoder: String, av1_encoder: String, prores_encoder: String, rate_control: RateControl, custom_fps: Option<f64>) -> Result<()> {
     tracing::info!("run_export: input={} output={} codec={} cs={} tf={}", info.path, output_path, codec_family.name(), export_cs.name(), export_tf.name());
     let setup_start = Instant::now();
     let decoder = Decoder::new(&info.path)?; let timestamps = decoder.timestamps()?;
@@ -99,7 +100,7 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
     let active_width = if info.active_width > 0 { info.active_width as u32 } else { stride_width };
     let active_height = if info.active_height > 0 { info.active_height as u32 } else { info.height as u32 };
     if active_width == 0 || active_height == 0 { return Err(anyhow!("Invalid active dimensions")); }
-    let fps = if info.fps > 0.0 { info.fps } else { 25.0 };
+    let fps = custom_fps.unwrap_or_else(|| if info.fps > 0.0 { info.fps } else { 25.0 });
     
     let cm1_f32: [f32; 9] = info.camera_metadata.color_matrix.map(|cm| { let mut ccm = [0.0f32; 9]; for (i, v) in cm.iter().enumerate() { ccm[i] = *v as f32; } ccm }).unwrap_or_else(identity_ccm);
     let cm2_f32: Option<[f32; 9]> = info.camera_metadata.color_matrix2.map(|cm| { let mut ccm = [0.0f32; 9]; for (i, v) in cm.iter().enumerate() { ccm[i] = *v as f32; } ccm });
