@@ -6,7 +6,7 @@
     "architecture": {
         "64bit": {
             "url": "https://github.com/Yoganshbhatt/mcraw-tui/releases/download/v0.2.1/mcraw-tui-x86_64-pc-windows-msvc.zip",
-            "hash": "UPDATE_ME_AFTER_RELEASE"
+            "hash": "4BF0741EA42B8C02B5AE9E8A34376A15E36353B47FAAA71F0BAD7C4AF165FAAF"
         }
     },
     "bin": "mcraw-tui.exe",
