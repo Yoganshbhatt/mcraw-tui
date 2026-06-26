@@ -1,6 +1,6 @@
 [package]
 name = "mcraw-tui"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Cross-platform TUI for browsing and exploring MotionCam (.mcraw) files"
 authors = ["Terminal Developer"]
@@ -64,3 +64,6 @@ icy_sixel = "0.5"
 
 # LRU eviction cache for thumbnails
 lru = "0.12"
+
+# Base64 encoding for Kitty terminal graphics protocol
+base64 = "0.22"

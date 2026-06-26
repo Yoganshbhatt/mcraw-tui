@@ -11,7 +11,7 @@ Cross-platform terminal UI for browsing and exporting MotionCam `.mcraw` files t
 - **Render Queue**: Multi-file batch export with per-item status tracking
 - **Export Settings**: 15 color spaces (Rec.709, S-Gamut3, ARRI WG, Canon Cinema Gamut, DaVinci Wide Gamut, ACES AP1, etc.), 14 transfer functions (S-Log3, C-Log3, ARRI LogC3/C4, PQ, HLG, etc.)
 - **16 export codec profiles**: ProRes 4444/XQ, HEVC 10-bit 4:4:4, H.264, AV1 (SVT-AV1, NVENC), VP9, DNxHR
-- **TUI Preview**: Preview thumbnails with Sixel graphics (Kitty > Chafa fallback planned)
+- **TUI Preview**: Preview thumbnails with kitty (tested on wezterm) and Sixel protocol.
 - **Apple Wide Gamut**: Full color pipeline support for Apple Log media
 - **Custom FPS**: Per-item export frame rate override (23.976, 24, 25, 30, 50, 60, 120 fps)
 - **Hardware acceleration**: Auto-detects NVENC, AMF, QSV, VideoToolbox encoders
