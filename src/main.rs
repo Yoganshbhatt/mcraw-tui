@@ -21,6 +21,7 @@ mod pipeline;
 mod preset;
 mod preview;
 mod stats;
+mod terminal;
 mod thumbnail;
 mod thumbnail_worker;
 mod ui;
@@ -96,6 +97,10 @@ async fn main() -> Result<()> {
     }
     tracing::info!("platform: {}", std::env::consts::OS);
     tracing::info!("working_dir: {:?}", std::env::current_dir().ok());
+
+    let protocol = crate::terminal::detect();
+    crate::terminal::init(protocol);
+    tracing::info!("terminal protocol: {}", crate::terminal::protocol_name(protocol));
 
     let args = cli::Cli::parse();
     tracing::info!("cli args: {:?}", args);

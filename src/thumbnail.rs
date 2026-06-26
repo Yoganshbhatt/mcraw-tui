@@ -1,14 +1,15 @@
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Instant;
 
 use anyhow::Result;
 use lru::LruCache;
-use std::num::NonZeroUsize;
 
 use crate::preview::pipeline::pipeline::{GpuPreviewPipeline, Ready};
 use crate::preview::pipeline::params::PreviewParams;
-use crate::preview::pipeline::params::{transfer_to_u32, color_space_to_u32};
+use crate::preview::pipeline::params::{color_space_to_u32, transfer_to_u32};
+use crate::terminal::{protocol, TerminalProtocol};
 
 pub const THUMBNAIL_WIDTH: u32 = 320;
 pub const THUMBNAIL_HEIGHT: u32 = 180;
@@ -157,6 +158,55 @@ impl Default for ThumbnailCache {
     }
 }
 
+/// Strip alpha channel from RGBA for Kitty f=24 raw RGB.
+fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
+    let mut rgb = Vec::with_capacity(rgba.len() / 4 * 3);
+    for chunk in rgba.chunks(4) {
+        rgb.push(chunk[0]);
+        rgb.push(chunk[1]);
+        rgb.push(chunk[2]);
+    }
+    rgb
+}
+
+/// Encode an RGBA buffer as Kitty graphics protocol raw RGB (`f=24`).
+///
+/// Uses `a=t` (transmit only, image ID=0, replace=1) to send the pixel
+/// data without displaying. The caller must emit a subsequent `a=p` (place)
+/// command to display the image at the cursor position — this two-step
+/// approach works around WezTerm on Windows where `a=T` (transmit+display)
+/// ignores the cursor position and snaps to pixel (0,0).
+fn kitty_encode(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
+    use base64::Engine;
+    let rgb = rgba_to_rgb(rgba);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&rgb);
+    let header = format!("\x1b_Ga=t,i=0,r=1,f=24,s={},v={},m=0;", width, height);
+    let mut out = header.into_bytes();
+    out.extend_from_slice(b64.as_bytes());
+    out.extend_from_slice(b"\x1b\\");
+    out
+}
+
+/// Encode an RGBA buffer to the terminal's image protocol (sixel or Kitty).
+/// Returns raw bytes ready to write directly to stdout.
+fn encode_rgba_to_terminal(rgba: &[u8], width: usize, height: usize) -> Result<Vec<u8>> {
+    match protocol() {
+        TerminalProtocol::Kitty => Ok(kitty_encode(rgba, width, height)),
+        TerminalProtocol::Sixel => {
+            let s = icy_sixel::sixel_encode(rgba, width, height, &icy_sixel::EncodeOptions::default())
+                .map_err(|e| anyhow::anyhow!("sixel encode: {}", e))?;
+            Ok(s.into_bytes())
+        }
+        TerminalProtocol::TextFallback => {
+            // Best-effort sixel. Terminals that don't support it silently
+            // ignore the escape sequences — harmless.
+            let s = icy_sixel::sixel_encode(rgba, width, height, &icy_sixel::EncodeOptions::default())
+                .map_err(|e| anyhow::anyhow!("sixel encode: {}", e))?;
+            Ok(s.into_bytes())
+        }
+    }
+}
+
 pub fn compute_thumbnail(
     pipeline: &mut GpuPreviewPipeline<Ready>,
     bayer: &[u16],
@@ -172,15 +222,10 @@ pub fn compute_thumbnail(
 
     let (rgba, w, h) = pipeline.process_and_readback(bayer, &params)?;
 
-    let sixel = icy_sixel::sixel_encode(
-        &rgba,
-        w as usize,
-        h as usize,
-        &icy_sixel::EncodeOptions::default(),
-    ).map_err(|e| anyhow::anyhow!("sixel encode: {}", e))?;
+    let encoded = encode_rgba_to_terminal(&rgba, w as usize, h as usize)?;
 
     Ok(CachedThumbnail {
-        sixel: sixel.into_bytes(),
+        sixel: encoded,
         width: w,
         height: h,
         encode_time: Instant::now(),
@@ -594,13 +639,8 @@ pub fn cpu_thumbnail(
         }
     }
 
-    // 12. Encode to sixel
-    let sixel = icy_sixel::sixel_encode(
-        &rgba,
-        out_w as usize,
-        out_h as usize,
-        &icy_sixel::EncodeOptions::default(),
-    ).map_err(|e| anyhow::anyhow!("sixel encode: {}", e))?;
+    // 12. Encode to terminal protocol
+    let encoded = encode_rgba_to_terminal(&rgba, out_w as usize, out_h as usize)?;
 
-    Ok((sixel.into_bytes(), out_w, out_h))
+    Ok((encoded, out_w, out_h))
 }

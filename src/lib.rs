@@ -23,6 +23,7 @@ pub mod pipeline;
 pub mod preset;
 pub mod preview;
 pub mod stats;
+pub mod terminal;
 pub mod thumbnail;
 pub mod thumbnail_worker;
 pub mod ui;

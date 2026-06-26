@@ -484,6 +484,9 @@ pub struct App {
     pub sixel_write_pos: Cell<Option<(u16, u16)>>,
     /// Character-cell footprint of the last written sixel (x, y, chars_w, chars_h).
     pub sixel_occupy_size: Cell<Option<(u16, u16, u16, u16)>>,
+    /// Panel interior rect (x, y, w, h) in character cells — used by Kitty
+    /// protocol to place the image spanning the full panel via `a=p,c=,r=`.
+    pub sixel_panel_rect: Cell<Option<(u16, u16, u16, u16)>>,
     /// Index of the media pool item whose sixel was last written to the terminal.
     pub last_written_media_index: Cell<Option<usize>>,
     /// Terminal character cell size in pixels — updated at each loop iteration.
@@ -671,6 +674,7 @@ impl App {
             sixel_pending: Cell::new(false),
             sixel_write_pos: Cell::new(None),
             sixel_occupy_size: Cell::new(None),
+            sixel_panel_rect: Cell::new(None),
             last_written_media_index: Cell::new(None),
             term_cell_size: Cell::new((10.0, 20.0)),
             preview_panel_chars: Cell::new(None),
@@ -873,6 +877,8 @@ impl App {
                 // Update preview state only if this result is for the current file
                 let is_current = self.file_path.as_ref().map_or(false, |fp| *fp == *result.path.to_string_lossy());
                 if is_current {
+                    // Worker produced data for the current file — force Ghost Widget write
+                    self.last_written_media_index.set(None);
                     if let Some(sixel) = result.sixel {
                         self.sixel_pending.set(true);
                         self.preview_state = PreviewState::Ready {
@@ -2625,11 +2631,18 @@ pub async fn run(args: Cli) -> Result<()> {
     while app.running {
         // Update terminal cell size for sixel positioning
         if let Ok(ws) = window_size() {
-            if ws.width > 0 && ws.height > 0 && ws.columns > 0 && ws.rows > 0 {
-                app.term_cell_size.set((
-                    ws.width as f32 / ws.columns as f32,
-                    ws.height as f32 / ws.rows as f32,
-                ));
+            if ws.columns > 0 && ws.rows > 0 {
+                let cell_w = if ws.width > 0 {
+                    ws.width as f32 / ws.columns as f32
+                } else {
+                    8.0
+                };
+                let cell_h = if ws.height > 0 {
+                    ws.height as f32 / ws.rows as f32
+                } else {
+                    16.0
+                };
+                app.term_cell_size.set((cell_w, cell_h));
             }
         }
 
@@ -2654,42 +2667,6 @@ pub async fn run(args: Cli) -> Result<()> {
 
         let mut click_regions = Vec::new();
         terminal.draw(|frame| ui::render(frame, &app, &mut click_regions))?;
-
-        // Ghost Widget: clear stale sixel when navigating to a different file,
-        // then write the new sixel bytes after ratatui has flushed its buffer.
-        let current_idx = app.media_pool_index;
-        let file_changed = app.last_written_media_index.get() != Some(current_idx);
-
-        // Clear old sixel area when file changes
-        if file_changed {
-            if let Some((lx, ly, lw, lh)) = app.sixel_occupy_size.get() {
-                let clear_line: Vec<u8> = vec![b' '; lw as usize];
-                for row in ly..(ly + lh).min(9999) {
-                    let _ = std::io::stdout()
-                        .queue(MoveTo(lx, row))
-                        .and_then(|out| out.write_all(&clear_line));
-                }
-                app.sixel_occupy_size.set(None);
-            }
-        }
-
-        if app.sixel_pending.get()
-            && !app.is_exporting
-            && (app.last_export_summary.is_none() || app.focused_file_info().or(app.file_info.as_ref()).is_some())
-            && !app.show_grade_screen
-            && !app.show_culling {
-            if let Some((x, y)) = app.sixel_write_pos.get() {
-                if let PreviewState::Ready { ref sixel, .. } = app.preview_state {
-                    let _ = std::io::stdout()
-                        .queue(MoveTo(x, y))
-                        .and_then(|out| out.write_all(sixel));
-                }
-            }
-            app.sixel_pending.set(false);
-            app.last_written_media_index.set(Some(current_idx));
-        }
-
-        // Advance animation state
 
         // Advance animation state
         app.spinner_frame = app.spinner_frame.wrapping_add(1);
@@ -2719,8 +2696,93 @@ pub async fn run(args: Cli) -> Result<()> {
         // the terminal sends a burst of events that must be consumed together.
         // Processing only one per frame causes input lag and wrong key events
         // leaking through between paste characters.
+        // Deduplicate identical key events within the same drain batch to
+        // prevent double-processing from auto-repeat or duplicate Press events.
+        let mut last_key = None::<crossterm::event::KeyEvent>;
         while let Ok(event) = rx.try_recv() {
+            if let Event::Key(ref ke) = event {
+                if last_key.as_ref().map_or(false, |last| {
+                    last.code == ke.code && last.modifiers == ke.modifiers && last.kind == ke.kind
+                }) {
+                    continue;
+                }
+                last_key = Some(*ke);
+            }
             handle_event(&mut app, event, &encoder, &click_regions).await;
+        }
+
+        // Ghost Widget: clear stale sixel area when navigating to a different
+        // file, then write the new sixel.  Runs after event drain so the
+        // blocking stdout write (multi-hundred-KB Kitty/Sixel bytes) cannot
+        // queue up keyboard events mid-frame — all pending input is consumed
+        // first, then the blocking write happens before sleep.
+        let current_idx = app.media_pool_index;
+        let file_changed = app.last_written_media_index.get() != Some(current_idx);
+
+        // Clear old sixel area when file changes
+        if file_changed {
+            if let Some((lx, ly, lw, lh)) = app.sixel_occupy_size.get() {
+                let clear_line: Vec<u8> = vec![b' '; lw as usize];
+                for row in ly..(ly + lh).min(9999) {
+                    let _ = std::io::stdout()
+                        .queue(MoveTo(lx, row))
+                        .and_then(|out| out.write_all(&clear_line));
+                }
+                app.sixel_occupy_size.set(None);
+            }
+        }
+
+        if app.sixel_pending.get()
+            && file_changed
+            && !app.is_exporting
+            && (app.last_export_summary.is_none() || app.focused_file_info().or(app.file_info.as_ref()).is_some())
+            && !app.show_grade_screen
+            && !app.show_culling {
+            if let Some((x, y)) = app.sixel_write_pos.get() {
+                if let PreviewState::Ready { ref sixel, width, height } = app.preview_state {
+                    let mut out = std::io::stdout();
+                    if crate::terminal::protocol() == crate::terminal::TerminalProtocol::Kitty {
+                        // Two-step transmit+place with aspect-fit scaling.
+                        // To preserve the image's pixel aspect ratio when the
+                        // terminal renders it spanning c columns × r rows,
+                        // compute c and r such that:
+                        //   (c * cell_w) / (r * cell_h) ≈ width / height
+                        // i.e. (c / r) = (width / height) * (cell_h / cell_w)
+                        // The panel pixel aspect is (pw*cell_w)/(ph*cell_h).
+                        if let Some((px, py, pw, ph)) = app.sixel_panel_rect.get() {
+                            let (cell_w, cell_h) = app.term_cell_size.get();
+                            let cell_aspect = cell_w / cell_h;
+                            let img_aspect_px = width as f32 / height as f32;
+                            let panel_px_aspect = (pw as f32 * cell_w) / (ph as f32 * cell_h);
+
+                            let (fit_w, fit_h) = if img_aspect_px > panel_px_aspect {
+                                // Image wider than panel in pixel space
+                                (pw, (pw as f32 * cell_aspect / img_aspect_px).round().max(1.0) as u16)
+                            } else {
+                                // Image taller than panel in pixel space
+                                ((ph as f32 * img_aspect_px / cell_aspect).round().max(1.0) as u16, ph)
+                            };
+
+                            let off_x = (pw - fit_w) / 2;
+                            let off_y = (ph - fit_h) / 2;
+                            let place_x = (px as i32 + off_x as i32).max(0) as u16;
+                            let place_y = (py as i32 + off_y as i32).max(0) as u16;
+
+                            let _ = out.queue(MoveTo(place_x, place_y));
+                            let _ = out.write_all(sixel);
+                            let place = format!("\x1b_Ga=p,i=0,c={fit_w},r={fit_h},m=0\x1b\\");
+                            let _ = out.write_all(place.as_bytes());
+                        }
+                    } else {
+                        // Sixel / fallback — render at natural pixel size at
+                        // the centered position computed by render_preview_panel.
+                        let _ = out.queue(MoveTo(x, y));
+                        let _ = out.write_all(sixel);
+                    }
+                }
+            }
+            app.sixel_pending.set(false);
+            app.last_written_media_index.set(Some(current_idx));
         }
 
         time::sleep(Duration::from_millis(16)).await;
@@ -3702,6 +3764,27 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                         app.phosphor_trail.push((old_norm, 4));
                         app.grade_strip_active = true;
                         app.grade_strip_idle_ticks = 15;
+                    } else if app.focus_target == FocusTarget::ExportSettings {
+                        match app.export_focus {
+                            ExportFocus::CodecFamily => app.cycle_codec(true),
+                            ExportFocus::ColorSpace => {
+                                app.export_color_space = app.export_color_space.next();
+                                app.status_message = format!("Gamut: {}", app.export_color_space.name());
+                            }
+                            ExportFocus::TransferFunction => {
+                                app.export_transfer_function = app.export_transfer_function.next();
+                                app.status_message = format!("Transfer: {}", app.export_transfer_function.name());
+                            }
+                            ExportFocus::Profile => app.cycle_profile(true),
+                            ExportFocus::RateControl => app.cycle_rate_control(),
+                            ExportFocus::Fps => app.cycle_export_fps(),
+                        }
+                    } else if !app.timestamps.is_empty() {
+                        let next = (app.frame_index + 1).min(app.timestamps.len() - 1);
+                        if next != app.frame_index {
+                            app.frame_index = next;
+                            app.request_frame_decode(app.frame_index);
+                        }
                     }
                 }
                 crossterm::event::KeyCode::Left | crossterm::event::KeyCode::Char('h') => {
@@ -3716,6 +3799,30 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                         app.phosphor_trail.push((old_norm, 4));
                         app.grade_strip_active = true;
                         app.grade_strip_idle_ticks = 15;
+                    } else if app.focus_target == FocusTarget::ExportSettings {
+                        match app.export_focus {
+                            ExportFocus::CodecFamily => app.cycle_codec(false),
+                            ExportFocus::ColorSpace => {
+                                app.export_color_space = app.export_color_space.prev();
+                                app.status_message = format!("Gamut: {}", app.export_color_space.name());
+                            }
+                            ExportFocus::TransferFunction => {
+                                app.export_transfer_function = app.export_transfer_function.prev();
+                                app.status_message = format!("Transfer: {}", app.export_transfer_function.name());
+                            }
+                            ExportFocus::Profile => app.cycle_profile(false),
+                            ExportFocus::RateControl => {
+                                app.active_rate_control = app.active_rate_control.prev();
+                                app.status_message = format!("Rate: {}", app.active_rate_control.name());
+                            }
+                            ExportFocus::Fps => app.cycle_export_fps(),
+                        }
+                    } else if !app.timestamps.is_empty() {
+                        let prev = app.frame_index.saturating_sub(1);
+                        if prev != app.frame_index {
+                            app.frame_index = prev;
+                            app.request_frame_decode(app.frame_index);
+                        }
                     }
                 }
                 crossterm::event::KeyCode::Char('L') => {
@@ -3758,13 +3865,14 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                                 }
                             }
                             FocusTarget::ExportSettings => {
+                                let show_rate = !matches!(app.export_codec_family, crate::export::CodecFamily::ProRes | crate::export::CodecFamily::DNxHR);
                                 app.export_focus = match app.export_focus {
-                                    ExportFocus::ColorSpace => ExportFocus::Fps,
-                                    ExportFocus::Fps => ExportFocus::RateControl,
+                                    ExportFocus::CodecFamily => if show_rate { ExportFocus::RateControl } else { ExportFocus::Fps },
+                                    ExportFocus::RateControl => ExportFocus::Fps,
+                                    ExportFocus::Fps => ExportFocus::Profile,
+                                    ExportFocus::Profile => ExportFocus::TransferFunction,
                                     ExportFocus::TransferFunction => ExportFocus::ColorSpace,
-                                    ExportFocus::CodecFamily => ExportFocus::TransferFunction,
-                                    ExportFocus::Profile => ExportFocus::CodecFamily,
-                                    ExportFocus::RateControl => ExportFocus::Profile,
+                                    ExportFocus::ColorSpace => ExportFocus::CodecFamily,
                                 };
                             }
                             FocusTarget::Grade => {
@@ -3798,13 +3906,14 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                                 }
                             }
                             FocusTarget::ExportSettings => {
+                                let show_rate = !matches!(app.export_codec_family, crate::export::CodecFamily::ProRes | crate::export::CodecFamily::DNxHR);
                                 app.export_focus = match app.export_focus {
+                                    ExportFocus::CodecFamily => ExportFocus::ColorSpace,
                                     ExportFocus::ColorSpace => ExportFocus::TransferFunction,
-                                    ExportFocus::TransferFunction => ExportFocus::CodecFamily,
-                                    ExportFocus::CodecFamily => ExportFocus::Profile,
-                                    ExportFocus::Profile => ExportFocus::RateControl,
-                                    ExportFocus::RateControl => ExportFocus::Fps,
-                                    ExportFocus::Fps => ExportFocus::ColorSpace,
+                                    ExportFocus::TransferFunction => ExportFocus::Profile,
+                                    ExportFocus::Profile => ExportFocus::Fps,
+                                    ExportFocus::Fps => if show_rate { ExportFocus::RateControl } else { ExportFocus::CodecFamily },
+                                    ExportFocus::RateControl => ExportFocus::CodecFamily,
                                 };
                             }
                             FocusTarget::Grade => {

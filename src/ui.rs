@@ -333,12 +333,6 @@ fn render_empty_state(frame: &mut Frame, area: Rect, app: &App, regions: &mut Ve
         )),
         Line::from(""),
         Line::from(Span::styled(
-            "  Or drag & drop .mcraw files onto this window",
-            Style::default().fg(Color::White),
-        )),
-        Line::from(""),
-        Line::from(""),
-        Line::from(Span::styled(
             "  [b] Toggle Browser    [?] Help",
             Style::default().fg(Palette::STATUS_KEY).add_modifier(Modifier::BOLD),
         )),
@@ -1232,7 +1226,12 @@ fn render_preview_panel(frame: &mut Frame, app: &App, area: Rect, border_color: 
         crate::preview::PreviewState::Ready { width, height, .. } => {
             frame.render_widget(Clear, inner);
 
-            // Convert sixel pixel size to character-cell footprint using terminal cell size
+            // Store panel interior rect for all protocols (Kitty fills the
+            // panel; Sixel clears the panel area on navigation).
+            app.sixel_panel_rect.set(Some((inner.x, inner.y, inner.width, inner.height)));
+            app.sixel_occupy_size.set(Some((inner.x, inner.y, inner.width, inner.height)));
+
+            // For Sixel: center the image in the panel at natural pixel size.
             let (cell_w, cell_h) = app.term_cell_size.get();
             let sixel_chars_w = *width as f32 / cell_w;
             let sixel_chars_h = *height as f32 / cell_h;
@@ -1244,10 +1243,7 @@ fn render_preview_panel(frame: &mut Frame, app: &App, area: Rect, border_color: 
             let sixel_x = (inner.x as i32 + offset_x as i32).max(0) as u16;
             let sixel_y = (inner.y as i32 + offset_y as i32).max(0) as u16;
 
-            // Store occupy size for Ghost Widget clearing, then write position
-            let occupy_w = (sixel_chars_w.ceil() as u16).max(1);
-            let occupy_h = (sixel_chars_h.ceil() as u16).max(1);
-            app.sixel_occupy_size.set(Some((sixel_x, sixel_y, occupy_w, occupy_h)));
+            // Store write position for Ghost Widget (centered for Sixel)
             app.sixel_write_pos.set(Some((sixel_x, sixel_y)));
             app.sixel_pending.set(true);
 
@@ -2495,7 +2491,9 @@ fn render_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         Line::from(Span::styled("  Navigation", Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD))),
         Line::from(Span::styled("  b          Toggle browser overlay", Style::default().fg(Palette::VALUE))),
-        Line::from(Span::styled("  Tab        Cycle focus: Media Pool -> Preview -> Export -> Queue", Style::default().fg(Palette::VALUE))),
+        Line::from(Span::styled("  Tab        Cycle focus: Media Pool -> Queue -> Export Settings", Style::default().fg(Palette::VALUE))),
+        Line::from(Span::styled("  ↑/↓ or j/k Navigate lists (media pool, queue)", Style::default().fg(Palette::VALUE))),
+        Line::from(Span::styled("  ←/→ or h/l Frame navigation / Export Settings value", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  Click      Click panel or items to focus/select", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  Scroll     Scroll wheel navigates the hovered panel", Style::default().fg(Palette::VALUE))),
         Line::from(""),
@@ -2515,6 +2513,8 @@ fn render_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         Line::from(Span::styled("  Export Settings", Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD))),
         Line::from(Span::styled("  e          Focus export settings", Style::default().fg(Palette::VALUE))),
+        Line::from(Span::styled("  ↑/↓        Cycle between settings (focus)", Style::default().fg(Palette::VALUE))),
+        Line::from(Span::styled("  ←/→        Change value of focused setting", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  c/g/t/r    Cycle codec/gamut/transfer/rate", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  P          Open preset picker (apply saved preset)", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  p          Save current settings as preset", Style::default().fg(Palette::VALUE))),
@@ -2535,6 +2535,13 @@ fn render_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::styled("  Culling", Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD))),
         Line::from(Span::styled("  C          Toggle culling mode", Style::default().fg(Palette::VALUE))),
         Line::from(""),
+        Line::from(Span::styled("  Grade (RAW Adjust)", Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled("  G          Toggle grade screen", Style::default().fg(Palette::VALUE))),
+        Line::from(Span::styled("  ↑/↓        Focus previous/next slider", Style::default().fg(Palette::VALUE))),
+        Line::from(Span::styled("  ←/→        Adjust slider value", Style::default().fg(Palette::VALUE))),
+        Line::from(Span::styled("  r          Reset focused slider to default", Style::default().fg(Palette::VALUE))),
+        Line::from(Span::styled("  b/B        Before/After toggle", Style::default().fg(Palette::VALUE))),
+        Line::from(""),
         Line::from(Span::styled("  File Info / Preview", Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD))),
         Line::from(Span::styled("  i          Show full file info for selected file", Style::default().fg(Palette::VALUE))),
         Line::from(""),
@@ -2547,7 +2554,6 @@ fn render_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::styled("                  [SW] orange = software encoder", Style::default().fg(Palette::SW_CODEC))),
         Line::from(""),
         Line::from(Span::styled("  Logs: stored in app data directory, auto-cleaned after 7 days", Style::default().fg(Color::DarkGray))),
-        Line::from(Span::styled("  Drag & drop .mcraw files onto the terminal to import", Style::default().fg(Color::DarkGray))),
         Line::from(Span::styled("  ↑/↓, PageUp/Dn, Scroll wheel  Scroll this help", Style::default().fg(Color::DarkGray))),
     ];
 
