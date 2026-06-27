@@ -720,63 +720,21 @@ impl App {
                 };
 
                     if let Some(ref decoder) = decoder {
-                        if let Ok(container_meta) = decoder.container_metadata() {
-                            let as_f64 = |v: &[f32; 9]| -> [f64; 9] {
-                                let mut r = [0.0; 9];
-                                for (i, &x) in v.iter().enumerate() { r[i] = x as f64; }
-                                r
-                            };
-                            let non_zero = |m: &[f32; 9]| m.iter().any(|&x| x != 0.0);
+                        info.enhance_from_decoder(decoder);
 
-                            info.camera_metadata.color_matrix = Some(as_f64(&container_meta.color_matrix1));
-                            if non_zero(&container_meta.color_matrix2) {
-                                info.camera_metadata.color_matrix2 = Some(as_f64(&container_meta.color_matrix2));
-                            }
-                            if non_zero(&container_meta.forward_matrix1) {
-                                info.camera_metadata.forward_matrix1 = Some(as_f64(&container_meta.forward_matrix1));
-                            }
-                            if non_zero(&container_meta.forward_matrix2) {
-                                info.camera_metadata.forward_matrix2 = Some(as_f64(&container_meta.forward_matrix2));
-                            }
-                            if container_meta.has_calibration_illuminants {
-                                info.camera_metadata.calibration_illuminant1 = Some(container_meta.calibration_illuminant1);
-                                info.camera_metadata.calibration_illuminant2 = Some(container_meta.calibration_illuminant2);
-                            }
-
-                            if container_meta.white_level > 0.0 {
-                                info.white_level = container_meta.white_level;
-                            }
-                            if container_meta.black_level_count > 0 {
-                                info.black_level = container_meta.black_level[0];
-                            }
-                        }
-                        info.frame_count = timestamps.len() as u32;
-                        if timestamps.len() >= 2 {
-                            let duration_ns = timestamps[timestamps.len() - 1] - timestamps[0];
-                            if duration_ns > 0 {
-                                let duration_in_seconds = duration_ns as f64 / 1_000_000_000.0;
-                                info.fps = (info.frame_count.saturating_sub(1)) as f64 / duration_in_seconds;
-                            }
-                        }
-                        if !timestamps.is_empty() {
-                            if let Ok(first_frame_meta) = decoder.load_frame_metadata(timestamps[0]) {
-                                info.width = first_frame_meta.width as u16;
-                                info.height = first_frame_meta.height as u16;
-                            }
-                            // Initialize grade temperature from file white balance
-                            if let Some(wb) = info.camera_metadata.wb_multipliers {
-                                let r_gain = wb[0];
-                                let b_gain = wb[2];
-                                let ratio = (r_gain / b_gain.max(1e-6)).clamp(0.1, 10.0);
-                                let temp = if ratio >= 1.0 {
-                                    5200.0 + (ratio - 1.0) * 3000.0
-                                } else {
-                                    5200.0 - (1.0 - ratio) * 3000.0
-                                };
-                                self.grade_sliders.set(5, temp.clamp(2000.0, 10000.0));
+                        // Initialize grade temperature from file white balance
+                        if let Some(wb) = info.camera_metadata.wb_multipliers {
+                            let r_gain = wb[0];
+                            let b_gain = wb[2];
+                            let ratio = (r_gain / b_gain.max(1e-6)).clamp(0.1, 10.0);
+                            let temp = if ratio >= 1.0 {
+                                5200.0 + (ratio - 1.0) * 3000.0
                             } else {
-                                self.grade_sliders.set(5, 5200.0);
-                            }
+                                5200.0 - (1.0 - ratio) * 3000.0
+                            };
+                            self.grade_sliders.set(5, temp.clamp(2000.0, 10000.0));
+                        } else {
+                            self.grade_sliders.set(5, 5200.0);
                         }
                     }
 
@@ -934,7 +892,7 @@ impl App {
             return;
         }
 
-        // 4b. Timeout check: if preview has been Loading for >5s, show error
+                // 4b. Timeout check: if preview has been Loading for >5s, show error
         if let PreviewState::Loading { started } = &self.preview_state {
             if started.elapsed() > Duration::from_secs(5) {
                 self.preview_state = PreviewState::Error("Timed out".into());
@@ -959,6 +917,11 @@ impl App {
                 let bp = bayer_phase_to_u32(&info.bayer_pattern);
                 let bl = info.black_level as f32;
                 let wl = if info.white_level > 0.0 { info.white_level as f32 } else { 4095.0 };
+
+                // Debug: log file info state
+                tracing::warn!("poll_thumbnail: wb_multipliers={:?} width={} height={} frame_count={}",
+                    info.camera_metadata.wb_multipliers, info.width, info.height, info.frame_count);
+
                 (cm, bp, bl, wl)
             }
             None => {
@@ -1018,10 +981,18 @@ impl App {
             (w.max(1), target_h)
         };
 
-        // White balance gains from grade sliders combined with as-shot neutral
-        let as_shot = self.file_info.as_ref()
-            .and_then(|info| info.camera_metadata.wb_multipliers)
-            .unwrap_or([1.0, 1.0, 1.0]);
+        // White balance — always neutral for preview.
+        //
+        // The preview CCM does NOT include Bradford CAT adaptation from the
+        // scene white point to D65. Applying asShotNeutral-derived gains here
+        // without CAT would desaturate the CCM output incorrectly, producing
+        // a pink/magenta cast (especially in wide-gamut scenes). The full
+        // export pipeline handles WB via the fused matrix with CAT — that's
+        // where as_shot_neutral belongs.
+        //
+        // Grade temperature/tint still works as a relative adjustment from
+        // neutral (temp_offset ± X, tint_offset ± Y).
+        let as_shot = [1.0f32, 1.0, 1.0];
 
         // Temperature/tint adjustment: modulate the as-shot neutral gains
         let temp_offset = self.grade_sliders.temperature - 5200.0;
@@ -1153,50 +1124,12 @@ impl App {
             self.error = None;
             match McrawFileInfo::from_path(path) {
                 Ok(mut info) => {
-                    let mut first_ts = 0i64;
-                    if let Ok(decoder) = Decoder::new(path) {
-                        if let Ok(container_meta) = decoder.container_metadata() {
-                            let as_f64 = |v: &[f32; 9]| -> [f64; 9] {
-                                let mut r = [0.0; 9];
-                                for (i, &x) in v.iter().enumerate() { r[i] = x as f64; }
-                                r
-                            };
-                            let non_zero = |m: &[f32; 9]| m.iter().any(|&x| x != 0.0);
-                            info.camera_metadata.color_matrix = Some(as_f64(&container_meta.color_matrix1));
-                            if non_zero(&container_meta.color_matrix2) {
-                                info.camera_metadata.color_matrix2 = Some(as_f64(&container_meta.color_matrix2));
-                            }
-                            if non_zero(&container_meta.forward_matrix1) {
-                                info.camera_metadata.forward_matrix1 = Some(as_f64(&container_meta.forward_matrix1));
-                            }
-                            if non_zero(&container_meta.forward_matrix2) {
-                                info.camera_metadata.forward_matrix2 = Some(as_f64(&container_meta.forward_matrix2));
-                            }
-                            if container_meta.has_calibration_illuminants {
-                                info.camera_metadata.calibration_illuminant1 = Some(container_meta.calibration_illuminant1);
-                                info.camera_metadata.calibration_illuminant2 = Some(container_meta.calibration_illuminant2);
-                            }
-                            if container_meta.white_level > 0.0 {
-                                info.white_level = container_meta.white_level;
-                            }
-                            if container_meta.black_level_count > 0 {
-                                info.black_level = container_meta.black_level[0];
-                            }
-                        }
-                        if let Ok(timestamps) = decoder.timestamps() {
-                            first_ts = timestamps.first().copied().unwrap_or(0);
-                            info.frame_count = timestamps.len() as u32;
-                            if timestamps.len() >= 2 {
-                                let duration_ns = timestamps[timestamps.len() - 1] - timestamps[0];
-                                if duration_ns > 0 {
-                                    let duration_in_seconds = duration_ns as f64 / 1_000_000_000.0;
-                                    info.fps = (info.frame_count.saturating_sub(1)) as f64 / duration_in_seconds;
-                                }
-                            }
-                            if let Ok(first_frame_meta) = decoder.load_frame_metadata(timestamps[0]) {
-                                info.width = first_frame_meta.width as u16;
-                                info.height = first_frame_meta.height as u16;
-                            }
+                    let first_ts = info.first_timestamp;
+
+                    // Only create decoder if metadata is incomplete (legacy files without BufferIndex)
+                    if !info.is_metadata_complete() {
+                        if let Ok(decoder) = Decoder::new(path) {
+                            info.enhance_from_decoder(&decoder);
                         }
                     }
 
@@ -1206,7 +1139,7 @@ impl App {
                             path: path.clone(),
                             info: info.clone(),
                             selected: true,
-                            first_timestamp: first_ts,
+                            first_timestamp: first_ts.unwrap_or(0),
                         });
                         imported += 1;
                         tracing::debug!("batch imported: {} ({} total)", path, self.imported_files.len());
@@ -1266,57 +1199,14 @@ impl App {
                 let path_clone = path.clone();
                 match McrawFileInfo::from_path(&path) {
                     Ok(mut info) => {
-                        let mut first_ts: i64 = 0;
-                        // Enhance with decoder metadata (same as load_file)
-                        if let Ok(decoder) = Decoder::new(&path) {
-                            first_ts = decoder.timestamps().ok()
-                                .and_then(|ts| ts.first().copied())
-                                .unwrap_or(0);
-                            if let Ok(container_meta) = decoder.container_metadata() {
-                                let as_f64 = |v: &[f32; 9]| -> [f64; 9] {
-                                    let mut r = [0.0; 9];
-                                    for (i, &x) in v.iter().enumerate() { r[i] = x as f64; }
-                                    r
-                                };
-                                let non_zero = |m: &[f32; 9]| m.iter().any(|&x| x != 0.0);
-                                info.camera_metadata.color_matrix = Some(as_f64(&container_meta.color_matrix1));
-                                if non_zero(&container_meta.color_matrix2) {
-                                    info.camera_metadata.color_matrix2 = Some(as_f64(&container_meta.color_matrix2));
-                                }
-                                if non_zero(&container_meta.forward_matrix1) {
-                                    info.camera_metadata.forward_matrix1 = Some(as_f64(&container_meta.forward_matrix1));
-                                }
-                                if non_zero(&container_meta.forward_matrix2) {
-                                    info.camera_metadata.forward_matrix2 = Some(as_f64(&container_meta.forward_matrix2));
-                                }
-                                if container_meta.has_calibration_illuminants {
-                                    info.camera_metadata.calibration_illuminant1 = Some(container_meta.calibration_illuminant1);
-                                    info.camera_metadata.calibration_illuminant2 = Some(container_meta.calibration_illuminant2);
-                                }
-                                if container_meta.white_level > 0.0 {
-                                    info.white_level = container_meta.white_level;
-                                }
-                                if container_meta.black_level_count > 0 {
-                                    info.black_level = container_meta.black_level[0];
-                                }
-                            }
-                            if let Ok(timestamps) = decoder.timestamps() {
-                                info.frame_count = timestamps.len() as u32;
-                                if timestamps.len() >= 2 {
-                                    let duration_ns = timestamps[timestamps.len() - 1] - timestamps[0];
-                                    if duration_ns > 0 {
-                                        let duration_in_seconds = duration_ns as f64 / 1_000_000_000.0;
-                                        info.fps = (info.frame_count.saturating_sub(1)) as f64 / duration_in_seconds;
-                                    }
-                                }
-                                if let Ok(first_frame_meta) = decoder.load_frame_metadata(timestamps[0]) {
-                                    info.width = first_frame_meta.width as u16;
-                                    info.height = first_frame_meta.height as u16;
-                                }
+                        let first_ts = info.first_timestamp;
+                        if !info.is_metadata_complete() {
+                            if let Ok(decoder) = Decoder::new(&path) {
+                                info.enhance_from_decoder(&decoder);
                             }
                         }
 
-                        let _ = tx.send(DropImportEvent::FileReady { path: path_clone, info, first_timestamp: first_ts });
+                        let _ = tx.send(DropImportEvent::FileReady { path: path_clone, info, first_timestamp: first_ts.unwrap_or(0) });
                         imported += 1;
                     }
                     Err(e) => {
