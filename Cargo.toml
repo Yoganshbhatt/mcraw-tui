@@ -1,11 +1,15 @@
 [package]
 name = "mcraw-tui"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Cross-platform TUI for browsing and exploring MotionCam (.mcraw) files"
 authors = ["Terminal Developer"]
 license = "Apache-2.0"
 repository = "https://github.com/Yoganshbhatt/mcraw-tui"
+
+# The `motioncam-decoder` Rust crate used by this project is a port of
+# the original C++ decoder by mirsadm:
+#   https://github.com/mirsadm/motioncam-decoder
 
 [dependencies]
 # TUI framework
@@ -35,7 +39,8 @@ rayon = "1.10"
 # Multi-producer multi-consumer channels for pipeline stages
 crossbeam-channel = "0.5"
 
-# Pure-Rust MotionCam decoder (replaces C++ FFI)
+# Pure-Rust MotionCam decoder — port of the original C++ decoder by mirsadm:
+#   https://github.com/mirsadm/motioncam-decoder
 motioncam-decoder = { version = "0.1", features = ["parallel"] }
 
 # GPU compute (WGSL compute shaders for RCD demosaicing)
