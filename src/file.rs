@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 #[derive(Debug, Deserialize)]
@@ -39,6 +40,16 @@ struct MotionJsonMetadata {
     extra_data: Option<ExtraData>,
     #[serde(rename = "deviceSpecificProfile", default)]
     device_specific_profile: Option<DeviceProfile>,
+    #[serde(rename = "colorIlluminant1", default)]
+    color_illuminant1: Option<String>,
+    #[serde(rename = "colorIlluminant2", default)]
+    color_illuminant2: Option<String>,
+    #[serde(rename = "lensShadingMap", default)]
+    lens_shading_map: Option<Vec<Vec<f64>>>,
+    #[serde(rename = "lensShadingMapWidth", default)]
+    lens_shading_map_width: Option<i64>,
+    #[serde(rename = "lensShadingMapHeight", default)]
+    lens_shading_map_height: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,21 +87,6 @@ struct DeviceProfile {
 }
 
 const INDEX_MAGIC: u32 = 0x8A905612;
-const ITEM_TYPE_BUFFER_INDEX: u32 = 0;
-const ITEM_TYPE_METADATA: u32 = 3;
-
-#[derive(Debug)]
-struct BufferIndex {
-    magic: u32,
-    num_offsets: u32,
-    data_offset: i64,
-}
-
-#[derive(Debug)]
-struct BufferOffset {
-    offset: i64,
-    timestamp: i64,
-}
 
 /// Bayer filter pattern IDs as defined in the MCRAW spec (Appendix A)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,84 +234,264 @@ pub struct McrawFileInfo {
     pub active_height: u16,
     pub white_level: f64,
     pub black_level: f64,
+    pub black_level_per_channel: [f64; 4],
+    pub black_level_count: i32,
+    pub lens_shading_map: Option<crate::decoder::LensShadingMap>,
+    pub dynamic_black_level: Option<[f32; 4]>,
+    pub dynamic_white_level: Option<f32>,
+    /// First frame timestamp from BufferIndex (None if not available without decoder).
+    pub first_timestamp: Option<i64>,
+}
+
+/// Data extracted from frame 0's JSON metadata header via bounded file read.
+struct FirstFrameMeta {
+    width: u16,
+    height: u16,
+    /// White balance gains [R, G, B] computed from asShotNeutral: G/R, 1.0, G/B.
+    wb_gains: Option<[f32; 3]>,
+}
+
+/// Read width, height and white balance gains from frame 0's JSON metadata.
+fn read_first_frame_meta(file: &mut fs::File, frame0_offset: u64) -> Option<FirstFrameMeta> {
+    file.seek(SeekFrom::Start(frame0_offset)).ok()?;
+    let mut hdr = [0u8; 8];
+    file.read_exact(&mut hdr).ok()?;
+    let buf_type = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+    let buf_size = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+    if buf_type != 2 {
+        return None;
+    }
+    file.seek(SeekFrom::Current(buf_size as i64)).ok()?;
+    file.read_exact(&mut hdr).ok()?;
+    let meta_type = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+    let meta_size = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+    if meta_type != 3 {
+        return None;
+    }
+    let mut json_buf = vec![0u8; meta_size as usize];
+    file.read_exact(&mut json_buf).ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&json_buf).ok()?;
+    let w = json.get("width")?.as_u64()? as u16;
+    let h = json.get("height")?.as_u64()? as u16;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let wb_gains = json.get("asShotNeutral").and_then(|v| v.as_array()).and_then(|arr| {
+        if arr.len() >= 3 {
+            let r = arr[0].as_f64()?;
+            let g = arr[1].as_f64()?;
+            let b = arr[2].as_f64()?;
+            if r > 1e-6 && g > 1e-6 && b > 1e-6 {
+                Some([(g / r) as f32, 1.0, (g / b) as f32])
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    });
+    tracing::debug!("read_first_frame_meta: w={} h={} wb_gains={:?}", w, h, wb_gains);
+    Some(FirstFrameMeta { width: w, height: h, wb_gains })
 }
 
 impl McrawFileInfo {
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
         tracing::debug!("McrawFileInfo::from_path: {:?}", path);
-        let metadata = fs::metadata(&path)
+        let file_meta = fs::metadata(&path)
             .with_context(|| format!("Failed to read metadata for {:?}", path))?;
+        let file_size = file_meta.len();
 
-        let data = fs::read(&path)
-            .with_context(|| format!("Failed to read file {:?}", path))?;
+        let mut file = std::fs::File::open(path)
+            .with_context(|| format!("Failed to open {:?}", path))?;
 
-        let info = parse_header(&data, path)?;
+        let mut magic_buf = [0u8; 16];
+        file.read_exact(&mut magic_buf)
+            .with_context(|| format!("Failed to read header from {:?}", path))?;
+
+        let info = if magic_buf.starts_with(b"MOTION ") {
+            let json_len = u32::from_le_bytes([
+                magic_buf[12], magic_buf[13], magic_buf[14], magic_buf[15],
+            ]) as usize;
+
+            let mut json_buf = vec![0u8; json_len];
+            file.read_exact(&mut json_buf)
+                .with_context(|| format!("Failed to read MOTION JSON block from {:?}", path))?;
+
+            let mut data = Vec::with_capacity(16 + json_len);
+            data.extend_from_slice(&magic_buf);
+            data.extend_from_slice(&json_buf);
+
+            let mut info = parse_motion_header(&data, path)?;
+
+            // Read BufferIndex from end-24: Item(8) + BufferIndex(16: magic, num_offsets, index_data_offset)
+            if file_size >= 24 {
+                let mut end_buf = [0u8; 24];
+                file.seek(SeekFrom::End(-24))
+                    .with_context(|| format!("Failed to seek to BufferIndex in {:?}", path))?;
+                file.read_exact(&mut end_buf)
+                    .with_context(|| format!("Failed to read BufferIndex from {:?}", path))?;
+
+                let idx_magic = u32::from_le_bytes([end_buf[8], end_buf[9], end_buf[10], end_buf[11]]);
+                if idx_magic == INDEX_MAGIC {
+                    let num_offsets = u32::from_le_bytes([end_buf[12], end_buf[13], end_buf[14], end_buf[15]]);
+                    let idx_data_offset = i64::from_le_bytes([
+                        end_buf[16], end_buf[17], end_buf[18], end_buf[19],
+                        end_buf[20], end_buf[21], end_buf[22], end_buf[23],
+                    ]) as u64;
+
+                    info.frame_count = num_offsets;
+
+                    if num_offsets > 0 && idx_data_offset + (num_offsets as u64 * 16) <= file_size {
+                        let mut offset_buf = vec![0u8; num_offsets as usize * 16];
+                        file.seek(SeekFrom::Start(idx_data_offset))
+                            .with_context(|| format!("Failed to seek to offset data in {:?}", path))?;
+                        file.read_exact(&mut offset_buf)
+                            .with_context(|| format!("Failed to read offset data from {:?}", path))?;
+
+                        let mut first_frame_offset: u64 = 0;
+                        let mut timestamps = Vec::with_capacity(num_offsets as usize);
+                        for i in 0..num_offsets as usize {
+                            let off = i64::from_le_bytes([
+                                offset_buf[i*16], offset_buf[i*16+1], offset_buf[i*16+2], offset_buf[i*16+3],
+                                offset_buf[i*16+4], offset_buf[i*16+5], offset_buf[i*16+6], offset_buf[i*16+7],
+                            ]);
+                            let ts = i64::from_le_bytes([
+                                offset_buf[i*16+8], offset_buf[i*16+9], offset_buf[i*16+10], offset_buf[i*16+11],
+                                offset_buf[i*16+12], offset_buf[i*16+13], offset_buf[i*16+14], offset_buf[i*16+15],
+                            ]);
+                            if i == 0 { first_frame_offset = off as u64; }
+                            timestamps.push(ts);
+                        }
+
+                        // Sort timestamps to compute fps and first_timestamp
+                        timestamps.sort();
+                        info.first_timestamp = Some(timestamps[0]);
+                        if num_offsets >= 2 {
+                            let duration_ns = timestamps[num_offsets as usize - 1] - timestamps[0];
+                            if duration_ns > 0 {
+                                info.fps = (num_offsets as f64 - 1.0) / (duration_ns as f64 / 1_000_000_000.0);
+                            }
+                        }
+
+                        // Read width/height + wb gains from frame 0's JSON metadata (bounded read, 1-2KB)
+                        if first_frame_offset > 0 {
+                            if let Some(meta) = read_first_frame_meta(&mut file, first_frame_offset) {
+                                info.width = meta.width;
+                                info.height = meta.height;
+                                if let Some(wb) = meta.wb_gains {
+                                    info.camera_metadata.wb_multipliers = Some(wb);
+                                }
+                            } else {
+                                tracing::debug!("from_path: read_first_frame_meta returned None for offset={}", first_frame_offset);
+                            }
+                        }
+                    }
+                }
+            }
+
+            info
+        } else if &magic_buf[..5] == b"MCRAW" {
+            let mut rest_header = [0u8; 20];
+            file.read_exact(&mut rest_header)
+                .with_context(|| format!("Failed to read legacy header from {:?}", path))?;
+
+            let mut data = Vec::with_capacity(36);
+            data.extend_from_slice(&magic_buf);
+            data.extend_from_slice(&rest_header);
+
+            if file_size > 36 {
+                let mut block_len_buf = [0u8; 4];
+                file.read_exact(&mut block_len_buf)
+                    .with_context(|| format!("Failed to read TLV block length from {:?}", path))?;
+                let block_length = u32::from_be_bytes(block_len_buf) as usize;
+
+                let mut tlv_buf = vec![0u8; block_length];
+                file.read_exact(&mut tlv_buf)
+                    .with_context(|| format!("Failed to read TLV block from {:?}", path))?;
+
+                data.extend_from_slice(&block_len_buf);
+                data.extend_from_slice(&tlv_buf);
+            }
+
+            parse_header(&data, path)?
+        } else {
+            anyhow::bail!(
+                "Invalid MCRAW magic header in {:?}: expected 'MCRAW' or 'MOTION ', got {:?}",
+                path,
+                &magic_buf[..7]
+            );
+        };
+
         Ok(McrawFileInfo {
             path: path.to_string_lossy().into_owned(),
-            size: metadata.len(),
+            size: file_size,
             ..info
         })
     }
 
-    pub fn enhance_with_decoder(&mut self) {
-        let path = self.path.clone();
-        tracing::debug!("enhance_with_decoder: {}", path);
-        let decoder_result = crate::decoder::Decoder::new(&path);
-        let decoder = match decoder_result {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!("failed to open decoder for {}: {}", path, e);
-                return;
-            }
-        };
-        if let Ok(container_meta) = decoder.container_metadata() {
-            if container_meta.white_level > 0.0 {
-                self.white_level = container_meta.white_level;
-                tracing::debug!("white_level from container: {}", self.white_level);
-            }
-            if container_meta.black_level_count > 0 {
-                self.black_level = container_meta.black_level[0];
-                tracing::debug!("black_level from container: {}", self.black_level);
-            }
+    /// Skip Decoder creation when all essential metadata is already populated.
+    pub fn is_metadata_complete(&self) -> bool {
+        self.width > 0 && self.height > 0 && self.frame_count > 0
+            && self.first_timestamp.is_some()
+            && self.camera_metadata.wb_multipliers.is_some()
+    }
 
-            let as_f64 = |v: &[f32; 9]| -> [f64; 9] {
-                let mut r = [0.0; 9];
-                for (i, &x) in v.iter().enumerate() { r[i] = x as f64; }
-                r
-            };
+    pub fn enhance_from_decoder(&mut self, decoder: &crate::decoder::Decoder) {
+        // Container-level metadata (skip if already populated from JSON parse)
+        if self.camera_metadata.color_matrix.is_none() {
+            if let Ok(container_meta) = decoder.container_metadata() {
+                if container_meta.white_level > 0.0 {
+                    self.white_level = container_meta.white_level;
+                    tracing::debug!("white_level from container: {}", self.white_level);
+                }
+                if container_meta.black_level_count > 0 {
+                    self.black_level = container_meta.black_level[0];
+                    self.black_level_per_channel = container_meta.black_level;
+                    self.black_level_count = container_meta.black_level_count;
+                    tracing::debug!("black_level from container: {} ({} ch)", self.black_level, self.black_level_count);
+                }
+                self.lens_shading_map = container_meta.lens_shading_map.clone();
 
-            self.camera_metadata.color_matrix = Some(as_f64(&container_meta.color_matrix1));
-            let non_zero = |m: &[f32; 9]| m.iter().any(|&x| x != 0.0);
+                let as_f64 = |v: &[f32; 9]| -> [f64; 9] {
+                    let mut r = [0.0; 9];
+                    for (i, &x) in v.iter().enumerate() { r[i] = x as f64; }
+                    r
+                };
 
-            if non_zero(&container_meta.color_matrix2) {
-                self.camera_metadata.color_matrix2 = Some(as_f64(&container_meta.color_matrix2));
-            }
-            if non_zero(&container_meta.forward_matrix1) {
-                self.camera_metadata.forward_matrix1 = Some(as_f64(&container_meta.forward_matrix1));
-            }
-            if non_zero(&container_meta.forward_matrix2) {
-                self.camera_metadata.forward_matrix2 = Some(as_f64(&container_meta.forward_matrix2));
-            }
-            if non_zero(&container_meta.calibration_matrix1) {
-                self.camera_metadata.calibration_matrix1 = Some(as_f64(&container_meta.calibration_matrix1));
-            }
-            if non_zero(&container_meta.calibration_matrix2) {
-                self.camera_metadata.calibration_matrix2 = Some(as_f64(&container_meta.calibration_matrix2));
-            }
-            if container_meta.has_calibration_illuminants {
-                self.camera_metadata.calibration_illuminant1 = Some(container_meta.calibration_illuminant1);
-                self.camera_metadata.calibration_illuminant2 = Some(container_meta.calibration_illuminant2);
-                tracing::debug!("calibration_illuminants: illum1={}, illum2={}",
-                    container_meta.calibration_illuminant1, container_meta.calibration_illuminant2);
+                self.camera_metadata.color_matrix = Some(as_f64(&container_meta.color_matrix1));
+                let non_zero = |m: &[f32; 9]| m.iter().any(|&x| x != 0.0);
+
+                if non_zero(&container_meta.color_matrix2) {
+                    self.camera_metadata.color_matrix2 = Some(as_f64(&container_meta.color_matrix2));
+                }
+                if non_zero(&container_meta.forward_matrix1) {
+                    self.camera_metadata.forward_matrix1 = Some(as_f64(&container_meta.forward_matrix1));
+                }
+                if non_zero(&container_meta.forward_matrix2) {
+                    self.camera_metadata.forward_matrix2 = Some(as_f64(&container_meta.forward_matrix2));
+                }
+                if non_zero(&container_meta.calibration_matrix1) {
+                    self.camera_metadata.calibration_matrix1 = Some(as_f64(&container_meta.calibration_matrix1));
+                }
+                if non_zero(&container_meta.calibration_matrix2) {
+                    self.camera_metadata.calibration_matrix2 = Some(as_f64(&container_meta.calibration_matrix2));
+                }
+                if container_meta.has_calibration_illuminants {
+                    self.camera_metadata.calibration_illuminant1 = Some(container_meta.calibration_illuminant1);
+                    self.camera_metadata.calibration_illuminant2 = Some(container_meta.calibration_illuminant2);
+                    tracing::debug!("calibration_illuminants: illum1={}, illum2={}",
+                        container_meta.calibration_illuminant1, container_meta.calibration_illuminant2);
+                }
             }
         }
+        // Timestamps and first-frame data (always run, in-memory from mmap)
         if let Ok(timestamps) = decoder.timestamps() {
-            if self.frame_count == 0 && !timestamps.is_empty() {
+            if !timestamps.is_empty() {
                 self.frame_count = timestamps.len() as u32;
                 if timestamps.len() >= 2 {
                     let duration_ns = timestamps[timestamps.len() - 1] - timestamps[0];
-                    if duration_ns > 0 && self.fps == 0.0 {
+                    if duration_ns > 0 {
                         let duration_in_seconds = duration_ns as f64 / 1_000_000_000.0;
                         self.fps = (self.frame_count.saturating_sub(1)) as f64 / duration_in_seconds;
                     }
@@ -329,14 +505,42 @@ impl McrawFileInfo {
                     tracing::debug!("enhanced dimensions: {}x{}", first_frame_meta.width, first_frame_meta.height);
                 }
                 let n = first_frame_meta.as_shot_neutral;
-                if n[0] > 1e-6 && n[1] > 1e-6 && n[2] > 1e-6 {
+                if self.camera_metadata.wb_multipliers.is_none()
+                    && n[0] > 1e-6 && n[1] > 1e-6 && n[2] > 1e-6
+                {
                     let r_gain = n[1] / n[0];
                     let b_gain = n[1] / n[2];
                     self.camera_metadata.wb_multipliers = Some([r_gain, 1.0, b_gain]);
                     tracing::debug!("wb_multipliers: R={:.3} G={:.3} B={:.3}", r_gain, 1.0, b_gain);
                 }
+                if first_frame_meta.dynamic_black_level.is_some() {
+                    self.dynamic_black_level = first_frame_meta.dynamic_black_level;
+                    tracing::debug!("dynamic_black_level from first frame: {:?}", self.dynamic_black_level);
+                }
+                if first_frame_meta.dynamic_white_level.is_some() {
+                    self.dynamic_white_level = first_frame_meta.dynamic_white_level;
+                    tracing::debug!("dynamic_white_level from first frame: {:?}", self.dynamic_white_level);
+                }
             }
         }
+    }
+
+    pub fn enhance_with_decoder(&mut self) {
+        if self.camera_metadata.color_matrix.is_some() {
+            tracing::debug!("enhance_with_decoder: metadata already populated, skipping decoder");
+            return;
+        }
+        let path = self.path.clone();
+        tracing::debug!("enhance_with_decoder: {}", path);
+        let decoder_result = crate::decoder::Decoder::new(&path);
+        let decoder = match decoder_result {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("failed to open decoder for {}: {}", path, e);
+                return;
+            }
+        };
+        self.enhance_from_decoder(&decoder);
     }
 
     pub fn format_name(&self) -> &'static str {
@@ -451,32 +655,57 @@ fn parse_motion_header(data: &[u8], path: &Path) -> Result<McrawFileInfo> {
         .map(detect_bit_depth_from_white_level)
         .unwrap_or(12);
 
-    let mut frame_count: u32 = 0;
-    let mut width: u16 = 0;
-    let mut height: u16 = 0;
-    let mut fps: f64 = 0.0;
+    let frame_count: u32 = 0;
+    let width: u16 = 0;
+    let height: u16 = 0;
+    let fps: f64 = 0.0;
 
-    let black_level = json.black_level
+    let (black_level, black_level_per_channel, black_level_count) = json.black_level
         .as_ref()
         .map(|levels| {
-            if levels.is_empty() { 0.0 }
-            else { levels.iter().sum::<f64>() / levels.len() as f64 }
+            let count = levels.len() as i32;
+            let avg = if levels.is_empty() { 0.0 } else { levels.iter().sum::<f64>() / levels.len() as f64 };
+            let mut per_ch = [avg; 4];
+            for (i, &v) in levels.iter().enumerate().take(4) {
+                per_ch[i] = v;
+            }
+            (avg, per_ch, count)
         })
-        .unwrap_or(0.0);
+        .unwrap_or((0.0, [0.0; 4], 0));
 
     let white_level = json.white_level.unwrap_or(16383.0);
 
-    if let Some((num_offsets, offsets, timestamps)) = parse_buffer_index(data) {
-        frame_count = num_offsets;
-        if num_offsets >= 2 {
-            let mut sorted_ts = timestamps.clone();
-            sorted_ts.sort();
-            let duration_ns = sorted_ts[num_offsets as usize - 1] - sorted_ts[0];
-            if duration_ns > 0 {
-                fps = (num_offsets as f64 - 1.0) / (duration_ns as f64 / 1_000_000_000.0);
-            }
+    // asShotNeutral is per-frame metadata only, not in container JSON.
+    // It's extracted in from_path via read_first_frame_meta from frame 0's
+    // per-frame JSON header, so this stays None here.
+    let wb_multipliers: Option<[f32; 3]> = None;
+
+
+    // Map JSON string illuminant names to DNG illuminant constants
+    let json_illuminant_to_const = |s: &str| -> Option<i32> {
+        match s.trim().to_lowercase().as_str() {
+            "d50" | "horizon" | "cool_white" => Some(23),
+            "d55" => Some(22),
+            "d65" | "daylight" | "fine_weather" | "cloudy" => Some(21),
+            "d75" | "shade" => Some(24),
+            "standardlighta" | "standard_a" | "tungsten" | "incandescent" | "warm_white" | "iso_studio_tungsten" => Some(17),
+            "fluorescent" | "tl84" => Some(12),
+            "flash" | "standardlightb" => Some(4),
+            _ => None,
         }
-    }
+    };
+
+    let calibration_illuminant1 = json.color_illuminant1.as_deref().and_then(json_illuminant_to_const);
+    let calibration_illuminant2 = json.color_illuminant2.as_deref().and_then(json_illuminant_to_const);
+
+    let lens_shading_map = json.lens_shading_map.as_ref().and_then(|channels| {
+        let width = json.lens_shading_map_width? as u32;
+        let height = json.lens_shading_map_height? as u32;
+        if channels.len() < 4 { return None; }
+        let f32_channels: Vec<Vec<f32>> = channels.iter().take(4).map(|ch| ch.iter().map(|&v| v as f32).collect()).collect();
+        if f32_channels.len() < 4 { return None; }
+        Some(crate::decoder::LensShadingMap { channels: f32_channels, width, height })
+    });
 
     Ok(McrawFileInfo {
         path: path.to_string_lossy().into_owned(),
@@ -508,10 +737,10 @@ fn parse_motion_header(data: &[u8], path: &Path) -> Result<McrawFileInfo> {
             forward_matrix2,
             calibration_matrix1,
             calibration_matrix2,
-            calibration_illuminant1: None,
-            calibration_illuminant2: None,
+            calibration_illuminant1,
+            calibration_illuminant2,
             calibration_illuminant: None,
-            wb_multipliers: None,
+            wb_multipliers,
         },
         frame_offsets: Vec::new(),
         audio_offset: None,
@@ -524,105 +753,13 @@ fn parse_motion_header(data: &[u8], path: &Path) -> Result<McrawFileInfo> {
         active_height: 0,
         white_level,
         black_level,
+        black_level_per_channel,
+        black_level_count,
+        lens_shading_map,
+        dynamic_black_level: None,
+        dynamic_white_level: None,
+        first_timestamp: None,
     })
-}
-
-fn parse_buffer_index(data: &[u8]) -> Option<(u32, Vec<i64>, Vec<i64>)> {
-    let file_len = data.len();
-    if file_len < 8 {
-        return None;
-    }
-
-    let item_size = u32::from_le_bytes([
-        data[file_len - 8],
-        data[file_len - 7],
-        data[file_len - 6],
-        data[file_len - 5],
-    ]) as usize;
-
-    let idx_data_start = file_len - 8 - item_size;
-    if idx_data_start < 16 {
-        return None;
-    }
-
-    let buf_idx_type = u32::from_le_bytes([
-        data[idx_data_start],
-        data[idx_data_start + 1],
-        data[idx_data_start + 2],
-        data[idx_data_start + 3],
-    ]);
-    if buf_idx_type != ITEM_TYPE_BUFFER_INDEX {
-        return None;
-    }
-
-    let buf_idx_size = u32::from_le_bytes([
-        data[idx_data_start + 4],
-        data[idx_data_start + 5],
-        data[idx_data_start + 6],
-        data[idx_data_start + 7],
-    ]) as usize;
-
-    let magic = u32::from_le_bytes([
-        data[idx_data_start + 8],
-        data[idx_data_start + 9],
-        data[idx_data_start + 10],
-        data[idx_data_start + 11],
-    ]);
-    if magic != INDEX_MAGIC {
-        return None;
-    }
-
-    let num_offsets = u32::from_le_bytes([
-        data[idx_data_start + 12],
-        data[idx_data_start + 13],
-        data[idx_data_start + 14],
-        data[idx_data_start + 15],
-    ]);
-
-    let data_offset = i64::from_le_bytes([
-        data[idx_data_start + 16],
-        data[idx_data_start + 17],
-        data[idx_data_start + 18],
-        data[idx_data_start + 19],
-        data[idx_data_start + 20],
-        data[idx_data_start + 21],
-        data[idx_data_start + 22],
-        data[idx_data_start + 23],
-    ]);
-
-    let mut offsets = Vec::new();
-    let mut timestamps = Vec::new();
-
-    for i in 0..num_offsets {
-        let pos = data_offset as usize + (i as usize) * 16;
-        if pos + 16 > data.len() {
-            break;
-        }
-        let offset = i64::from_le_bytes([
-            data[pos],
-            data[pos + 1],
-            data[pos + 2],
-            data[pos + 3],
-            data[pos + 4],
-            data[pos + 5],
-            data[pos + 6],
-            data[pos + 7],
-        ]);
-        let timestamp = i64::from_le_bytes([
-            data[pos + 8],
-            data[pos + 9],
-            data[pos + 10],
-            data[pos + 11],
-            data[pos + 12],
-            data[pos + 13],
-            data[pos + 14],
-            data[pos + 15],
-        ]);
-        offsets.push(offset);
-        timestamps.push(timestamp);
-    }
-
-    Some((num_offsets, offsets, timestamps))
 }
 
 fn parse_header(data: &[u8], path: &Path) -> Result<McrawFileInfo> {
@@ -876,9 +1013,16 @@ fn parse_header(data: &[u8], path: &Path) -> Result<McrawFileInfo> {
         active_height,
         white_level: 16383.0,
         black_level: 0.0,
+        black_level_per_channel: [0.0; 4],
+        black_level_count: 0,
+        lens_shading_map: None,
+        dynamic_black_level: None,
+        dynamic_white_level: None,
+        first_timestamp: None,
     })
 }
 
+/// Read a big-endian u32 from a byte slice at the given offset.
 fn read_u32_be(data: &[u8], offset: usize) -> u32 {
     u32::from_be_bytes([
         data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
@@ -1027,9 +1171,8 @@ mod tests {
         assert!((info.duration_seconds() - 20.0).abs() < 0.001);
     }
 
-    #[test]
-    fn test_resolution_label() {
-        let make_info = |w: u16, h: u16| McrawFileInfo {
+    fn make_test_info(w: u16, h: u16) -> McrawFileInfo {
+        McrawFileInfo {
             path: String::new(),
             size: 0,
             format_version: 2,
@@ -1052,15 +1195,24 @@ mod tests {
             active_offset_y: 0,
             active_width: 0,
             active_height: 0,
-white_level: 16383.0,
-        black_level: 0.0,
-        };
+            white_level: 16383.0,
+            black_level: 0.0,
+            black_level_per_channel: [0.0; 4],
+            black_level_count: 0,
+            lens_shading_map: None,
+            dynamic_black_level: None,
+            dynamic_white_level: None,
+            first_timestamp: None,
+        }
+    }
 
-        assert_eq!(make_info(1920, 1080).resolution_label(), "1080p");
-        assert_eq!(make_info(2560, 1440).resolution_label(), "1440p");
-        assert_eq!(make_info(3840, 2160).resolution_label(), "4K");
-        assert_eq!(make_info(4096, 2160).resolution_label(), "4K DCI");
-        assert_eq!(make_info(1280, 720).resolution_label(), "Custom");
+    #[test]
+    fn test_resolution_label() {
+        assert_eq!(make_test_info(1920, 1080).resolution_label(), "1080p");
+        assert_eq!(make_test_info(2560, 1440).resolution_label(), "1440p");
+        assert_eq!(make_test_info(3840, 2160).resolution_label(), "4K");
+        assert_eq!(make_test_info(4096, 2160).resolution_label(), "4K DCI");
+        assert_eq!(make_test_info(1280, 720).resolution_label(), "Custom");
     }
 
     #[test]

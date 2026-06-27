@@ -8,6 +8,13 @@ pub struct Decoder {
 }
 
 #[derive(Debug, Clone)]
+pub struct LensShadingMap {
+    pub channels: Vec<Vec<f32>>,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone)]
 pub struct ContainerMetadata {
     pub color_matrix1: [f32; 9],
     pub color_matrix2: [f32; 9],
@@ -23,6 +30,7 @@ pub struct ContainerMetadata {
     pub black_level_count: i32,
     pub audio_sample_rate_hz: i32,
     pub num_audio_channels: i32,
+    pub lens_shading_map: Option<LensShadingMap>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +43,9 @@ pub struct FrameMetadata {
     pub iso: f32,
     pub focal_length: f32,
     pub aperture: f32,
+    pub dynamic_black_level: Option<[f32; 4]>,
+    pub dynamic_white_level: Option<f32>,
+    pub lens_shading_map: Option<LensShadingMap>,
 }
 
 fn json_to_matrix9(val: &Value, key: &str) -> [f32; 9] {
@@ -73,6 +84,43 @@ fn json_to_as_shot_neutral(val: &Value) -> [f32; 3] {
         }
     }
     result
+}
+
+fn json_to_lens_shading_map(val: &Value) -> Option<LensShadingMap> {
+    let map_arr = val.get("lensShadingMap").and_then(|v| v.as_array())?;
+    if map_arr.len() < 4 {
+        return None;
+    }
+    let width = val.get("lensShadingMapWidth").and_then(|v| v.as_u64())? as u32;
+    let height = val.get("lensShadingMapHeight").and_then(|v| v.as_u64())? as u32;
+    let expected_len = (width * height) as usize;
+    let channels: Vec<Vec<f32>> = map_arr.iter().take(4).filter_map(|ch| {
+        let arr = ch.as_array()?;
+        if arr.len() < expected_len {
+            return None;
+        }
+        Some(arr.iter().filter_map(|v| v.as_f64().map(|x| x as f32)).collect::<Vec<f32>>())
+    }).collect();
+    if channels.len() < 4 {
+        return None;
+    }
+    Some(LensShadingMap { channels, width, height })
+}
+
+fn json_to_dynamic_black_level(val: &Value) -> Option<[f32; 4]> {
+    let arr = val.get("dynamicBlackLevel").and_then(|v| v.as_array())?;
+    if arr.len() < 4 {
+        return None;
+    }
+    let mut result = [0.0f32; 4];
+    for (i, item) in arr.iter().enumerate().take(4) {
+        result[i] = item.as_f64()? as f32;
+    }
+    Some(result)
+}
+
+fn json_to_dynamic_white_level(val: &Value) -> Option<f32> {
+    val.get("dynamicWhiteLevel").and_then(|v| v.as_f64()).map(|v| v as f32)
 }
 
 impl Decoder {
@@ -117,6 +165,8 @@ impl Decoder {
             .and_then(|v| v.as_i64())
             .unwrap_or(0) as i32;
 
+        let lens_shading_map = json_to_lens_shading_map(meta);
+
         Ok(ContainerMetadata {
             color_matrix1,
             color_matrix2,
@@ -132,6 +182,7 @@ impl Decoder {
             black_level_count,
             audio_sample_rate_hz: audio_sample_rate,
             num_audio_channels: audio_channels,
+            lens_shading_map,
         })
     }
 
@@ -171,6 +222,9 @@ impl Decoder {
             iso,
             focal_length,
             aperture,
+            dynamic_black_level: json_to_dynamic_black_level(&meta),
+            dynamic_white_level: json_to_dynamic_white_level(&meta),
+            lens_shading_map: json_to_lens_shading_map(&meta),
         }))
     }
 
@@ -206,6 +260,9 @@ impl Decoder {
             iso,
             focal_length,
             aperture,
+            dynamic_black_level: json_to_dynamic_black_level(&meta),
+            dynamic_white_level: json_to_dynamic_white_level(&meta),
+            lens_shading_map: json_to_lens_shading_map(&meta),
         })
     }
 
