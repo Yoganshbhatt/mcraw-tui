@@ -86,6 +86,8 @@ fn export_pipeline_emits_per_phase_stats() {
         "prores_ks".to_string(),
         RateControl::Lossless,
         None,
+        mcraw_tui::pipeline::LensCorrectionMode::Full,
+        mcraw_tui::pipeline::BlWlMode::Dynamic,
     );
 
     let wall = start.elapsed();

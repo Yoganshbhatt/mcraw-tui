@@ -147,6 +147,7 @@ impl PhaseTimer {
 #[derive(Debug)]
 pub struct PipelineStats {
     pub decode: PhaseTimer,
+    pub lens_correction: PhaseTimer,
     pub demosaic: PhaseTimer,
     pub normalize: PhaseTimer,
     pub wb_hl_ccm: PhaseTimer,
@@ -170,6 +171,7 @@ impl Default for PipelineStats {
     fn default() -> Self {
         Self {
             decode: PhaseTimer::default(),
+            lens_correction: PhaseTimer::default(),
             demosaic: PhaseTimer::default(),
             normalize: PhaseTimer::default(),
             wb_hl_ccm: PhaseTimer::default(),
@@ -226,6 +228,7 @@ impl PipelineStats {
             phases: vec![
                 ("setup".to_string(),      self.setup.snapshot()),
                 ("decode".to_string(),     self.decode.snapshot()),
+                ("lens_correction".to_string(), self.lens_correction.snapshot()),
                 ("demosaic".to_string(),   self.demosaic.snapshot()),
                 ("normalize".to_string(),  self.normalize.snapshot()),
                 ("wb_hl_ccm".to_string(),  self.wb_hl_ccm.snapshot()),

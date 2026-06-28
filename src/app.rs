@@ -21,6 +21,7 @@ use crate::export::{
     ProResProfile, RateControl, Vp9Profile,
 };
 use crate::hardware::probe_hardware;
+use crate::pipeline::{LensCorrectionMode, BlWlMode};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use crate::decoder::Decoder;
@@ -377,6 +378,8 @@ pub struct App {
     pub export_focus: ExportFocus,
     pub export_fps: Option<f64>,
     pub export_start_time: Option<Instant>,
+    pub lens_correction_mode: Cell<LensCorrectionMode>,
+    pub blwl_mode: Cell<BlWlMode>,
 
     // Sticky per-codec profiles
     pub prores_profile: ProResProfile,
@@ -556,6 +559,8 @@ pub enum ExportFocus {
     Profile,
     RateControl,
     Fps,
+    LensMode,
+    BlWlMode,
 }
 
 impl App {
@@ -618,6 +623,8 @@ impl App {
             export_focus: ExportFocus::CodecFamily,
             export_fps: None,
             export_start_time: None,
+            lens_correction_mode: Cell::new(LensCorrectionMode::Full),
+            blwl_mode: Cell::new(BlWlMode::Dynamic),
 
             prores_profile: ProResProfile::HQ,
             dnxhr_profile: DnxhrProfile::HQX,
@@ -1606,6 +1613,45 @@ impl App {
         self.status_message = format!("FPS: {}", Self::fps_label(self.export_fps));
     }
 
+    pub fn cycle_lens_mode(&mut self, forward: bool) {
+        let cur = self.lens_correction_mode.get();
+        let next = match (cur, forward) {
+            (LensCorrectionMode::Off, true) => LensCorrectionMode::Full,
+            (LensCorrectionMode::Full, true) => LensCorrectionMode::ColorOnly,
+            (LensCorrectionMode::ColorOnly, true) => LensCorrectionMode::Off,
+            (LensCorrectionMode::Off, false) => LensCorrectionMode::ColorOnly,
+            (LensCorrectionMode::ColorOnly, false) => LensCorrectionMode::Full,
+            (LensCorrectionMode::Full, false) => LensCorrectionMode::Off,
+        };
+        self.lens_correction_mode.set(next);
+        self.export_focus = ExportFocus::LensMode;
+        self.status_message = format!("Lens: {}", next.name());
+    }
+
+    pub fn cycle_blwl(&mut self, forward: bool) {
+        const ALL: &[BlWlMode] = &[
+            BlWlMode::Dynamic,
+            BlWlMode::Static,
+            BlWlMode::Preset1023_64,
+            BlWlMode::Preset4095_256,
+            BlWlMode::Preset16383_1024,
+            BlWlMode::Preset65535_4096,
+            BlWlMode::Preset4095_64,
+            BlWlMode::Preset16383_64,
+            BlWlMode::Preset16383_0,
+        ];
+        let cur = self.blwl_mode.get();
+        let pos = ALL.iter().position(|m| *m == cur).unwrap_or(0);
+        let next = if forward {
+            ALL[(pos + 1) % ALL.len()]
+        } else {
+            ALL[(pos + ALL.len() - 1) % ALL.len()]
+        };
+        self.blwl_mode.set(next);
+        self.export_focus = ExportFocus::BlWlMode;
+        self.status_message = format!("BL/WL: {}", next.name());
+    }
+
     pub fn cycle_codec(&mut self, forward: bool) {
         self.export_codec_family = if forward {
             self.export_codec_family.next()
@@ -1754,6 +1800,8 @@ impl App {
 
         let rate_control = self.active_rate_control.clone();
         let custom_fps = self.export_fps;
+        let lens_mode = self.lens_correction_mode.get();
+        let blwl_mode = self.blwl_mode.get();
         let stats = Arc::new(PipelineStats::new());
         let stats_for_event = Arc::clone(&stats);
 
@@ -1763,7 +1811,7 @@ impl App {
                     info, output_path, progress_cb, cancel_flag, stats,
                     cs, tf, cf, pp, dp, hp, h4p, ap, vp,
                     hevc_enc, h264_enc, av1_enc, prores_enc,
-                    rate_control, custom_fps,
+                    rate_control, custom_fps, lens_mode, blwl_mode,
                 )
             }));
             // Always emit stats before Done so the UI can persist them,
@@ -2318,6 +2366,17 @@ fn execute_click_action(app: &mut App, action: ClickAction) {
             app.set_focus(FocusTarget::ExportSettings);
             app.export_focus = ExportFocus::RateControl;
             app.cycle_rate_control();
+            return;
+        }
+        ClickAction::CycleLensMode => {
+            app.set_focus(FocusTarget::ExportSettings);
+            app.cycle_lens_mode(true);
+            return;
+        }
+        ClickAction::CycleBlWlMode => {
+            app.set_focus(FocusTarget::ExportSettings);
+            app.cycle_blwl(true);
+            return;
         }
         ClickAction::CycleFps => {
             app.set_focus(FocusTarget::ExportSettings);
@@ -3041,6 +3100,8 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                                         app.status_message = format!("Rate: {}", app.active_rate_control.name());
                                     }
                                     ExportFocus::Fps => app.cycle_export_fps(),
+                                    ExportFocus::LensMode => app.cycle_lens_mode(false),
+                                    ExportFocus::BlWlMode => app.cycle_blwl(false),
                                 }
                             }
                             FocusTarget::Grade => {
@@ -3088,6 +3149,8 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                                     ExportFocus::Profile => app.cycle_profile(true),
                                     ExportFocus::RateControl => app.cycle_rate_control(),
                                     ExportFocus::Fps => app.cycle_export_fps(),
+                                    ExportFocus::LensMode => app.cycle_lens_mode(true),
+                                    ExportFocus::BlWlMode => app.cycle_blwl(true),
                                 }
                             }
                             FocusTarget::Grade => {
@@ -3493,6 +3556,16 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                             app.cycle_export_fps();
                         }
                     }
+                    'm' => {
+                        if app.focus_target == FocusTarget::ExportSettings {
+                            app.cycle_lens_mode(true);
+                        }
+                    }
+                    'w' => {
+                        if app.focus_target == FocusTarget::ExportSettings {
+                            app.cycle_blwl(true);
+                        }
+                    }
                     'F' => {
                         if app.show_browser {
                             app.toggle_favourite_folder(app.browser.current_path.clone());
@@ -3668,6 +3741,8 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                             ExportFocus::Profile => app.cycle_profile(true),
                             ExportFocus::RateControl => app.cycle_rate_control(),
                             ExportFocus::Fps => app.cycle_export_fps(),
+                            ExportFocus::LensMode => app.cycle_lens_mode(true),
+                            ExportFocus::BlWlMode => app.cycle_blwl(true),
                         }
                     } else if !app.timestamps.is_empty() {
                         let next = (app.frame_index + 1).min(app.timestamps.len() - 1);
@@ -3706,6 +3781,8 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                                 app.status_message = format!("Rate: {}", app.active_rate_control.name());
                             }
                             ExportFocus::Fps => app.cycle_export_fps(),
+                            ExportFocus::LensMode => app.cycle_lens_mode(false),
+                            ExportFocus::BlWlMode => app.cycle_blwl(false),
                         }
                     } else if !app.timestamps.is_empty() {
                         let prev = app.frame_index.saturating_sub(1);
@@ -3757,7 +3834,9 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                             FocusTarget::ExportSettings => {
                                 let show_rate = !matches!(app.export_codec_family, crate::export::CodecFamily::ProRes | crate::export::CodecFamily::DNxHR);
                                 app.export_focus = match app.export_focus {
-                                    ExportFocus::CodecFamily => if show_rate { ExportFocus::RateControl } else { ExportFocus::Fps },
+                                    ExportFocus::CodecFamily => ExportFocus::BlWlMode,
+                                    ExportFocus::BlWlMode => ExportFocus::LensMode,
+                                    ExportFocus::LensMode => if show_rate { ExportFocus::RateControl } else { ExportFocus::Fps },
                                     ExportFocus::RateControl => ExportFocus::Fps,
                                     ExportFocus::Fps => ExportFocus::Profile,
                                     ExportFocus::Profile => ExportFocus::TransferFunction,
@@ -3802,8 +3881,10 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                                     ExportFocus::ColorSpace => ExportFocus::TransferFunction,
                                     ExportFocus::TransferFunction => ExportFocus::Profile,
                                     ExportFocus::Profile => ExportFocus::Fps,
-                                    ExportFocus::Fps => if show_rate { ExportFocus::RateControl } else { ExportFocus::CodecFamily },
-                                    ExportFocus::RateControl => ExportFocus::CodecFamily,
+                                    ExportFocus::Fps => if show_rate { ExportFocus::RateControl } else { ExportFocus::LensMode },
+                                    ExportFocus::RateControl => ExportFocus::LensMode,
+                                    ExportFocus::LensMode => ExportFocus::BlWlMode,
+                                    ExportFocus::BlWlMode => ExportFocus::CodecFamily,
                                 };
                             }
                             FocusTarget::Grade => {

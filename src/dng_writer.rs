@@ -7,6 +7,7 @@ use tiff::encoder::TiffEncoder;
 use tiff::tags::Tag;
 
 use crate::file::{BayerPattern, McrawFileInfo};
+use crate::decoder::LensShadingMap;
 
 // ---------------------------------------------------------------------------
 // LJ92 — pure-Rust lossless JPEG (SOF3, predictor 1, 16-bit CFA)
@@ -212,6 +213,82 @@ fn asn_as_srational_slice(asn: [f32; 3]) -> [SRational; 3] {
 }
 
 // ---------------------------------------------------------------------------
+// GainMap opcode (DNG OpcodeList2, tag 0xC61B, opcode ID 9)
+// ---------------------------------------------------------------------------
+
+/// Build the binary blob for a single GainMap opcode embedded in OpcodeList2.
+///
+/// Returns the complete byte array for tag 0xC61B including the opcode-count
+/// prefix and the `GainMapOpcode` payload per the DNG 1.7 specification.
+/// The output is big-endian as required by TIFF/DNG IFD encoding.
+pub fn build_gainmap_opcode_blob(
+    map: &LensShadingMap,
+    top: u32,
+    left: u32,
+    bottom: u32,
+    right: u32,
+) -> Vec<u8> {
+    use std::io::Write;
+    let mut buf = Vec::with_capacity(1024);
+
+    // OpcodeList2 header: opcode count (u32BE)
+    buf.write_all(&1u32.to_be_bytes()).unwrap();
+
+    // OpcodeRecord: opcode_id (u16BE), dng_version (u32BE), flags (u32BE),
+    //               data_size (u32BE)
+    let opcode_id = 9u16; // GainMap
+    let dng_version = 1_007_000u32; // DNG 1.7.0.0
+    let flags = 0u32; // not optional
+    buf.write_all(&opcode_id.to_be_bytes()).unwrap();
+    buf.write_all(&dng_version.to_be_bytes()).unwrap();
+    buf.write_all(&flags.to_be_bytes()).unwrap();
+
+    // Reserve space for data_size — we'll fill it after computing the payload
+    let data_size_offset = buf.len();
+    buf.write_all(&0u32.to_be_bytes()).unwrap();
+
+    // GainMap data payload
+    let payload_offset = buf.len();
+
+    // GainMapID = 0 (Lens Shading)
+    buf.write_all(&0u32.to_be_bytes()).unwrap();
+
+    // Top / Left / Bottom / Right
+    buf.write_all(&top.to_be_bytes()).unwrap();
+    buf.write_all(&left.to_be_bytes()).unwrap();
+    buf.write_all(&bottom.to_be_bytes()).unwrap();
+    buf.write_all(&right.to_be_bytes()).unwrap();
+
+    // MapPlanes = 4 (R, G1, G2, B)
+    buf.write_all(&4u32.to_be_bytes()).unwrap();
+
+    // MapWidth / MapHeight
+    buf.write_all(&map.width.to_be_bytes()).unwrap();
+    buf.write_all(&map.height.to_be_bytes()).unwrap();
+
+    // MapType = 0 (f32 map)
+    buf.write_all(&0u32.to_be_bytes()).unwrap();
+
+    // MapFlags = 1 (BilinearInterpolate)
+    buf.write_all(&1u32.to_be_bytes()).unwrap();
+
+    // Map data: f32 × map_width × map_height × 4 planes, big-endian
+    for plane_idx in 0..4 {
+        let plane = &map.channels[plane_idx];
+        for &gain in plane {
+            buf.write_all(&gain.to_be_bytes()).unwrap();
+        }
+    }
+
+    // Go back and fill in data_size
+    let data_size = (buf.len() - payload_offset) as u32;
+    let data_size_bytes = data_size.to_be_bytes();
+    buf[data_size_offset..data_size_offset + 4].copy_from_slice(&data_size_bytes);
+
+    buf
+}
+
+// ---------------------------------------------------------------------------
 // DngWriter
 // ---------------------------------------------------------------------------
 
@@ -330,6 +407,16 @@ impl<'a> DngWriter<'a> {
 
         // WhiteLevel
         dir.write_tag(Tag::Unknown(50717), self.info.white_level as u32)?;
+
+        // OpcodeList2 — GainMap opcode for lens shading correction
+        if let Some(ref shading) = self.info.lens_shading_map {
+            let at = self.info.active_offset_y as u32;
+            let al = self.info.active_offset_x as u32;
+            let ab = at + self.info.active_height as u32;
+            let ar = al + self.info.active_width as u32;
+            let opcode_blob = build_gainmap_opcode_blob(shading, at, al, ab, ar);
+            dir.write_tag(Tag::Unknown(0xC61B), &opcode_blob[..])?;
+        }
 
         // DefaultScale — RATIONAL[2] = [1, 1]
         dir.write_tag(Tag::Unknown(50718), &[

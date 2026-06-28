@@ -106,6 +106,8 @@ pub enum ClickAction {
     CycleTransfer,
     CycleProfile,
     CycleRate,
+    CycleLensMode,
+    CycleBlWlMode,
     ImportOption1,
     ImportOption2,
     ClosePopup,
@@ -1825,6 +1827,40 @@ fn render_export_settings(frame: &mut Frame, app: &App, area: Rect, regions: &mu
         regions.push(ClickRegion { area: rc_area, action: ClickAction::CycleRate });
     }
 
+    // --- Lens Correction Mode ---
+    let lm_y = if show_rate { base_y + 5 + 1 } else { base_y + 4 + 1 };
+    {
+        let lm_focused = app.export_focus == ExportFocus::LensMode && is_focused;
+        let lm_val = app.lens_correction_mode.get().name().to_string();
+        lines.push(Line::from(vec![
+            Span::styled("  Lens:     ", Style::default().fg(Palette::LABEL)),
+            Span::styled(lm_val, if lm_focused {
+                Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Palette::VALUE)
+            }),
+        ]));
+        let lm_area = Rect { x: area.x + 1, y: lm_y, width: area.width.saturating_sub(2), height: 1 };
+        regions.push(ClickRegion { area: lm_area, action: ClickAction::CycleLensMode });
+    }
+
+    // --- BL/WL Mode ---
+    let bw_y = lm_y + 1;
+    {
+        let bw_focused = app.export_focus == ExportFocus::BlWlMode && is_focused;
+        let bw_val = app.blwl_mode.get().name().to_string();
+        lines.push(Line::from(vec![
+            Span::styled("  BL/WL:    ", Style::default().fg(Palette::LABEL)),
+            Span::styled(bw_val, if bw_focused {
+                Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Palette::VALUE)
+            }),
+        ]));
+        let bw_area = Rect { x: area.x + 1, y: bw_y, width: area.width.saturating_sub(2), height: 1 };
+        regions.push(ClickRegion { area: bw_area, action: ClickAction::CycleBlWlMode });
+    }
+
     lines.push(Line::from(""));
     if let Some(ref folder) = app.export_folder {
         let disp = folder.to_string_lossy().to_string();
@@ -1843,7 +1879,7 @@ fn render_export_settings(frame: &mut Frame, app: &App, area: Rect, regions: &mu
             Style::default().fg(Palette::LABEL),
         )));
     }
-    lines.push(Line::from(Span::styled("  [c] Codec  [g] Gamut  [t] Transfer  [f] FPS  [r] Rate  [P] Preset  [p] Save", Style::default().fg(Color::White))));
+    lines.push(Line::from(Span::styled("  [c] Codec  [g] Gamut  [t] Transfer  [f] FPS  [r] Rate  [m] Lens  [w] BL/WL  [P] Preset  [p] Save", Style::default().fg(Color::White))));
 
     let panel = Paragraph::new(lines)
         .block(
@@ -2398,6 +2434,31 @@ fn render_full_info_overlay(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled("  Bayer:        ", Style::default().fg(Palette::LABEL)),
             Span::styled(info.bayer_pattern.name(), Style::default().fg(Palette::VALUE)),
         ]));
+        if info.black_level_count > 0 {
+            lines.push(Line::from(vec![
+                Span::styled("  Black Level:  ", Style::default().fg(Palette::LABEL)),
+                Span::styled(
+                    info.black_level_per_channel[..info.black_level_count.min(4) as usize]
+                        .iter().map(|v| format!("{}", v)).collect::<Vec<_>>().join(", "),
+                    Style::default().fg(Palette::VALUE),
+                ),
+            ]));
+        }
+        lines.push(Line::from(vec![
+            Span::styled("  White Level:  ", Style::default().fg(Palette::LABEL)),
+            Span::styled(info.white_level.to_string(), Style::default().fg(Palette::VALUE)),
+        ]));
+        if let Some(ref lsm) = info.lens_shading_map {
+            lines.push(Line::from(vec![
+                Span::styled("  Lens Shading: ", Style::default().fg(Palette::LABEL)),
+                Span::styled(format!("{}x{} grid, 4 ch", lsm.width, lsm.height), Style::default().fg(Palette::VALUE)),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("  Lens Shading: ", Style::default().fg(Palette::LABEL)),
+                Span::styled("none", Style::default().fg(Palette::VALUE)),
+            ]));
+        }
         if info.active_width > 0 && info.active_height > 0 {
             lines.push(Line::from(vec![
                 Span::styled("  Active Area:  ", Style::default().fg(Palette::LABEL)),

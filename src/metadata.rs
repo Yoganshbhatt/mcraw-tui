@@ -130,6 +130,27 @@ pub fn format_video_section(info: &McrawFileInfo) -> Vec<Line<'static>> {
         )));
     }
 
+    if info.black_level_count > 0 {
+        lines.push(Line::from(format!(
+            "  Black Level:  {}",
+            info.black_level_per_channel[..info.black_level_count.min(4) as usize]
+                .iter()
+                .map(|v| format!("{}", v))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    lines.push(Line::from(format!("  White Level:  {}", info.white_level)));
+
+    if let Some(ref lsm) = info.lens_shading_map {
+        lines.push(Line::from(format!(
+            "  Lens Shading: {}x{} grid, 4 ch",
+            lsm.width, lsm.height
+        )));
+    } else {
+        lines.push(Line::from("  Lens Shading: none".to_string()));
+    }
+
     lines.push(Line::from(""));
     lines
 }
