@@ -198,11 +198,7 @@ fn encode_rgba_to_terminal(rgba: &[u8], width: usize, height: usize) -> Result<V
             Ok(s.into_bytes())
         }
         TerminalProtocol::TextFallback => {
-            // Best-effort sixel. Terminals that don't support it silently
-            // ignore the escape sequences — harmless.
-            let s = icy_sixel::sixel_encode(rgba, width, height, &icy_sixel::EncodeOptions::default())
-                .map_err(|e| anyhow::anyhow!("sixel encode: {}", e))?;
-            Ok(s.into_bytes())
+            Err(anyhow::anyhow!("Terminal does not support image display (sixel/kitty)"))
         }
     }
 }
@@ -216,6 +212,9 @@ pub fn compute_thumbnail(
     white_level: f32,
     bayer_phase: u32,
 ) -> Result<CachedThumbnail> {
+    if matches!(protocol(), TerminalProtocol::TextFallback) {
+        return Err(anyhow::anyhow!("Terminal does not support image display (sixel/kitty)"));
+    }
     let (width, height) = aspect_fit(raw_width, raw_height);
 
     let params = build_params(width, height, raw_width, raw_height, black_level, white_level, bayer_phase);
@@ -558,6 +557,9 @@ pub fn cpu_thumbnail(
     bayer: &[u16],
     params: &PreviewParams,
 ) -> Result<(Vec<u8>, u32, u32)> {
+    if matches!(protocol(), TerminalProtocol::TextFallback) {
+        return Err(anyhow::anyhow!("Terminal does not support image display (sixel/kitty)"));
+    }
     let out_w = params.width;
     let out_h = params.height;
     let raw_w = params.bayer_width;
