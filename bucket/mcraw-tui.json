@@ -1,12 +1,12 @@
 {
-    "version": "0.2.3",
+    "version": "0.2.4",
     "description": "Cross Platform TUI for encoding your motioncam MCRAW files to professional video formats. All in the Terminal.",
     "homepage": "https://github.com/Yoganshbhatt/mcraw-tui",
     "license": "Apache-2.0",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/Yoganshbhatt/mcraw-tui/releases/download/v0.2.3/mcraw-tui-x86_64-pc-windows-msvc.zip",
-            "hash": "1B21A7B2F8DA73E1C08BAE69555F72EF215BB9E6B03CE4921D374C525D0FF7CD"
+            "url": "https://github.com/Yoganshbhatt/mcraw-tui/releases/download/v0.2.4/mcraw-tui-x86_64-pc-windows-msvc.zip",
+            "hash": "704033DB1D482E4AA23DEFE0553600494C3D8970F229606A9B8F527CE63126C3"
         }
     },
     "bin": "mcraw-tui.exe",
