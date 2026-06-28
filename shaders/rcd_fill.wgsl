@@ -4,10 +4,42 @@ struct Uniforms {
     black_r: f32, black_g: f32, black_b: f32, _black_pad: f32,
     ccm_row0: vec4<f32>, ccm_row1: vec4<f32>, ccm_row2: vec4<f32>,
     phase_x: i32, phase_y: i32,
+    recon_enabled: u32, _recon_pad: u32, recon_threshold: f32, pin_thr: f32,
+    recon_luma: vec4<f32>,
 };
 
 const WB_GAIN_MIN: f32 = 0.1;
 const WB_GAIN_MAX: f32 = 10.0;
+
+// Highlight reconstruction (HL-handling.md §3). Reference-channel floor:
+// ratio samples whose reference value is at or below this are excluded
+// (below ~1% of the white level, SNR is read-noise dominated).
+const RECON_EPS: f32 = 0.01;
+// Estimate ceiling factor: never above this × the largest unclipped value
+// of the clipped channel in the window (texture bound).
+const RECON_MAX_FACTOR: f32 = 1.5;
+// Tier-1/2 window radius: 9×9 (matches RECON_WIN_R in color.rs). The
+// previous 5×5 window found no clean support more than 2 px inside a
+// saturated blob — the population that goes pink.
+const RECON_WIN_R: u32 = 4u;
+const RECON_WIN_MAX: u32 = 81u;
+// Tier-3 ring search: Chebyshev radii 3..=8 (RECON_RING_MAX stays inside
+// the BORDER=9 valid region). Nearest fully-clean ring = hue anchor.
+const RECON_RING_MIN: u32 = 3u;
+const RECON_RING_MAX: u32 = 8u;
+const RECON_RING_SAMPLES: u32 = 6u;
+const RECON_RING_CAP: u32 = 64u;
+// Tier-3 brightness continuation (CPU Pass-B lite): nearest informative
+// (mask != 111) radii 1..=16, dead-zone 4px + smoothstep ramp, m' fade.
+// Radii beyond BORDER=9 sample fewer valid-region pixels at tile edges —
+// median robustness bounds the error (documented lite tolerance; no 13×13
+// blur on GPU — single-pixel continuation only).
+const RECON_BRIGHT_MAX: u32 = 16u;
+const RECON_BRIGHT_DEADZONE: f32 = 4.0;
+// Bright-continuation sample count: scan outward until this many
+// informative peaks are gathered (CPU Pass-B parity). Deliberately larger
+// than RING_SAMPLES: single-sample medians print through as contour rims.
+const RECON_BRIGHT_SAMPLES: u32 = 8u;
 
 @group(0) @binding(0) var cfa_tex: texture_2d<u32>;
 @group(0) @binding(1) var vh_tex: texture_2d<f32>;
@@ -25,6 +57,15 @@ const VALID_Y: u32 = TILE_Y - 2u * BORDER;
 var<workgroup> shm_r: array<f32, 128 * 32>;
 var<workgroup> shm_g: array<f32, 128 * 32>;
 var<workgroup> shm_b: array<f32, 128 * 32>;
+// Raw-truth 2×2-block pin registry (user-approved design): one bit per
+// channel per tile site, written in the LOAD loop from the pre-demosaic
+// CFA value against the flat sensor-ceiling threshold `pin_thr`
+// (0.99 × clip_raw in raw units — host-computed, never derived from
+// recon_threshold). The collapse gate reads this registry instead of the
+// demosaiced plane, so physically pinned photosites are never smoothed
+// beneath the mask threshold by interpolation. Sub-threshold photosites
+// carry real data and are deliberately NOT flagged.
+var<workgroup> shm_pin: array<u32, 128 * 32>;
 
 fn safe_idx(lx: i32, ly: i32) -> u32 {
     let cx = clamp(lx, 0, i32(TILE_X) - 1);
@@ -80,6 +121,340 @@ fn read_lp(gx: i32, gy: i32) -> f32 {
     return textureLoad(lp_tex, vec2<i32>(cx, cy), 0).r;
 }
 
+// ── Highlight reconstruction helpers (HL-handling.md §3) ────────────────
+// Operate on normalized pre-WB values in shared memory. The border zone of
+// the tile (within BORDER of the edge) is NOT fully demosaiced — its
+// non-photosite planes were never filled by the RCD passes — so window
+// samples are taken from the valid region only, plus the image-bounds
+// check (mirrors the CPU's clamped window at frame edges).
+
+fn chan(v: vec3<f32>, c: u32) -> f32 {
+    if (c == 0u) { return v.x; }
+    if (c == 1u) { return v.y; }
+    return v.z;
+}
+
+fn set_chan(v: ptr<function, vec3<f32>>, c: u32, x: f32) {
+    if (c == 0u) { (*v).x = x; }
+    else if (c == 1u) { (*v).y = x; }
+    else { (*v).z = x; }
+}
+
+fn wb_gain_of(c: u32) -> f32 {
+    if (c == 0u) { return uniforms.wb_r; }
+    if (c == 1u) { return 1.0; }
+    return uniforms.wb_b;
+}
+
+// Insertion sort of the first `n` entries. Called with function-scope
+// arrays only; `n` is bounded by the callers (≤ 81).
+fn sort_asc(v: ptr<function, array<f32, 81u>>, n: u32) {
+    for (var i: u32 = 1u; i < n; i++) {
+        var j = i;
+        while (j > 0u && (*v)[j] < (*v)[j - 1u]) {
+            let t = (*v)[j];
+            (*v)[j] = (*v)[j - 1u];
+            (*v)[j - 1u] = t;
+            j = j - 1u;
+        }
+    }
+}
+
+// Tier-1/2/3 reconstruction for one pixel. `src` is the pixel's own
+// normalized pre-WB RGB (read-only); `own_mask` its clip mask (bit 0 = R,
+// 1 = G, 2 = B). Returns the reconstructed RGB — pixels with a clean mask
+// are returned unchanged.
+//
+// Tier 1 (one clipped channel): estimates keep the pixel's own pinned
+// value as floor (never darken — a single clipped channel still carries
+// real hue). Tier 2 (two clipped channels — the asymmetric-clip pink
+// case): floor = 0 — pinning the saturated pair at the ceiling is what
+// anchors the post-WB/CCM magenta cast. Tier 3 (all clipped): hue anchor
+// from the nearest fully-clean Chebyshev ring (radius 3..=8); the pixel
+// keeps its own measured peak brightness.
+//
+// Ceiling = RECON_MAX_FACTOR × the largest unclipped value of the channel
+// in the window. Reconstruction results are private registers; shared
+// memory is never re-written here.
+fn reconstruct_pixel(src: vec3<f32>, own_mask: u32, gx: i32, gy: i32, lx: i32, ly: i32) -> vec3<f32> {
+    var win_val: array<vec3<f32>, RECON_WIN_MAX>;
+    var win_mask: array<u32, RECON_WIN_MAX>;
+    var n_win: u32 = 0u;
+    for (var dy: i32 = -i32(RECON_WIN_R); dy <= i32(RECON_WIN_R); dy++) {
+        for (var dx: i32 = -i32(RECON_WIN_R); dx <= i32(RECON_WIN_R); dx++) {
+            let wlx = lx + dx;
+            let wly = ly + dy;
+            if (wlx >= i32(BORDER) && wlx < i32(TILE_X) - i32(BORDER) && wly >= i32(BORDER) && wly < i32(TILE_Y) - i32(BORDER)) {
+                let wx = gx + dx;
+                let wy = gy + dy;
+                if (wx >= 0 && wx < i32(uniforms.width) && wy >= 0 && wy < i32(uniforms.height)) {
+                    let nidx = u32(wly) * TILE_X + u32(wlx);
+                    var m: u32 = 0u;
+                    if (shm_r[nidx] >= uniforms.recon_threshold) { m |= 1u; }
+                    if (shm_g[nidx] >= uniforms.recon_threshold) { m |= 2u; }
+                    if (shm_b[nidx] >= uniforms.recon_threshold) { m |= 4u; }
+                    win_val[n_win] = vec3(shm_r[nidx], shm_g[nidx], shm_b[nidx]);
+                    win_mask[n_win] = m;
+                    n_win++;
+                }
+            }
+        }
+    }
+
+    var n_clipped: u32 = 0u;
+    if ((own_mask & 1u) != 0u) { n_clipped++; }
+    if ((own_mask & 2u) != 0u) { n_clipped++; }
+    if ((own_mask & 4u) != 0u) { n_clipped++; }
+
+    var out = src;
+
+    // ── Tier 3: hue anchor from the nearest fully-clean ring ──────────────
+    // All channels are at the sensor ceiling — the pixel's own hue is
+    // uninformative. Keep the measured peak brightness; chromaticity =
+    // median of the nearest clean ring's WB'd chromaticities.
+    if (n_clipped == 3u) {
+        var chi: array<vec3<f32>, RECON_RING_CAP>;
+        var n_ring: u32 = 0u;
+        for (var r: u32 = RECON_RING_MIN; r <= RECON_RING_MAX; r++) {
+            var stop = false;
+            for (var dy: i32 = -i32(RECON_RING_MAX); dy <= i32(RECON_RING_MAX); dy++) {
+                for (var dx: i32 = -i32(RECON_RING_MAX); dx <= i32(RECON_RING_MAX); dx++) {
+                    let dist = max(abs(dx), abs(dy));
+                    if (dist != i32(r)) { continue; }
+                    let wlx = lx + dx;
+                    let wly = ly + dy;
+                    if (wlx >= i32(BORDER) && wlx < i32(TILE_X) - i32(BORDER) && wly >= i32(BORDER) && wly < i32(TILE_Y) - i32(BORDER)) {
+                        let wx = gx + dx;
+                        let wy = gy + dy;
+                        if (wx >= 0 && wx < i32(uniforms.width) && wy >= 0 && wy < i32(uniforms.height)) {
+                            let nidx = u32(wly) * TILE_X + u32(wlx);
+                            var m: u32 = 0u;
+                            if (shm_r[nidx] >= uniforms.recon_threshold) { m |= 1u; }
+                            if (shm_g[nidx] >= uniforms.recon_threshold) { m |= 2u; }
+                            if (shm_b[nidx] >= uniforms.recon_threshold) { m |= 4u; }
+                            if (m == 0u) {
+                                let w = vec3(shm_r[nidx], shm_g[nidx], shm_b[nidx]);
+                                let ww = vec3(w.x * uniforms.wb_r, w.y, w.z * uniforms.wb_b);
+                                let mx = max(ww.x, max(ww.y, ww.z));
+                                if (mx > RECON_EPS) {
+                                    chi[n_ring] = ww / mx;
+                                    n_ring++;
+                                    if (n_ring >= RECON_RING_SAMPLES) {
+                                        stop = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if (stop) { break; }
+            }
+            if (stop) { break; }
+        }
+        var m_chroma = vec3(1.0, 1.0, 1.0);
+        if (n_ring >= RECON_RING_SAMPLES) {
+            var c0: array<f32, RECON_WIN_MAX>;
+            var c1: array<f32, RECON_WIN_MAX>;
+            var c2: array<f32, RECON_WIN_MAX>;
+            for (var j: u32 = 0u; j < n_ring; j++) {
+                c0[j] = chi[j].x;
+                c1[j] = chi[j].y;
+                c2[j] = chi[j].z;
+            }
+            sort_asc(&c0, n_ring);
+            sort_asc(&c1, n_ring);
+            sort_asc(&c2, n_ring);
+            m_chroma = vec3(c0[n_ring / 2u], c1[n_ring / 2u], c2[n_ring / 2u]);
+        }
+        // Brightness continuation (lite): nearest informative pixels
+        // (mask != 111 — semi-clipped halo carrying Pass-A-level brightness;
+        // fully-clean pixels excluded by requiring mask != 0? No — CPU uses
+        // mask != 111 && mask != 0 as informative (semi-clipped only) so dim
+        // clean scene never pulls the core down. Mirror exactly.
+        let own_max_wb = max(src.x * uniforms.wb_r, max(src.y, src.z * uniforms.wb_b));
+        var peaks: array<f32, RECON_WIN_MAX>;
+        var peak_d: array<f32, RECON_WIN_MAX>;
+        var n_peaks: u32 = 0u;
+        for (var r: u32 = 1u; r <= RECON_BRIGHT_MAX; r++) {
+            var stop_b = false;
+            for (var dy: i32 = -i32(RECON_BRIGHT_MAX); dy <= i32(RECON_BRIGHT_MAX); dy++) {
+                for (var dx: i32 = -i32(RECON_BRIGHT_MAX); dx <= i32(RECON_BRIGHT_MAX); dx++) {
+                    if (max(abs(dx), abs(dy)) != i32(r)) { continue; }
+                    let wlx = lx + dx;
+                    let wly = ly + dy;
+                    if (wlx >= i32(BORDER) && wlx < i32(TILE_X) - i32(BORDER) && wly >= i32(BORDER) && wly < i32(TILE_Y) - i32(BORDER)) {
+                        let wx = gx + dx;
+                        let wy = gy + dy;
+                        if (wx >= 0 && wx < i32(uniforms.width) && wy >= 0 && wy < i32(uniforms.height)) {
+                            let nidx = u32(wly) * TILE_X + u32(wlx);
+                            var m: u32 = 0u;
+                            if (shm_r[nidx] >= uniforms.recon_threshold) { m |= 1u; }
+                            if (shm_g[nidx] >= uniforms.recon_threshold) { m |= 2u; }
+                            if (shm_b[nidx] >= uniforms.recon_threshold) { m |= 4u; }
+                            if (m == 7u || m == 0u) { continue; }
+                            let w = vec3(shm_r[nidx], shm_g[nidx], shm_b[nidx]);
+                            let mx = max(w.x * uniforms.wb_r, max(w.y, w.z * uniforms.wb_b));
+                            if (mx > RECON_EPS) {
+                                peaks[n_peaks] = mx;
+                                peak_d[n_peaks] = f32(r);
+                                n_peaks++;
+                                if (n_peaks >= RECON_BRIGHT_SAMPLES) {
+                                    stop_b = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (stop_b) { break; }
+            }
+            if (stop_b) { break; }
+        }
+        var est_peak = own_max_wb;
+        var m_prime = m_chroma;
+        if (n_peaks > 0u) {
+            sort_asc(&peaks, n_peaks);
+            sort_asc(&peak_d, n_peaks);
+            let med = peaks[n_peaks / 2u];
+            let d_found = peak_d[n_peaks / 2u];
+            let t = clamp((d_found - RECON_BRIGHT_DEADZONE) / (f32(RECON_BRIGHT_MAX) - RECON_BRIGHT_DEADZONE), 0.0, 1.0);
+            let s = t * t * (3.0 - 2.0 * t);
+            est_peak = own_max_wb + (med - own_max_wb) * s;
+            m_prime = m_chroma + (vec3(1.0) - m_chroma) * (1.0 - s);
+        }
+        if (est_peak > RECON_EPS) {
+            out = vec3(est_peak * m_prime.x / uniforms.wb_r, est_peak * m_prime.y, est_peak * m_prime.z / uniforms.wb_b);
+        }
+        return out;
+    }
+
+    // ── Tier 1b: G-anchor upward reconstruction (deviation D10) ──────────
+    // G is the single clipped channel (own_mask == 010): G is the WB anchor
+    // (gain 1.0), so a neutral highlight clipped on G reconstructs UPWARD
+    // from the WB'd R/B brightness. Never below the pinned value —
+    // genuinely saturated colors (WB'd R/B below the pinned G) keep their
+    // real hue via the floor.
+    if (own_mask == 2u) {
+        let g_up = max(max(src.x * uniforms.wb_r, src.z * uniforms.wb_b), src.y);
+        set_chan(&out, 1, g_up);
+        return out;
+    }
+
+    for (var c: u32 = 0u; c < 3u; c++) {
+        if ((own_mask & (1u << c)) == 0u) { continue; }
+        // Tier-1 keeps the never-darken floor; Tier-2 does not (the pinned
+        // ceiling anchors the magenta cast).
+        let floor_v = select(0.0, chan(src, c), n_clipped == 1u);
+        var wmax: f32 = 0.0;
+        for (var j: u32 = 0u; j < n_win; j++) {
+            if ((win_mask[j] & (1u << c)) == 0u) {
+                wmax = max(wmax, chan(win_val[j], c));
+            }
+        }
+        let ceil_v = max(RECON_MAX_FACTOR * wmax, floor_v + 1e-6);
+
+        if (n_clipped == 1u) {
+            // Tier 1: one estimate per healthy reference channel, averaged.
+            var sum: f32 = 0.0;
+            var refs: u32 = 0u;
+            for (var h: u32 = 0u; h < 3u; h++) {
+                if (h == c) { continue; }
+                var ratios: array<f32, RECON_WIN_MAX>;
+                var nr: u32 = 0u;
+                for (var j: u32 = 0u; j < n_win; j++) {
+                    if ((win_mask[j] & (1u << c)) != 0u || (win_mask[j] & (1u << h)) != 0u) { continue; }
+                    let hv = chan(win_val[j], h);
+                    if (hv > RECON_EPS) {
+                        ratios[nr] = chan(win_val[j], c) / hv;
+                        nr++;
+                    }
+                }
+                if (nr > 0u) {
+                    sort_asc(&ratios, nr);
+                    sum += chan(src, h) * ratios[nr / 2u];
+                    refs++;
+                }
+            }
+            if (refs > 0u) {
+                set_chan(&out, c, clamp(sum / f32(refs), floor_v, ceil_v));
+            }
+        } else {
+            // Tier 2: two clipped channels, one healthy anchor.
+            var hh: u32 = 0u;
+            if ((own_mask & 1u) == 0u) { hh = 0u; }
+            else if ((own_mask & 2u) == 0u) { hh = 1u; }
+            else { hh = 2u; }
+            var c2: u32;
+            if (c == 0u) { c2 = select(2u, 1u, (own_mask & 2u) != 0u); }
+            else if (c == 1u) { c2 = select(2u, 0u, (own_mask & 1u) != 0u); }
+            else { c2 = select(1u, 0u, (own_mask & 1u) != 0u); }
+
+            var ratios: array<f32, RECON_WIN_MAX>;
+            var nr: u32 = 0u;
+            for (var j: u32 = 0u; j < n_win; j++) {
+                if ((win_mask[j] & (1u << c)) != 0u || (win_mask[j] & (1u << hh)) != 0u) { continue; }
+                let hv = chan(win_val[j], hh);
+                if (hv > RECON_EPS) {
+                    ratios[nr] = chan(win_val[j], c) / hv;
+                    nr++;
+                }
+            }
+            var stable: bool = nr >= 4u;
+            if (nr >= 6u) {
+                sort_asc(&ratios, nr);
+                let med = ratios[nr / 2u];
+                let q1 = ratios[nr / 4u];
+                let q3 = ratios[(3u * nr) / 4u];
+                if (abs(med) > 1e-6 && (q3 - q1) > 2.0 * abs(med)) { stable = false; }
+            }
+            if (stable && nr > 0u) {
+                if (nr < 6u) { sort_asc(&ratios, nr); }
+                set_chan(&out, c, clamp(chan(src, hh) * ratios[nr / 2u], floor_v, ceil_v));
+            } else {
+                // Luminance-continuity fallback (Resolve "Luminance"
+                // style): anchor on the luma of fully-unclipped neighbors
+                // plus the clipped-channel ratio from the same neighbors.
+                let luma = uniforms.recon_luma.xyz;
+                var y_acc: f32 = 0.0;
+                var n_y: u32 = 0u;
+                var k_ratios: array<f32, RECON_WIN_MAX>;
+                var n_k: u32 = 0u;
+                for (var j: u32 = 0u; j < n_win; j++) {
+                    if (win_mask[j] != 0u) { continue; }
+                    let w = win_val[j];
+                    let ww = vec3(w.x * uniforms.wb_r, w.y, w.z * uniforms.wb_b);
+                    y_acc += luma.x * ww.x + luma.y * ww.y + luma.z * ww.z;
+                    n_y++;
+                    let c2w = chan(w, c2) * wb_gain_of(c2);
+                    if (c2w > RECON_EPS) {
+                        k_ratios[n_k] = chan(w, c) * wb_gain_of(c) / c2w;
+                        n_k++;
+                    }
+                }
+                if (n_y > 0u && n_k > 0u) {
+                    let y_mean = y_acc / f32(n_y);
+                    sort_asc(&k_ratios, n_k);
+                    let k = k_ratios[n_k / 2u];
+                    let hw = chan(src, hh) * wb_gain_of(hh);
+                    let denom = luma[c] * k + luma[c2];
+                    if (abs(denom) > 1e-12) {
+                        let c2w = (y_mean - luma[hh] * hw) / denom;
+                        let cw = k * c2w;
+                        let est_c = cw / wb_gain_of(c);
+                        // WGSL has no isFinite; NaN is the only non-clampable
+                        // value (self-comparison), ±Inf clamps to the ceiling.
+                        if (est_c == est_c) {
+                            set_chan(&out, c, clamp(est_c, floor_v, ceil_v));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return out;
+}
+
 @compute @workgroup_size(16, 16)
 fn main(
     @builtin(workgroup_id) wg_id: vec3<u32>,
@@ -88,6 +463,17 @@ fn main(
     let tile_origin_x = i32(wg_id.x * VALID_X);
     let tile_origin_y = i32(wg_id.y * VALID_Y);
     let thread_id = lid.y * 16u + lid.x;
+    // Normalization ranges (kept for the in-place normalize pass below).
+    // Per-channel, matching the CPU's `normalize_linear_per_channel`:
+    // each plane divides by `white_level - black_ch`. The raw-truth pin
+    // threshold is NOT derived from these: `pin_thr` is the flat
+    // sensor-ceiling threshold in raw CFA units (0.99 × clip_raw),
+    // computed host-side from the per-frame dynamic white level. Black
+    // levels never enter the pin test — a photosite is physically pinned
+    // when its raw code sits at the sensor ceiling, full stop.
+    let norm_range_r = max(uniforms.white_level - uniforms.black_r, 1.0);
+    let norm_range_g = max(uniforms.white_level - uniforms.black_g, 1.0);
+    let norm_range_b = max(uniforms.white_level - uniforms.black_b, 1.0);
 
     for (var i: u32 = 0u; i < 16u; i++) {
         let idx = thread_id * 16u + i;
@@ -106,6 +492,19 @@ fn main(
                             select(uniforms.black_g, uniforms.black_r, c == 0),
                             c == 2);
             val = max(0.0, raw - bl);
+            // Raw-truth pin registry: a pre-demosaic CFA photosite whose
+            // RAW code sits at/above 0.99×clip_raw (~the sensor ceiling)
+            // flags its channel — no black adjustment, no reconstruction
+            // coupling. Sub-threshold photosites (e.g. 0.983×WL) are NOT
+            // flagged: they carry real, distinct sensor data that WB + CCM
+            // may legitimately push into wide-gamut colors — the collapse
+            // gate must leave those pixels alone (user-mandated). The
+            // collapse gate reads this registry, not the demosaiced plane —
+            // physically pinned sensor data cannot be smoothed beneath the
+            // mask by interpolation.
+            shm_pin[idx] = select(0u, 1u << u32(c), raw >= uniforms.pin_thr);
+        } else {
+            shm_pin[idx] = 0u;
         }
 
         let c = bayer_color(gx, gy);
@@ -225,12 +624,29 @@ fn main(
     }
     workgroupBarrier();
 
-    let norm_range = max(uniforms.white_level - uniforms.black_level, 1.0);
     let ccm0 = uniforms.ccm_row0.x; let ccm1 = uniforms.ccm_row0.y; let ccm2 = uniforms.ccm_row0.z;
     let ccm3 = uniforms.ccm_row1.x; let ccm4 = uniforms.ccm_row1.y; let ccm5 = uniforms.ccm_row1.z;
     let ccm6 = uniforms.ccm_row2.x; let ccm7 = uniforms.ccm_row2.y; let ccm8 = uniforms.ccm_row2.z;
 
     let gm = uniforms.gamma_mode;
+    let recon_on = uniforms.recon_enabled == 1u;
+    let recon_thr = uniforms.recon_threshold;
+
+    // Highlight reconstruction prep: normalize the entire tile in place
+    // (the RCD fill output is dead after this point). Border positions are
+    // normalized too — their non-photosite planes were never demosaiced,
+    // but the reconstruction never samples them (valid-region check), so
+    // whatever they hold is harmless.
+    for (var i: u32 = 0u; i < 16u; i++) {
+        let idx = thread_id * 16u + i;
+        shm_r[idx] = shm_r[idx] / norm_range_r;
+        shm_g[idx] = shm_g[idx] / norm_range_g;
+        shm_b[idx] = shm_b[idx] / norm_range_b;
+    }
+    // The user's barrier protocol (verified): all normalized writes must be
+    // visible before ANY thread reads another thread's window. No barrier
+    // is needed after the reconstruction — results are private registers.
+    workgroupBarrier();
 
     for (var i: u32 = 0u; i < 16u; i++) {
         let idx = thread_id * 16u + i;
@@ -241,9 +657,81 @@ fn main(
             let gy = tile_origin_y + ly - i32(BORDER);
             if (gx >= 0 && gx < i32(uniforms.width) && gy >= 0 && gy < i32(uniforms.height)) {
 
-                let rn = shm_r[idx] / norm_range;
-                let gn = shm_g[idx] / norm_range;
-                let bn = shm_b[idx] / norm_range;
+                var rn = shm_r[idx];
+                var gn = shm_g[idx];
+                var bn = shm_b[idx];
+
+                // Raw-truth block override (CPU raw_truth_override parity):
+                // pinned 2×2 CFA blocks replace the demosaiced triple with
+                // the block's own photosite readings (R/B direct, G avg of
+                // unpinned sites). Private regs only — no shm write, no
+                // barrier. Clean blocks (mcoll==0) untouched (no-temper).
+                // Computed here so BOTH the recon mask (m0) and the collapse
+                // gate below see sensor truth, matching pipeline.rs order
+                // (override → mask → recon → collapse).
+                let lxb0 = lx - i32((u32(lx) + 1u) & 1u);
+                let lyb0 = ly - i32((u32(ly) + 1u) & 1u);
+                let bpi0 = u32(lyb0) * TILE_X + u32(lxb0);
+                let mcoll_pre = shm_pin[bpi0] | shm_pin[bpi0 + 1u] | shm_pin[bpi0 + TILE_X] | shm_pin[bpi0 + TILE_X + 1u];
+                if (mcoll_pre != 0u) {
+                    let gxb = tile_origin_x + lxb0 - i32(BORDER);
+                    let gyb = tile_origin_y + lyb0 - i32(BORDER);
+                    var r_raw = 0.0; var g_sum = 0.0; var g_n = 0u; var b_raw = 0.0;
+                    var g_all = 0.0;
+                    for (var by: i32 = 0; by < 2; by++) {
+                        for (var bx: i32 = 0; bx < 2; bx++) {
+                            let sx = clamp(gxb + bx, 0, i32(uniforms.width) - 1);
+                            let sy = clamp(gyb + by, 0, i32(uniforms.height) - 1);
+                            let raw = f32(textureLoad(cfa_tex, vec2<i32>(sx, sy), 0).r);
+                            let ch = bayer_color(sx, sy);
+                            if (ch == 0) { r_raw = raw; }
+                            else if (ch == 2) { b_raw = raw; }
+                            else {
+                                g_all += raw;
+                                if (raw < uniforms.pin_thr) { g_sum += raw; g_n += 1u; }
+                            }
+                        }
+                    }
+                    var g_raw = g_all * 0.5;
+                    if (g_n > 0u) { g_raw = g_sum / f32(g_n); }
+                    rn = max(0.0, (r_raw - uniforms.black_r) / norm_range_r);
+                    gn = max(0.0, (g_raw - uniforms.black_g) / norm_range_g);
+                    bn = max(0.0, (b_raw - uniforms.black_b) / norm_range_b);
+                }
+
+                // Highlight reconstruction (HL-handling.md §3): estimate
+                // clipped channels from the 9×9 neighborhood in normalized
+                // raw space, BEFORE white balance. Tier 3 (all channels
+                // clipped) gets the ring-anchor hue. Clean pixels pass
+                // through untouched.
+                var m0: u32 = 0u;
+                if (rn >= recon_thr) { m0 |= 1u; }
+                if (gn >= recon_thr) { m0 |= 2u; }
+                if (bn >= recon_thr) { m0 |= 4u; }
+                if (recon_on && m0 != 0u) {
+                    let rec = reconstruct_pixel(vec3(rn, gn, bn), m0, gx, gy, lx, ly);
+                    rn = rec.x; gn = rec.y; bn = rec.z;
+                }
+
+// Collapse-gate mask (user-approved design): the RAW-TRUTH
+                // 2×2-block registry written by the load loop — a photosite
+                // at/above 0.99×clip_raw (raw CFA units) anywhere in the
+                // pixel's 2×2 CFA block flags its channel. The demosaiced
+                // plane (m0) is NOT used here: RCD/bilinear interpolation
+                // can average pinned photosites beneath the mask threshold
+                // (the GPU magenta residual); the raw CFA cannot lie.
+                // Pixels with ≥ 2 pinned channels hold no hue info and
+                // collapse to their fused-luma neutral after WB (§3.2,
+                // deviation D9) — brightness preserved, no hue invented.
+                // This is the guarantee that NO export state (recovery on
+                // or off) renders magenta. Pixels whose block carries no
+                // pin keep their recorded color — scene-referred, no
+                // pre-trigger (user-mandated: sub-threshold photosites
+                // like 0.983×WL pass through WB + CCM untouched).
+                let lxb = lx - i32((u32(lx) + 1u) & 1u);
+                let lyb = ly - i32((u32(ly) + 1u) & 1u);
+                let bpi = u32(lyb) * TILE_X + u32(lxb);
+                let mcoll = shm_pin[bpi] | shm_pin[bpi + 1u] | shm_pin[bpi + TILE_X] | shm_pin[bpi + TILE_X + 1u];
 
                 // 1. Apply White Balance (gains are clamped on the CPU
                 //    side at uniform-write time; clamp here too so a
@@ -254,49 +742,59 @@ fn main(
                 let gw = gn;
                 let bw = bn * wb_b;
 
-                // 2. Highlight Reconstruction — desaturate toward neutral
-                //    when a single channel clips. Only for display-referred
-                //    curves (Linear gm=0, Rec.709 gm=1, Gamma2.4 gm=12).
-                //    Log curves encode 4-100× of dynamic range — skip to
-                //    preserve highlight detail for the scene-referred OETF.
-                let is_display_referred = gm == 0u || gm == 1u || gm == 12u;
-                var final_rw = rw;
-                var final_gw = gw;
-                var final_bw = bw;
-                if (is_display_referred) {
-                    let max_raw = max(rn, max(gn, bn));
-                    let max_wb  = max(rw, max(gw, bw));
-                    let t_highlight = clamp((max_raw - 0.95) / 0.05, 0.0, 1.0);
-                    let neutral = min(1.0, max_wb);
-                    if (t_highlight > 0.0) {
-                        final_rw = mix(rw, neutral, t_highlight);
-                        final_gw = mix(gw, neutral, t_highlight);
-                        final_bw = mix(bw, neutral, t_highlight);
+                // 1b. Clipped-pair neutral collapse (always active when the
+                //     raw-truth mask threshold is set; independent of
+                //     recon_on and of recon_threshold).
+                var rwc = rw;
+                var gwc = gw;
+                var bwc = bw;
+                if (uniforms.pin_thr > 0.0) {
+                    let ones = (mcoll & 1u) + ((mcoll >> 1u) & 1u) + ((mcoll >> 2u) & 1u);
+                    if (ones >= 2u) {
+                        // Neutral direction is [k, k, k]: the fused CCM row
+                        // sums are 1.0 (±0.001 by ±CAT construction), so the
+                        // matrix's input-space neutral [1,1,1] maps to output
+                        // neutral. WB gains are applied separately above; the
+                        // old [k·wb_r, k, k·wb_b] re-applied them inside the
+                        // CCM and exited with R≈B≈3.4·G — magenta.
+                        let luma = uniforms.recon_luma.xyz;
+                        let y = luma.x * rw + luma.y * gw + luma.z * bw;
+                        let luma_neutral = luma.x + luma.y + luma.z;
+                        var k: f32 = 0.0;
+                        if (abs(luma_neutral) > 1e-6) { k = max(y / luma_neutral, 0.0); }
+                        rwc = k; gwc = k; bwc = k;
+                    } else if (mcoll == 2u) {
+                        // G-pinned single clip (G is the WB anchor, gain 1.0):
+                        // the WB'd R/B overshoot the pinned G and the CCM's
+                        // negative secondaries flip the ratio magenta. Cap
+                        // the unclipped channels at the WB'd pinned G —
+                        // brightness from the measured anchor, no hue
+                        // invented (D10).
+                        rwc = min(rwc, gwc);
+                        bwc = min(bwc, gwc);
                     }
                 }
 
-                // 3. Apply CCM (on WB'd values — standard pipeline)
-                var rout = final_rw * ccm0 + final_gw * ccm1 + final_bw * ccm2;
-                var gout = final_rw * ccm3 + final_gw * ccm4 + final_bw * ccm5;
-                var bout = final_rw * ccm6 + final_gw * ccm7 + final_bw * ccm8;
+                // 2. Apply CCM
+                var rout = rwc * ccm0 + gwc * ccm1 + bwc * ccm2;
+                var gout = rwc * ccm3 + gwc * ccm4 + bwc * ccm5;
+                var bout = rwc * ccm6 + gwc * ccm7 + bwc * ccm8;
 
                 rout = max(rout, 0.0);
                 gout = max(gout, 0.0);
                 bout = max(bout, 0.0);
 
-                // 4. Gamut soft-clip (log curves only): desaturate extreme
-                //    out-of-gamut values (>1.0) toward luminance. Prevents
-                //    "wild highlight peaks" from wide-gamut CCM matrices
-                //    (DWG, CanonCG, SG3C) while preserving in-gamut colors.
-                if (!is_display_referred) {
-                    let max_val = max(rout, max(gout, bout));
-                    if (max_val > 1.0) {
-                        let lum = 0.2126 * rout + 0.7152 * gout + 0.0722 * bout;
-                        let lum_c = min(lum, max_val);
-                        let t_soft = min(max_val - 1.0, 1.0);
-                        rout = mix(rout, lum_c, t_soft);
-                        gout = mix(gout, lum_c, t_soft);
-                        bout = mix(bout, lum_c, t_soft);
+                // 3. Hue-preserving display rolloff (HL-handling.md §4).
+                //    Display-referred only (Linear, Rec.709, Gamma24);
+                //    identity below 1.0, C1-continuous rational shoulder
+                //    above, uniform scale — R:G:B ratios invariant.
+                if (gm == 0u || gm == 1u || gm == 12u) {
+                    let m = max(rout, max(gout, bout));
+                    if (m > 1.0) {
+                        let s = (1.0 + (m - 1.0) / (1.0 + 20.0 * (m - 1.0))) / m;
+                        rout *= s;
+                        gout *= s;
+                        bout *= s;
                     }
                 }
 

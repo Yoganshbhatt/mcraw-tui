@@ -106,6 +106,8 @@ pub enum ClickAction {
     CycleTransfer,
     CycleProfile,
     CycleRate,
+    CycleLensMode,
+    CycleBlWlMode,
     ImportOption1,
     ImportOption2,
     ClosePopup,
@@ -722,7 +724,7 @@ fn render_browser_overlay(frame: &mut Frame, area: Rect, app: &App, regions: &mu
 
         let mut state = ListState::default()
             .with_offset(app.favourites_scroll_offset.get());
-        state.select(Some(app.favourites_scroll_offset.get()));
+        state.select(Some(app.favourites_selected_index.get()));
         frame.render_stateful_widget(list, list_area, &mut state);
         // Keep the offset in sync (handles clamping done by the widget).
         if let Some(off) = state.offset().into() {
@@ -1036,25 +1038,25 @@ fn render_thumbnail_panel(frame: &mut Frame, app: &App, area: Rect) {
 /// Post-render summary panel. Shown after an export finishes (success,
 /// failure, or cancellation) until the user starts another export. Mirrors
 /// the "render complete" panel in DaVinci Resolve — sticky settings + timing.
+/// When `summary.batch_total > 1` the panel shows aggregate batch stats with
+/// a "Last file" detail row so the user still has a concrete reference.
 fn render_export_summary(frame: &mut Frame, app: &App, area: Rect, border_color: Color) {
     let summary = match app.last_export_summary.as_ref() {
         Some(s) => s,
         None => return,
     };
 
-    let elapsed_secs = summary.elapsed.as_secs();
-    let mins = elapsed_secs / 60;
-    let secs = elapsed_secs % 60;
-    let elapsed_str = if mins > 0 {
-        format!("{}m {:02}s", mins, secs)
-    } else {
-        format!("{}.{:01}s", elapsed_secs, summary.elapsed.subsec_millis() / 100)
-    };
+    let is_batch = summary.batch_total > 1;
 
-    let avg_fps = if summary.elapsed.as_secs_f64() > 0.0 && summary.frame_count > 0 {
-        summary.frame_count as f64 / summary.elapsed.as_secs_f64()
-    } else {
-        0.0
+    // --- helper for formatting duration ---
+    let fmt_dur = |d: Duration| -> String {
+        let secs = d.as_secs();
+        let mins = secs / 60;
+        if mins > 0 {
+            format!("{}m {:02}s", mins, secs % 60)
+        } else {
+            format!("{}.{:01}s", secs, d.subsec_millis() / 100)
+        }
     };
 
     let out_name = summary
@@ -1063,70 +1065,158 @@ fn render_export_summary(frame: &mut Frame, app: &App, area: Rect, border_color:
         .last()
         .unwrap_or(&summary.output_path);
 
-    let (status_label, status_color) = match &summary.result {
-        Ok(()) => (" RENDER COMPLETE", Palette::SUCCESS),
-        Err(msg) if msg == "Cancelled by user" => (" RENDER CANCELLED", Color::Yellow),
-        Err(_) => (" RENDER FAILED", Color::Red),
+    let (status_label, status_color) = if is_batch {
+        let done = summary.batch_completed;
+        let total = summary.batch_total;
+        let failed = summary.batch_failed;
+        let ok = done - failed;
+        if failed > 0 {
+            (
+                format!(" BATCH COMPLETE: {}/{} files ({} failed)", done, total, failed),
+                Color::Yellow,
+            )
+        } else {
+            (
+                format!(" BATCH COMPLETE: {}/{} files", done, total),
+                Palette::SUCCESS,
+            )
+        }
+    } else {
+        match &summary.result {
+            Ok(()) => (" RENDER COMPLETE".to_string(), Palette::SUCCESS),
+            Err(msg) if msg == "Cancelled by user" => (" RENDER CANCELLED".to_string(), Color::Yellow),
+            Err(_) => (" RENDER FAILED".to_string(), Color::Red),
+        }
     };
 
     let mut lines = vec![
         Line::from(Span::styled(
-            status_label,
+            &status_label,
             Style::default().fg(status_color).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("  Output:      ", Style::default().fg(Palette::LABEL)),
-            Span::styled(out_name, Style::default().fg(Palette::VALUE)),
-        ]),
-        Line::from(vec![
-            Span::styled("  Codec:       ", Style::default().fg(Palette::LABEL)),
-            Span::styled(
-                format!("{} ({})", summary.codec_label, summary.profile_label),
-                Style::default().fg(Palette::VALUE),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("  Gamut:       ", Style::default().fg(Palette::LABEL)),
-            Span::styled(&summary.color_space, Style::default().fg(Palette::VALUE)),
-        ]),
-        Line::from(vec![
-            Span::styled("  Transfer:    ", Style::default().fg(Palette::LABEL)),
-            Span::styled(&summary.transfer, Style::default().fg(Palette::VALUE)),
-        ]),
-        Line::from(vec![
-            Span::styled("  Rate:        ", Style::default().fg(Palette::LABEL)),
-            Span::styled(&summary.rate_control, Style::default().fg(Palette::VALUE)),
-        ]),
-        Line::from(vec![
-            Span::styled("  Frames:      ", Style::default().fg(Palette::LABEL)),
-            Span::styled(format!("{}", summary.frame_count), Style::default().fg(Palette::VALUE)),
-        ]),
-        Line::from(vec![
-            Span::styled("  Time:        ", Style::default().fg(Palette::LABEL)),
-            Span::styled(elapsed_str, Style::default().fg(Palette::VALUE)),
-            Span::raw("  "),
-            Span::styled(
-                format!("({:.1} fps avg)", avg_fps),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]),
     ];
 
-    // Add a wrapped error message for failures so the user can see why.
-    if let Err(ref msg) = summary.result {
-        if msg != "Cancelled by user" {
-            lines.push(Line::from(""));
+    if is_batch {
+        // --- batch aggregate section ---
+        let batch_elapsed = summary.batch_total_elapsed;
+        let batch_avg_fps = if batch_elapsed.as_secs_f64() > 0.0 && summary.batch_total_frames > 0 {
+            summary.batch_total_frames as f64 / batch_elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled("  Total frames: ", Style::default().fg(Palette::LABEL)),
+            Span::styled(format!("{}", summary.batch_total_frames), Style::default().fg(Palette::VALUE)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  Total time:   ", Style::default().fg(Palette::LABEL)),
+            Span::styled(fmt_dur(batch_elapsed), Style::default().fg(Palette::VALUE)),
+            Span::raw("  "),
+            Span::styled(
+                format!("({:.1} fps avg)", batch_avg_fps),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+        if summary.batch_failed > 0 {
+            lines.push(Line::from(vec![
+                Span::styled("  Errors:       ", Style::default().fg(Palette::LABEL)),
+                Span::styled(format!("{}", summary.batch_failed), Color::Red),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  ─── Last file ───",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    // --- per-file detail (always present) ---
+    let per_elapsed_secs = summary.elapsed.as_secs();
+    let per_mins = per_elapsed_secs / 60;
+    let per_secs = per_elapsed_secs % 60;
+    let per_elapsed_str = if per_mins > 0 {
+        format!("{}m {:02}s", per_mins, per_secs)
+    } else {
+        format!("{}.{:01}s", per_elapsed_secs, summary.elapsed.subsec_millis() / 100)
+    };
+
+    let per_avg_fps = if summary.elapsed.as_secs_f64() > 0.0 && summary.frame_count > 0 {
+        summary.frame_count as f64 / summary.elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled("  Output:      ", Style::default().fg(Palette::LABEL)),
+        Span::styled(out_name, Style::default().fg(Palette::VALUE)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  Codec:       ", Style::default().fg(Palette::LABEL)),
+        Span::styled(
+            format!("{} ({})", summary.codec_label, summary.profile_label),
+            Style::default().fg(Palette::VALUE),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  Gamut:       ", Style::default().fg(Palette::LABEL)),
+        Span::styled(&summary.color_space, Style::default().fg(Palette::VALUE)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  Transfer:    ", Style::default().fg(Palette::LABEL)),
+        Span::styled(&summary.transfer, Style::default().fg(Palette::VALUE)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  Rate:        ", Style::default().fg(Palette::LABEL)),
+        Span::styled(&summary.rate_control, Style::default().fg(Palette::VALUE)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  Frames:      ", Style::default().fg(Palette::LABEL)),
+        Span::styled(format!("{}", summary.frame_count), Style::default().fg(Palette::VALUE)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  Time:        ", Style::default().fg(Palette::LABEL)),
+        Span::styled(&per_elapsed_str, Style::default().fg(Palette::VALUE)),
+        Span::raw("  "),
+        Span::styled(
+            format!("({:.1} fps avg)", per_avg_fps),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+
+    // --- batch error list ---
+    if is_batch && !summary.batch_errors.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Errors:",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+        for msg in summary.batch_errors.iter().take(6) {
+            // Show only the first line of each error to save space
+            let first = msg.lines().next().unwrap_or(msg);
             lines.push(Line::from(Span::styled(
-                "  Error:",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                format!("    {}", first),
+                Style::default().fg(Color::Red),
             )));
-            // Show up to ~3 lines of the error.
-            for chunk in msg.lines().take(6) {
+        }
+    }
+
+    // --- single-item error ---
+    if !is_batch {
+        if let Err(ref msg) = summary.result {
+            if msg != "Cancelled by user" {
+                lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
-                    format!("    {}", chunk),
-                    Style::default().fg(Color::Red),
+                    "  Error:",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 )));
+                for chunk in msg.lines().take(6) {
+                    lines.push(Line::from(Span::styled(
+                        format!("    {}", chunk),
+                        Style::default().fg(Color::Red),
+                    )));
+                }
             }
         }
     }
@@ -1825,6 +1915,40 @@ fn render_export_settings(frame: &mut Frame, app: &App, area: Rect, regions: &mu
         regions.push(ClickRegion { area: rc_area, action: ClickAction::CycleRate });
     }
 
+    // --- Lens Correction Mode ---
+    let lm_y = if show_rate { base_y + 5 + 1 } else { base_y + 4 + 1 };
+    {
+        let lm_focused = app.export_focus == ExportFocus::LensMode && is_focused;
+        let lm_val = app.lens_correction_mode.get().name().to_string();
+        lines.push(Line::from(vec![
+            Span::styled("  Lens:     ", Style::default().fg(Palette::LABEL)),
+            Span::styled(lm_val, if lm_focused {
+                Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Palette::VALUE)
+            }),
+        ]));
+        let lm_area = Rect { x: area.x + 1, y: lm_y, width: area.width.saturating_sub(2), height: 1 };
+        regions.push(ClickRegion { area: lm_area, action: ClickAction::CycleLensMode });
+    }
+
+    // --- BL/WL Mode ---
+    let bw_y = lm_y + 1;
+    {
+        let bw_focused = app.export_focus == ExportFocus::BlWlMode && is_focused;
+        let bw_val = app.blwl_mode.get().name().to_string();
+        lines.push(Line::from(vec![
+            Span::styled("  BL/WL:    ", Style::default().fg(Palette::LABEL)),
+            Span::styled(bw_val, if bw_focused {
+                Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Palette::VALUE)
+            }),
+        ]));
+        let bw_area = Rect { x: area.x + 1, y: bw_y, width: area.width.saturating_sub(2), height: 1 };
+        regions.push(ClickRegion { area: bw_area, action: ClickAction::CycleBlWlMode });
+    }
+
     lines.push(Line::from(""));
     if let Some(ref folder) = app.export_folder {
         let disp = folder.to_string_lossy().to_string();
@@ -1843,7 +1967,7 @@ fn render_export_settings(frame: &mut Frame, app: &App, area: Rect, regions: &mu
             Style::default().fg(Palette::LABEL),
         )));
     }
-    lines.push(Line::from(Span::styled("  [c] Codec  [g] Gamut  [t] Transfer  [f] FPS  [r] Rate  [P] Preset  [p] Save", Style::default().fg(Color::White))));
+    lines.push(Line::from(Span::styled("  [c] Codec  [g] Gamut  [t] Transfer  [f] FPS  [r] Rate  [m] Lens  [w] BL/WL  [P] Preset  [p] Save", Style::default().fg(Color::White))));
 
     let panel = Paragraph::new(lines)
         .block(
@@ -2398,6 +2522,31 @@ fn render_full_info_overlay(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled("  Bayer:        ", Style::default().fg(Palette::LABEL)),
             Span::styled(info.bayer_pattern.name(), Style::default().fg(Palette::VALUE)),
         ]));
+        if info.black_level_count > 0 {
+            lines.push(Line::from(vec![
+                Span::styled("  Black Level:  ", Style::default().fg(Palette::LABEL)),
+                Span::styled(
+                    info.black_level_per_channel[..info.black_level_count.min(4) as usize]
+                        .iter().map(|v| format!("{}", v)).collect::<Vec<_>>().join(", "),
+                    Style::default().fg(Palette::VALUE),
+                ),
+            ]));
+        }
+        lines.push(Line::from(vec![
+            Span::styled("  White Level:  ", Style::default().fg(Palette::LABEL)),
+            Span::styled(info.white_level.to_string(), Style::default().fg(Palette::VALUE)),
+        ]));
+        if let Some(ref lsm) = info.lens_shading_map {
+            lines.push(Line::from(vec![
+                Span::styled("  Lens Shading: ", Style::default().fg(Palette::LABEL)),
+                Span::styled(format!("{}x{} grid, 4 ch", lsm.width, lsm.height), Style::default().fg(Palette::VALUE)),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("  Lens Shading: ", Style::default().fg(Palette::LABEL)),
+                Span::styled("none", Style::default().fg(Palette::VALUE)),
+            ]));
+        }
         if info.active_width > 0 && info.active_height > 0 {
             lines.push(Line::from(vec![
                 Span::styled("  Active Area:  ", Style::default().fg(Palette::LABEL)),
@@ -2494,11 +2643,15 @@ fn render_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::styled("  Tab        Cycle focus: Media Pool -> Queue -> Export Settings", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  ↑/↓ or j/k Navigate lists (media pool, queue)", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  ←/→ or h/l Frame navigation / Export Settings value", Style::default().fg(Palette::VALUE))),
+        Line::from(Span::styled("  Home/End   Jump to first/last item in focused list", Style::default().fg(Palette::VALUE))),
+        Line::from(Span::styled("  PgUp/PgDn  Fast scroll 10 items", Style::default().fg(Palette::VALUE))),
+        Line::from(Span::styled("  Backspace  Navigate up in browser / Exit favourites", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  Click      Click panel or items to focus/select", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  Scroll     Scroll wheel navigates the hovered panel", Style::default().fg(Palette::VALUE))),
         Line::from(""),
         Line::from(Span::styled("  Media Pool", Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD))),
         Line::from(Span::styled("  Space      Toggle selection checkbox", Style::default().fg(Palette::VALUE))),
+        Line::from(Span::styled("  s          Toggle select all", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  a          Add selected to render queue", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  A          Add ALL to render queue", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  d          Remove current from media pool", Style::default().fg(Palette::VALUE))),
@@ -2508,6 +2661,7 @@ fn render_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::styled("  Space      Toggle selection in queue", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  v          Render selected items", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  R          Render ALL items (sequential batch)", Style::default().fg(Palette::VALUE))),
+        Line::from(Span::styled("  Ctrl+X     Cancel in-progress export", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  x          Clear completed/failed", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  d          Remove from queue", Style::default().fg(Palette::VALUE))),
         Line::from(""),
@@ -2516,6 +2670,7 @@ fn render_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::styled("  ↑/↓        Cycle between settings (focus)", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  ←/→        Change value of focused setting", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  c/g/t/r    Cycle codec/gamut/transfer/rate", Style::default().fg(Palette::VALUE))),
+        Line::from(Span::styled("  m/w        Cycle lens mode / black-white level mode", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  P          Open preset picker (apply saved preset)", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  p          Save current settings as preset", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  i          Edit custom rate (when export focused)", Style::default().fg(Palette::VALUE))),
@@ -2547,6 +2702,7 @@ fn render_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         Line::from(Span::styled("  General", Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD))),
         Line::from(Span::styled("  q          Quit", Style::default().fg(Palette::VALUE))),
+        Line::from(Span::styled("  Ctrl+C     Force quit", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  ?          Toggle this help", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  Esc        Close popup/browser/help -> Quit", Style::default().fg(Palette::VALUE))),
         Line::from(""),

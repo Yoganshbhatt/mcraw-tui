@@ -86,6 +86,9 @@ fn export_pipeline_emits_per_phase_stats() {
         "prores_ks".to_string(),
         RateControl::Lossless,
         None,
+        mcraw_tui::pipeline::LensCorrectionMode::Full,
+        mcraw_tui::pipeline::BlWlMode::Dynamic,
+        true,
     );
 
     let wall = start.elapsed();
@@ -113,4 +116,18 @@ fn export_pipeline_emits_per_phase_stats() {
     // Sanity: at least one phase recorded > 0 frames.
     let any_phase = report.phases.iter().any(|(_, p)| p.frames > 0);
     assert!(any_phase, "no phase recorded any frames");
+
+    // Highlight reconstruction (on by default) must have timed the
+    // `reconstruct` phase for every CPU-processed frame — the phase timer
+    // wraps the mask scan, which runs per frame when recovery is enabled.
+    // On the GPU path the reconstruction runs inside the shader; there is
+    // no CPU-side timer, so the phase must be empty (or absent).
+    let recon = report.phases.iter().find(|(n, _)| n == "reconstruct");
+    let recon_frames = recon.map(|(_, p)| p.frames);
+    let cpu_frames = report.total_frames - report.gpu_frames;
+    if cpu_frames > 0 {
+        assert_eq!(recon_frames, Some(cpu_frames), "reconstruct phase must time every CPU-processed frame");
+    } else {
+        assert!(recon_frames.is_none() || recon_frames == Some(0), "GPU path must not time a CPU reconstruct phase");
+    }
 }

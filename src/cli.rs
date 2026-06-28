@@ -19,12 +19,53 @@ pub enum CliCommands {
         /// Path to the .mcraw file
         #[arg(short, long)]
         file: Option<String>,
-        /// Export format: dng, prores, h264, hevc
+        /// Export format: dng, prores, dnxhr, h264, hevc, av1, vp9
         #[arg(short = 'F', long)]
         format: String,
         /// Output path or directory
         #[arg(short, long)]
         output: String,
+        /// Color space for export (e.g. "Rec.709", "ARRI Wide Gamut 4", "DaVinci Wide Gamut")
+        #[arg(long, default_value = "Rec.709")]
+        color_space: String,
+        /// Transfer function (e.g. "Rec.709", "ARRI LogC4", "S-Log3", "Gamma 2.4")
+        #[arg(long, default_value = "Rec.709")]
+        transfer_function: String,
+        /// ProRes profile: Proxy, LT, Standard, HQ, P4444, XQ4444
+        #[arg(long, default_value = "HQ")]
+        prores_profile: String,
+        /// DNxHR profile: SQ, HD, HDX, HQX, P444
+        #[arg(long, default_value = "HQX")]
+        dnxhr_profile: String,
+        /// HEVC profile ("Main 10 4:2:0", "Main 10 4:4:4")
+        #[arg(long, default_value = "Main 10 4:2:0")]
+        hevc_profile: String,
+        /// H.264 profile ("Main 8-bit", "High 10-bit")
+        #[arg(long, default_value = "Main 8-bit")]
+        h264_profile: String,
+        /// AV1 profile ("Profile 0 4:2:0 10-bit", "Profile 1 4:4:4 10-bit")
+        #[arg(long, default_value = "Profile 0 4:2:0 10-bit")]
+        av1_profile: String,
+        /// VP9 profile ("Profile 2 4:2:0 10-bit", "Profile 3 4:4:4 10-bit")
+        #[arg(long, default_value = "Profile 2 4:2:0 10-bit")]
+        vp9_profile: String,
+        /// Rate control: Lossless, High, Standard, Master400M, Standard150M, Custom:xxx
+        #[arg(long, default_value = "Lossless")]
+        rate_control: String,
+        /// Lens correction mode: off, full, color-only
+        #[arg(long, default_value = "full")]
+        lens_correction: String,
+        /// Black/white level mode: dynamic, static, 1023/64, 4095/256, 16383/1024, 65535/4096, 4095/64, 16383/64, 16383/0
+        #[arg(long, default_value = "dynamic")]
+        blwl: String,
+        /// Disable highlight reconstruction (raw-space clipped-channel
+        /// estimation). Off exists purely for A/B verification; the
+        /// reconstruction is the data-preserving default (HL-handling.md §3).
+        #[arg(long)]
+        no_highlight_recovery: bool,
+        /// Override output frame rate
+        #[arg(long)]
+        fps: Option<f64>,
     },
 }
 
@@ -73,7 +114,7 @@ impl Cli {
 
     /// Validate export format
     pub fn validate_export_format(format: &str) -> Result<(), String> {
-        let valid = ["dng", "prores", "h264", "hevc"];
+        let valid = ["dng", "prores", "dnxhr", "h264", "hevc", "av1", "vp9"];
         let lower = format.to_lowercase();
         if valid.contains(&lower.as_str()) {
             Ok(())
@@ -97,10 +138,17 @@ impl CliCommands {
             CliCommands::Info { file } => CliCommands::Info {
                 file: file.or(top_level_file),
             },
-            CliCommands::Export { file, format, output } => CliCommands::Export {
+            CliCommands::Export {
+                file, format, output, color_space, transfer_function,
+                prores_profile, dnxhr_profile, hevc_profile, h264_profile,
+                av1_profile, vp9_profile, rate_control,
+                lens_correction, blwl, no_highlight_recovery, fps,
+            } => CliCommands::Export {
                 file: file.or(top_level_file),
-                format,
-                output,
+                format, output, color_space, transfer_function,
+                prores_profile, dnxhr_profile, hevc_profile, h264_profile,
+                av1_profile, vp9_profile, rate_control,
+                lens_correction, blwl, no_highlight_recovery, fps,
             },
         }
     }

@@ -521,13 +521,58 @@ impl McrawFileInfo {
                     self.dynamic_white_level = first_frame_meta.dynamic_white_level;
                     tracing::debug!("dynamic_white_level from first frame: {:?}", self.dynamic_white_level);
                 }
+                // Fallback: if we still don't have a lens shading map (e.g. it was
+                // not in the JSON header or the container-metadata block was
+                // skipped because color_matrix was already populated), read it
+                // from the first frame's per-frame metadata.
+                if self.lens_shading_map.is_none() {
+                    if let Some(ref lsm) = first_frame_meta.lens_shading_map {
+                        self.lens_shading_map = Some(crate::decoder::LensShadingMap {
+                            channels: lsm.channels.clone(),
+                            width: lsm.width,
+                            height: lsm.height,
+                        });
+                        tracing::info!("lens_shading_map from first frame: {}x{}", lsm.width, lsm.height);
+                    }
+                }
             }
         }
     }
 
     pub fn enhance_with_decoder(&mut self) {
         if self.camera_metadata.color_matrix.is_some() {
-            tracing::debug!("enhance_with_decoder: metadata already populated, skipping decoder");
+            // Header already supplied color matrices, but the lens shading
+            // map may live ONLY in decoder metadata (burst IMAGE files keep
+            // it per-frame / in the container block, not the file header).
+            // Fill in just the missing map; touch nothing else.
+            if self.lens_shading_map.is_none() {
+                if let Ok(decoder) = crate::decoder::Decoder::new(&self.path) {
+                    let mut found = decoder
+                        .container_metadata()
+                        .ok()
+                        .and_then(|cm| cm.lens_shading_map);
+                    if found.is_none() {
+                        if let Ok(timestamps) = decoder.timestamps() {
+                            if let Some(&first) = timestamps.first() {
+                                found = decoder
+                                    .load_frame_metadata(first)
+                                    .ok()
+                                    .and_then(|m| m.lens_shading_map);
+                            }
+                        }
+                    }
+                    if let Some(lsm) = found {
+                        tracing::info!(
+                            "lens_shading_map from decoder despite populated header: {}x{}",
+                            lsm.width,
+                            lsm.height
+                        );
+                        self.lens_shading_map = Some(lsm);
+                    }
+                }
+            } else {
+                tracing::debug!("enhance_with_decoder: metadata already populated, skipping decoder");
+            }
             return;
         }
         let path = self.path.clone();

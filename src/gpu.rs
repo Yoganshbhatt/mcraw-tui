@@ -27,7 +27,15 @@ struct GpuUniforms {
     black_level: f32, white_level: f32, wb_r: f32, wb_b: f32,
     black_r: f32, black_g: f32, black_b: f32, _black_pad: f32,
     ccm_row0: [f32; 4], ccm_row1: [f32; 4], ccm_row2: [f32; 4],
-    phase_x: i32, phase_y: i32, _pad: [u32; 2],
+    phase_x: i32, phase_y: i32,
+    // Layout must match the WGSL Uniforms struct exactly (16-byte vec4
+    // alignment in WGSL vs. tight packing in Rust — a mismatch is a
+    // silent bind-group failure). Verified by `uniform_layout_test`:
+    // recon_enabled @104, recon_threshold @112, pin_thr @116,
+    // recon_luma @128.
+    recon_enabled: u32, _recon_pad: u32, recon_threshold: f32, pin_thr: f32,
+    _recon_pad3: [u32; 2],
+    recon_luma: [f32; 4],
 }
 
 fn transfer_to_gamma_mode(tf: &crate::color::TransferFunction) -> u32 {
@@ -108,7 +116,7 @@ impl RcdPipeline {
         Ok(pipeline)
     }
 
-    pub fn process(&mut self, bayer: &[u16], filters: u32, black_level: f32, white_level: f32, stride_width: u32, offset_x: u32, offset_y: u32, fused_ccm: &[f32; 9], as_shot_neutral: &[f32; 3], tf: &crate::color::TransferFunction) -> Result<Vec<u8>> {
+    pub fn process(&mut self, bayer: &[u16], filters: u32, black_r: f32, black_g: f32, black_b: f32, white_level: f32, stride_width: u32, offset_x: u32, offset_y: u32, fused_ccm: &[f32; 9], as_shot_neutral: &[f32; 3], tf: &crate::color::TransferFunction, recon_enabled: bool, recon_threshold: f32, pin_thr: f32, recon_luma: [f32; 3]) -> Result<Vec<u8>> {
         let device = &self.context.device; let queue = &self.context.queue;
         let mut ccm_row0 = [0.0f32; 4]; let mut ccm_row1 = [0.0f32; 4]; let mut ccm_row2 = [0.0f32; 4];
         ccm_row0[..3].copy_from_slice(&fused_ccm[0..3]); ccm_row1[..3].copy_from_slice(&fused_ccm[3..6]); ccm_row2[..3].copy_from_slice(&fused_ccm[6..9]);
@@ -122,17 +130,29 @@ impl RcdPipeline {
                 as_shot_neutral, raw_wb_r, raw_wb_b, wb_r, wb_b
             );
         }
-        // Per-channel black level. When the decoder supplies only one
-        // value, all four channels use that single black level.
-        let bl = black_level;
+        // Per-channel black levels, resolved host-side (per-frame dynamic /
+        // static per-channel values, or the single header value broadcast by
+        // the caller when the file carries no per-channel data). The scalar
+        // `black_level` uniform field has no WGSL consumer since per-channel
+        // normalize landed — kept for struct-layout stability (pinned test).
         let uniforms = GpuUniforms {
             width: self.width, height: self.height, filters, gamma_mode: transfer_to_gamma_mode(tf),
-            black_level: bl, white_level,
+            black_level: black_r, white_level,
             wb_r, wb_b,
-            black_r: bl, black_g: bl, black_b: bl, _black_pad: 0.0,
+            black_r, black_g, black_b, _black_pad: 0.0,
             ccm_row0, ccm_row1, ccm_row2,
-            phase_x: (offset_x & 1) as i32, phase_y: (offset_y & 1) as i32, _pad: [0u32; 2],
+            phase_x: (offset_x & 1) as i32, phase_y: (offset_y & 1) as i32,
+            recon_enabled: recon_enabled as u32, _recon_pad: 0,
+            recon_threshold, pin_thr, _recon_pad3: [0u32; 2],
+            recon_luma: [recon_luma[0], recon_luma[1], recon_luma[2], 0.0],
         };
+        tracing::info!(
+            "gpu recon: enabled={enabled} threshold={recon_threshold:.4} pin_thr={pin_thr:.1} luma=[{lr:.3},{lg:.3},{lb:.3}]",
+            enabled = recon_enabled,
+            lr = recon_luma[0],
+            lg = recon_luma[1],
+            lb = recon_luma[2]
+        );
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
         
         let bayer_bytes = bytemuck::cast_slice(bayer); let row_bytes = self.width as usize * 2;
@@ -230,5 +250,26 @@ impl RcdPipeline {
             wgpu::BindGroupEntry { binding: 5, resource: self.uniform_buffer.as_entire_binding() },
         ], label: None });
         Ok(())
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::GpuUniforms;
+    use std::mem::{offset_of, size_of};
+
+    /// The WGSL Uniforms struct layout contract (rcd_fill.wgsl). WGSL vec4
+    /// alignment is 16 bytes; Rust `[f32; 4]` packs at 4. A divergence here
+    /// is a SILENT bind-group failure (shader reads wrong offsets, e.g.
+    /// recon_enabled reads the `_pad` bytes) — no compile error, no wgpu
+    /// validation error, reconstruction quietly disabled. Pin it.
+    #[test]
+    fn uniform_layout_matches_wgsl() {
+        assert_eq!(size_of::<GpuUniforms>(), 144, "struct size must be 144 bytes (WGSL)");
+        assert_eq!(offset_of!(GpuUniforms, phase_x), 96);
+        assert_eq!(offset_of!(GpuUniforms, phase_y), 100);
+assert_eq!(offset_of!(GpuUniforms, recon_enabled), 104, "WGSL packs u32 right after phase_y");
+        assert_eq!(offset_of!(GpuUniforms, recon_threshold), 112);
+        assert_eq!(offset_of!(GpuUniforms, pin_thr), 116, "pin_thr replaces _recon_pad2 — layout must not shift");
+        assert_eq!(offset_of!(GpuUniforms, recon_luma), 128, "WGSL vec4 aligns to 16 (skip 120..128)");
     }
 }

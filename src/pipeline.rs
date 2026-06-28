@@ -1,7 +1,12 @@
 use crate::color::{
-    normalize_linear_f32, identity_ccm, mat_mul_vec3, mat_mul_3x3, camera_to_xyz_matrix, interpolate_matrix,
+    normalize_linear_per_channel, identity_ccm, mat_mul_vec3, mat_mul_3x3,
+    camera_to_xyz_matrix, interpolate_matrix,
     BilinearDemosaic, ColorSpace, TransferFunction, build_bradford_matrix, D65_XYZ,
-    forward_to_camera_xyz, detect_camera_to_xyz,
+    detect_camera_to_xyz,
+    compute_color_only_map,
+    apply_lens_correction_cpu_with_map,
+    clip_mask, raw_pin_mask, reconstruct_clipped, apply_display_rolloff, ReconstructParams,
+    luma_collapse_after_wb,
 };
 use crate::decoder::Decoder;
 use crate::encoder::VideoEncoder;
@@ -19,7 +24,62 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 const PIPELINE_DEPTH: usize = 3;
-struct FrameSlot { bayer: Vec<u16>, frame_bytes: Vec<u8>, as_shot_neutral: [f32; 3] }
+
+/// Black level / white level mode for normalization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlWlMode {
+    Dynamic,
+    Static,
+    Preset1023_64,
+    Preset4095_256,
+    Preset16383_1024,
+    Preset65535_4096,
+    Preset4095_64,
+    Preset16383_64,
+    Preset16383_0,
+}
+
+impl BlWlMode {
+    pub fn name(&self) -> &'static str {
+        match self {
+            BlWlMode::Dynamic => "Dynamic",
+            BlWlMode::Static => "Static",
+            BlWlMode::Preset1023_64 => "1023/64",
+            BlWlMode::Preset4095_256 => "4095/256",
+            BlWlMode::Preset16383_1024 => "16383/1024",
+            BlWlMode::Preset65535_4096 => "65535/4096",
+            BlWlMode::Preset4095_64 => "4095/64",
+            BlWlMode::Preset16383_64 => "16383/64",
+            BlWlMode::Preset16383_0 => "16383/0",
+        }
+    }
+}
+
+/// Lens correction mode for shading map correction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LensCorrectionMode {
+    Off,
+    Full,
+    ColorOnly,
+}
+
+impl LensCorrectionMode {
+    pub fn name(&self) -> &'static str {
+        match self {
+            LensCorrectionMode::Off => "Off",
+            LensCorrectionMode::Full => "Full",
+            LensCorrectionMode::ColorOnly => "Color Only",
+        }
+    }
+}
+
+struct FrameSlot {
+    bayer: Vec<u16>,
+    frame_bytes: Vec<u8>,
+    as_shot_neutral: [f32; 3],
+    dynamic_black_level: Option<[f32; 4]>,
+    dynamic_white_level: Option<f32>,
+}
 
 pub fn build_ffmpeg_codec_args(family: CodecFamily, hevc_encoder: &str, h264_encoder: &str, av1_encoder: &str, prores_encoder: &str, prores: ProResProfile, dnxhr: DnxhrProfile, hevc: HevcProfile, h264: H264Profile, av1: Av1Profile, vp9: Vp9Profile, rate_control: &RateControl, is_wide_gamut: bool) -> (String, String, Vec<String>) {
     family.to_ffmpeg_args(hevc_encoder, h264_encoder, av1_encoder, prores_encoder, prores, dnxhr, hevc, h264, av1, vp9, rate_control, is_wide_gamut)
@@ -87,11 +147,11 @@ pub fn run_naked(info: &McrawFileInfo, output_path: &str) -> Result<()> {
 pub fn run(info: &McrawFileInfo, output_path: &str) -> Result<()> {
     let never_cancel = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(PipelineStats::new());
-    run_export(info.clone(), output_path.to_string(), Arc::new(|_| {}), never_cancel, stats, ColorSpace::Rec709, TransferFunction::Rec709, CodecFamily::ProRes, ProResProfile::HQ, DnxhrProfile::HQX, HevcProfile::Main10_420, H264Profile::Main8bit, Av1Profile::Profile0_420_10bit, Vp9Profile::Profile2_420_10bit, "libx265".to_string(), "libx264".to_string(), "libaom-av1".to_string(), "prores_ks".to_string(), RateControl::Lossless, None)
+    run_export(info.clone(), output_path.to_string(), Arc::new(|_| {}), never_cancel, stats, ColorSpace::Rec709, TransferFunction::Rec709, CodecFamily::ProRes, ProResProfile::HQ, DnxhrProfile::HQX, HevcProfile::Main10_420, H264Profile::Main8bit, Av1Profile::Profile0_420_10bit, Vp9Profile::Profile2_420_10bit, "libx265".to_string(), "libx264".to_string(), "libaom-av1".to_string(), "prores_ks".to_string(), RateControl::Lossless, None, LensCorrectionMode::Full, BlWlMode::Dynamic, true)
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn Fn(f64) + Send + Sync>, cancelled: Arc<AtomicBool>, stats: Arc<PipelineStats>, export_cs: ColorSpace, export_tf: TransferFunction, codec_family: CodecFamily, prores_profile: ProResProfile, dnxhr_profile: DnxhrProfile, hevc_profile: HevcProfile, h264_profile: H264Profile, av1_profile: Av1Profile, vp9_profile: Vp9Profile, hevc_encoder: String, h264_encoder: String, av1_encoder: String, prores_encoder: String, rate_control: RateControl, custom_fps: Option<f64>) -> Result<()> {
+pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn Fn(f64) + Send + Sync>, cancelled: Arc<AtomicBool>, stats: Arc<PipelineStats>, export_cs: ColorSpace, export_tf: TransferFunction, codec_family: CodecFamily, prores_profile: ProResProfile, dnxhr_profile: DnxhrProfile, hevc_profile: HevcProfile, h264_profile: H264Profile, av1_profile: Av1Profile, vp9_profile: Vp9Profile, hevc_encoder: String, h264_encoder: String, av1_encoder: String, prores_encoder: String, rate_control: RateControl, custom_fps: Option<f64>, lens_mode: LensCorrectionMode, blwl_mode: BlWlMode, highlight_recovery: bool) -> Result<()> {
     tracing::info!("run_export: input={} output={} codec={} cs={} tf={}", info.path, output_path, codec_family.name(), export_cs.name(), export_tf.name());
     let setup_start = Instant::now();
     let decoder = Decoder::new(&info.path)?; let timestamps = decoder.timestamps()?;
@@ -203,7 +263,30 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
         fused[3], fused[4], fused[5],
         fused[6], fused[7], fused[8],
     );
-    let pattern = info.bayer_pattern; let black_level = info.black_level; let white_level = info.white_level; let total_frames = timestamps.len();
+    let pattern = info.bayer_pattern; let white_level = info.white_level; let total_frames = timestamps.len();
+    let bl_count = info.black_level_count;
+    let bl_per_ch = info.black_level_per_channel;
+    let bl_static_r = bl_per_ch[0];
+    let bl_static_g = if bl_count >= 4 { (bl_per_ch[1] + bl_per_ch[2]) / 2.0 } else { bl_per_ch[0] };
+    let bl_static_b = if bl_count >= 4 { bl_per_ch[3] } else { bl_per_ch[0] };
+
+    // Lens correction data (captured by processor closure).
+    // MOTION format files may not populate sensor_width/sensor_height
+    // (they come from legacy TLV blocks only), so fall back to the
+    // active frame dimensions when those values are zero.
+    let sensor_w = if info.sensor_width > 0 { info.sensor_width as u32 } else { info.width as u32 + info.active_offset_x as u32 };
+    let sensor_h = if info.sensor_height > 0 { info.sensor_height as u32 } else { info.height as u32 + info.active_offset_y as u32 };
+    // Try the info's shading map first, fall back to decoder's container metadata
+    let shading_map = info.lens_shading_map.clone().or_else(|| {
+        decoder.container_metadata().ok().and_then(|cm| cm.lens_shading_map)
+    });
+    if let Some(ref sm) = shading_map {
+        if lens_mode != LensCorrectionMode::Off {
+            tracing::info!("lens shading map found: {}x{}", sm.width, sm.height);
+        }
+    } else if lens_mode != LensCorrectionMode::Off {
+        tracing::warn!("lens correction enabled but no shading map found in file or decoder");
+    }
     let is_wide_gamut = export_cs != ColorSpace::Rec709 && export_cs != ColorSpace::Srgb;
     
     let (codec_name, pix_fmt, mut extra_args) = build_ffmpeg_codec_args(codec_family, &hevc_encoder, &h264_encoder, &av1_encoder, &prores_encoder, prores_profile, dnxhr_profile, hevc_profile, h264_profile, av1_profile, vp9_profile, &rate_control, is_wide_gamut);
@@ -221,13 +304,18 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
     let mut encoder = VideoEncoder::new(&output_path, active_width, active_height, fps, &codec_name, &pix_fmt, &extra_args, audio_temp_path.as_deref(), info.audio_sample_rate, info.audio_channels)?;
     let stride_pixels = stride_width as usize * info.height as usize; let pixel_count = (active_width * active_height) as usize; let bytes_per_frame = pixel_count * 6;
     let (free_tx, free_rx) = bounded::<FrameSlot>(PIPELINE_DEPTH); let (loaded_tx, loaded_rx) = bounded::<FrameSlot>(PIPELINE_DEPTH); let (processed_tx, processed_rx) = bounded::<FrameSlot>(PIPELINE_DEPTH);
-    for _ in 0..PIPELINE_DEPTH { free_tx.send(FrameSlot { bayer: vec![0u16; stride_pixels], frame_bytes: vec![0u8; bytes_per_frame], as_shot_neutral: [0.0; 3] })?; }
+    for _ in 0..PIPELINE_DEPTH { free_tx.send(FrameSlot { bayer: vec![0u16; stride_pixels], frame_bytes: vec![0u8; bytes_per_frame], as_shot_neutral: [0.0; 3], dynamic_black_level: None, dynamic_white_level: None })?; }
     let free_tx_writer = free_tx.clone();
     
     let filters = pattern.to_dcraw_filters(); let mut rcd_pipeline: Option<gpu::RcdPipeline> = None;
-    match pollster::block_on(gpu::GpuContext::new()) {
-        Ok(ctx) => { let ctx = std::sync::Arc::new(ctx); match gpu::RcdPipeline::new(ctx, active_width, active_height) { Ok(pipeline) => { rcd_pipeline = Some(pipeline); } Err(_) => {} } }
-        Err(_) => {}
+    // TEMP-DEBUG: force CPU path to bisect the collapse bug (revert before commit)
+    if std::env::var("MCRAW_FORCE_CPU").as_deref() == Ok("1") {
+        rcd_pipeline = None;
+    } else if let Ok(ctx) = pollster::block_on(gpu::GpuContext::new()) {
+        let ctx = std::sync::Arc::new(ctx);
+        if let Ok(pipeline) = gpu::RcdPipeline::new(ctx, active_width, active_height) {
+            rcd_pipeline = Some(pipeline);
+        }
     }
     stats.setup.record(setup_start.elapsed());
     
@@ -243,6 +331,10 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
                     decoder.load_frame_into(*ts, &mut slot.bayer)?
                 };
                 slot.as_shot_neutral = as_shot_neutral;
+                if let Ok(meta) = decoder.load_frame_metadata(*ts) {
+                    slot.dynamic_black_level = meta.dynamic_black_level;
+                    slot.dynamic_white_level = meta.dynamic_white_level;
+                }
                 // B4: hint the OS to prefetch the next frame's range.
                 if let Some(next_ts) = timestamps.get(i + 1) {
                     decoder.prefetch(*next_ts);
@@ -262,6 +354,18 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
         let stats = Arc::clone(&stats);
         move || -> Result<()> {
             let mut rgb = vec![0.0f32; pixel_count * 3]; let demosaic = BilinearDemosaic::new(pattern);
+
+            // Lens correction pre-setup (computed once, applied per-frame)
+            let (color_only_map, _lens_grid_w, _lens_grid_h) = match &shading_map {
+                Some(sm) if lens_mode == LensCorrectionMode::ColorOnly => {
+                    let cm = compute_color_only_map(&sm.channels, sm.width, sm.height);
+                    (Some(cm), sm.width, sm.height)
+                }
+                Some(sm) => (None, sm.width, sm.height),
+                None => (None, 0, 0),
+            };
+            let has_lens = !matches!(lens_mode, LensCorrectionMode::Off) && shading_map.is_some();
+
             for mut slot in loaded_rx {
                 if cancelled.load(Ordering::Relaxed) { break; }
                 stats.frames_total.fetch_add(1, Ordering::Relaxed);
@@ -317,10 +421,133 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
                     fused
                 };
 
+                // Resolve black/white levels from the selected BL/WL mode.
+                // These are the "src" values used by the lens correction formula
+                // (`(raw - src_bl) / (src_wl - src_bl)`), matching motioncam-fs.
+                let (src_bl_r, src_bl_g, src_bl_b, src_wl) = match blwl_mode {
+                    BlWlMode::Dynamic => {
+                        if let Some(dbl) = slot.dynamic_black_level {
+                            let g_bl = if dbl[1] > 0.0 && dbl[2] > 0.0 {
+                                (dbl[1] + dbl[2]) / 2.0
+                            } else {
+                                dbl[1].max(dbl[2])
+                            };
+                            let wl = slot.dynamic_white_level
+                                .map(|w| w as f64)
+                                .unwrap_or(white_level);
+                            (dbl[0] as f64, g_bl as f64, dbl[3] as f64, wl)
+                        } else {
+                            (bl_static_r, bl_static_g, bl_static_b, white_level)
+                        }
+                    }
+                    BlWlMode::Static => (bl_static_r, bl_static_g, bl_static_b, white_level),
+                    BlWlMode::Preset1023_64 => (64.0, 64.0, 64.0, 1023.0),
+                    BlWlMode::Preset4095_256 => (256.0, 256.0, 256.0, 4095.0),
+                    BlWlMode::Preset16383_1024 => (1024.0, 1024.0, 1024.0, 16383.0),
+                    BlWlMode::Preset65535_4096 => (4096.0, 4096.0, 4096.0, 65535.0),
+                    BlWlMode::Preset4095_64 => (64.0, 64.0, 64.0, 4095.0),
+                    BlWlMode::Preset16383_64 => (64.0, 64.0, 64.0, 16383.0),
+                    BlWlMode::Preset16383_0 => (0.0, 0.0, 0.0, 16383.0),
+                };
+
+                // Compute extended white level and normalization black/white.
+                // When lens correction is active we follow motioncam-fs:
+                //   - Output range is extended by +2 bits for headroom
+                //   - Black level becomes 0 (already subtracted in correction)
+                let (norm_bl_r, norm_bl_g, norm_bl_b, norm_wl) = if has_lens {
+                    let bits = (u16::BITS - (src_wl as u16).leading_zeros()).max(1);
+                    let ext = ((1u64 << (bits + 2).min(16)) - 1) as f64;
+                    (0.0, 0.0, 0.0, ext)
+                } else {
+                    (src_bl_r, src_bl_g, src_bl_b, src_wl)
+                };
+
+                // Highlight-reconstruction clip threshold, in the *normalized*
+                // space produced by `normalize_linear_per_channel`. The sensor
+                // clip ceiling is the min of the per-frame dynamic WL (the
+                // true well reading) and the selected src WL. The 0.99 factor
+                // pre-triggers on near-ceiling pixels (real sensors compress
+                // slightly below the nominal ceiling, and sensor noise is
+                // several raw levels wide — a razor-thin margin at 0.995
+                // splits one highlight population across the mask boundary,
+                // leaving half neutralized and half pink). With lens
+                // correction the normalization range is extended (+2 bits),
+                // so the threshold lands at ~0.25 — never reference the
+                // extended WL as a clip point: it is not a sensor ceiling.
+                //
+                // The threshold is computed unconditionally: reconstruction is
+                // gated by `highlight_recovery`, but the clipped-pair neutral
+                // collapse (always-on anti-magenta guarantee, HL-handling.md
+                // §3.2) needs the same mask in BOTH export states.
+                //
+                // `pin_thr_raw` is the COLLAPSE-GATE threshold — flat raw CFA
+                // units (0.99 × clip_raw), deliberately decoupled from
+                // recon_threshold: physically pinned sensor data, and nothing
+                // else, trips the neutral collapse. Sub-threshold photosites
+                // (e.g. 0.983×WL) are real data — WB + CCM push them to
+                // wide-gamut colors legitimately and they must pass through
+                // untouched (user-mandated no-pre-trigger rule).
+                let clip_raw = slot
+                    .dynamic_white_level
+                    .map(|w| w as f64)
+                    .filter(|w| *w > 0.0)
+                    .unwrap_or(src_wl)
+                    .min(src_wl);
+                let pin_thr_raw = 0.99 * clip_raw;
+                let recon_threshold = {
+                    (0.99 * (clip_raw - norm_bl_r) / (norm_wl - norm_bl_r)).clamp(0.0, 1.0) as f32
+                };
+                // Lens-trap invariant: the clip ceiling is ALWAYS the
+                // un-extended sensor ceiling (min(dyn_wl, src_wl)), never the
+                // lens-extended norm_wl (+2 bits). Otherwise recon silently
+                // never fires on the lens path.
+                debug_assert!(clip_raw <= src_wl + 1e-6, "clip_raw must be un-extended");
+                debug_assert!(pin_thr_raw <= clip_raw + 1e-6, "pin threshold above ceiling");
+                debug_assert!((0.0..=1.0).contains(&recon_threshold), "recon threshold range");
+
+                // Lens correction: apply before both GPU and CPU paths to
+                // ensure corrected bayer data is used regardless of backend.
+                if has_lens {
+                    if let Some(ref sm) = shading_map {
+                        let channels = if lens_mode == LensCorrectionMode::ColorOnly {
+                            color_only_map.as_ref().unwrap()
+                        } else {
+                            &sm.channels
+                        };
+                        let _g = PhaseGuard::new(&stats.lens_correction);
+                        apply_lens_correction_cpu_with_map(
+                            &mut slot.bayer, stride_width,
+                            offset_x, offset_y, pattern,
+                            channels, sm.width, sm.height,
+                            sensor_w, sensor_h,
+                            [src_bl_r as f32, src_bl_g as f32, src_bl_g as f32, src_bl_b as f32],
+                            src_wl as f32,
+                            norm_wl as u16,
+                        );
+                    }
+                }
+
+                // GPU gets the same per-channel blacks the CPU normalizes
+                // with (norm_bl_*): 0 when lens correction already
+                // subtracted them, else the resolved src blacks. The WGSL
+                // normalize divides each plane by its own per-channel range,
+                // matching `normalize_linear_per_channel` exactly.
+                let (gpu_bl_r, gpu_bl_g, gpu_bl_b) = if has_lens {
+                    (0.0f32, 0.0f32, 0.0f32)
+                } else {
+                    (src_bl_r as f32, src_bl_g as f32, src_bl_b as f32)
+                };
+                let gpu_wl = if has_lens { norm_wl as f32 } else { white_level as f32 };
+                let lc = export_cs.luma_coefficients();
+                let fused_luma = [
+                    lc[0] * fused[0] + lc[1] * fused[3] + lc[2] * fused[6],
+                    lc[0] * fused[1] + lc[1] * fused[4] + lc[2] * fused[7],
+                    lc[0] * fused[2] + lc[1] * fused[5] + lc[2] * fused[8],
+                ];
                 let gpu_ok = if let Some(ref mut pipeline) = rcd_pipeline {
                     let gpu_result = {
                         let _g = PhaseGuard::new(&stats.gpu);
-                        pipeline.process(&slot.bayer, filters, black_level as f32, white_level as f32, stride_width, offset_x, offset_y, &fused, &slot.as_shot_neutral, &export_tf)
+                        pipeline.process(&slot.bayer, filters, gpu_bl_r, gpu_bl_g, gpu_bl_b, gpu_wl, stride_width, offset_x, offset_y, &fused, &slot.as_shot_neutral, &export_tf, highlight_recovery, recon_threshold, pin_thr_raw as f32, fused_luma)
                     };
                     match gpu_result {
                         Ok(rgb48le) => {
@@ -338,7 +565,7 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
                     }
                     {
                         let _g = PhaseGuard::new(&stats.normalize);
-                        normalize_linear_f32(&mut rgb, black_level as f32, white_level as f32);
+                        normalize_linear_per_channel(&mut rgb, norm_bl_r, norm_bl_g, norm_bl_b, norm_wl);
                     }
 
                     let raw_r_gain = if as_shot[0] > 1e-6 && as_shot[1] > 1e-6 { as_shot[1] / as_shot[0] } else { 1.0 };
@@ -352,71 +579,106 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
                             as_shot, raw_r_gain, raw_b_gain, r_gain, b_gain
                         );
                     }
+                    // Highlight reconstruction: raw-space (pre-WB, pre-CCM)
+                    // estimate of clipped channels from healthy neighbors
+                    // (HL-handling.md §3). Clean pixels are never touched.
+                    // The collapsed-pair neutral gate below NO LONGER reads
+                    // a demosaiced-plane mask — it reads RAW sensor truth:
+                    // the pre-demosaic 2×2-block pin registry built by
+                    // raw_pin_mask() (user-approved design). Demosaic
+                    // interpolation (bilinear/RCD) can average pinned
+                    // photosites beneath the mask threshold (the GPU magenta
+                    // residual); the raw CFA cannot lie. Pixels with ≥ 2
+                    // pinned channels carry no hue info and render
+                    // luma-neutral, never magenta (§3.2, deviation D9).
+                    // Pixels whose block carries no pin keep their recorded
+                    // color — scene-referred, no pre-trigger.
+                    let mut collapse_mask: Option<Vec<u8>> = None;
+                    if highlight_recovery && recon_threshold > 0.0 {
+                        let _g = PhaseGuard::new(&stats.reconstruct);
+                        let (mask, clipped) = clip_mask(&rgb, recon_threshold);
+                        if clipped > 0 {
+                            tracing::info!(
+                                "hl-recon cpu: threshold={recon_threshold:.4} clipped={clipped}/{} pixels",
+                                rgb.len() / 3
+                            );
+                            let params = ReconstructParams {
+                                r_gain,
+                                b_gain,
+                                fused_luma: Some(fused_luma),
+                            };
+                            reconstruct_clipped(&mut rgb, active_width, active_height, &mask, &params);
+                        }
+                    }
+                    if pin_thr_raw > 0.0 {
+                        let mask = raw_pin_mask(
+                            &slot.bayer,
+                            stride_width as usize,
+                            offset_x as usize,
+                            offset_y as usize,
+                            active_width as usize,
+                            active_height as usize,
+                            pattern,
+                            pin_thr_raw,
+                        );
+                        let collapsed = mask
+                            .par_iter()
+                            .filter(|m| m.count_ones() >= 2)
+                            .count();
+                        tracing::info!(
+                            "hl-collapse cpu: pin_thr_raw={pin_thr_raw:.1} collapsed={collapsed}/{} pixels (raw-truth gate, neutral, never magenta)",
+                            rgb.len() / 3
+                        );
+                        collapse_mask = Some(mask);
+                    }
                     {
                         let _g = PhaseGuard::new(&stats.wb_hl_ccm);
-                        let is_display_referred = matches!(export_tf,
-                            TransferFunction::Rec709
-                            | TransferFunction::Gamma24
-                            | TransferFunction::Linear
-                        );
-                        rgb.par_chunks_exact_mut(3).for_each(|chunk| {
+                        let collapse = collapse_mask.as_deref();
+                        rgb.par_chunks_exact_mut(3).enumerate().for_each(|(px, chunk)| {
                             // 1. Apply WB
                             let r = chunk[0] * r_gain;
                             let g = chunk[1];
                             let b = chunk[2] * b_gain;
+                            let mut wb = [r, g, b];
 
-                            if is_display_referred {
-                                // 2. Highlight reconstruction — desaturate toward
-                                //    neutral when the pixel is blown. Prevents
-                                //    magenta-shifted highlights when a single
-                                //    channel clips (common with speculars).
-                                let max_val = r.max(g).max(b);
-                                let neutral = max_val.min(1.0);
-                                let t = if max_val > 0.95_f32 { ((max_val - 0.95) / 0.05).min(1.0) } else { 0.0 };
-                                let (r, g, b) = if t > 0.0 {
-                                    (r + (neutral - r) * t, g + (neutral - g) * t, b + (neutral - b) * t)
-                                } else {
-                                    (r, g, b)
-                                };
-
-                                // 3. Apply CCM
-                                let out = mat_mul_vec3(&fused, &[r, g, b]);
-                                chunk[0] = out[0].max(0.0); chunk[1] = out[1].max(0.0); chunk[2] = out[2].max(0.0);
-                            } else {
-                                // 2. Log curve path: skip highlight reconstruction.
-                                //    Log OETFs encode 4-100× of dynamic range and
-                                //    naturally handle values above 1.0. No
-                                //    reconstruction needed — clamping would
-                                //    destroy highlight detail.
-                                // 3. Apply CCM
-                                let out = mat_mul_vec3(&fused, &[r, g, b]);
-                                let mut r_ccm = out[0].max(0.0);
-                                let mut g_ccm = out[1].max(0.0);
-                                let mut b_ccm = out[2].max(0.0);
-
-                                // Gamut soft-clip: desaturate extreme out-of-gamut
-                                // values (>1.0) toward luminance. Prevents "wild
-                                // highlight peaks" from wide-gamut matrices
-                                // (DWG, CanonCG, SG3C) while preserving in-gamut
-                                // colorimetry perfectly.
-                                let max_val = r_ccm.max(g_ccm.max(b_ccm));
-                                if max_val > 1.0 {
-                                    let lum = 0.2126_f32 * r_ccm + 0.7152_f32 * g_ccm + 0.0722_f32 * b_ccm;
-                                    let lum = lum.min(max_val).max(0.0);
-                                    let t = ((max_val - 1.0) * 1.0).min(1.0);
-                                    r_ccm += (lum - r_ccm) * t;
-                                    g_ccm += (lum - g_ccm) * t;
-                                    b_ccm += (lum - b_ccm) * t;
+                            // 1b. Clipped-pair neutral collapse: ≥ 2 channels
+                            // at the sensor ceiling → replace the WB'd triple
+                            // with its fused-luma neutral (brightness kept,
+                            // no hue invented). Bit-exact for every pixel
+                            // with < 2 clipped channels.
+                            if let Some(cmask) = collapse {
+                                let m = cmask[px];
+                                if m.count_ones() >= 2 {
+                                    luma_collapse_after_wb(&mut wb, m, fused_luma);
+                                } else if m == 0b010 {
+                                    // G-pinned single clip (G is the WB anchor,
+                                    // gain 1.0): the WB'd R/B overshoot the
+                                    // pinned G and the CCM's negative
+                                    // secondaries flip the ratio magenta. Cap
+                                    // the unclipped channels at the WB'd
+                                    // pinned G — brightness from the measured
+                                    // anchor, no hue invented (D10).
+                                    wb[0] = wb[0].min(wb[1]);
+                                    wb[2] = wb[2].min(wb[1]);
                                 }
-
-                                chunk[0] = r_ccm;
-                                chunk[1] = g_ccm;
-                                chunk[2] = b_ccm;
                             }
+
+                            // 2. Apply CCM
+                            let out = mat_mul_vec3(&fused, &wb);
+                            chunk[0] = out[0].max(0.0);
+                            chunk[1] = out[1].max(0.0);
+                            chunk[2] = out[2].max(0.0);
                         });
                     }
                     {
                         let _g = PhaseGuard::new(&stats.oetf);
+                        // Hue-preserving display rolloff for display-referred
+                        // curves only (HL-handling.md §4): identity below 1.0,
+                        // uniform scalar compression above — R:G:B ratios are
+                        // invariant. Scene-referred/log exports get no rolloff.
+                        if export_tf.is_display_referred() {
+                            apply_display_rolloff(&mut rgb);
+                        }
                         export_tf.process(&mut rgb);
                     }
 
@@ -424,7 +686,7 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
                         let _g = PhaseGuard::new(&stats.pack);
                         slot.frame_bytes.par_chunks_exact_mut(6).enumerate().for_each(|(pi, out)| {
                             let base = pi * 3;
-                            let ru = (rgb[base].clamp(0.0, 1.0) * 65535.0) as u16; let gu = (rgb[base + 1].clamp(0.0, 1.0) * 65535.0) as u16; let bu = (rgb[base + 2].clamp(0.0, 1.0) * 65535.0) as u16;
+                            let ru = (rgb[base].max(0.0) * 65535.0).min(65535.0) as u16; let gu = (rgb[base + 1].max(0.0) * 65535.0).min(65535.0) as u16; let bu = (rgb[base + 2].max(0.0) * 65535.0).min(65535.0) as u16;
                             out[0] = ru as u8; out[1] = (ru >> 8) as u8; out[2] = gu as u8; out[3] = (gu >> 8) as u8; out[4] = bu as u8; out[5] = (bu >> 8) as u8;
                         });
                     }
