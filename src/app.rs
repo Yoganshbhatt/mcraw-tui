@@ -21,6 +21,7 @@ use crate::export::{
     ProResProfile, RateControl, Vp9Profile,
 };
 use crate::hardware::probe_hardware;
+use crate::pipeline::{LensCorrectionMode, BlWlMode};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use crate::decoder::Decoder;
@@ -259,6 +260,10 @@ pub enum ExportEvent {
 /// Snapshot of the most recently finished export. Kept so the UI can show a
 /// post-render summary (codec, settings, elapsed time, output path, etc.)
 /// instead of immediately reverting to the preview panel.
+///
+/// When `batch_total > 1` the summary represents an aggregate of all items
+/// in a batch, with the per-item fields showing the **last** file that was
+/// rendered so the user still has a specific reference.
 #[derive(Debug, Clone)]
 pub struct ExportSummary {
     pub output_path: String,
@@ -270,6 +275,27 @@ pub struct ExportSummary {
     pub frame_count: usize,
     pub elapsed: Duration,
     pub result: Result<(), String>,
+    // Batch aggregation fields (batch_total = 0 for single-item exports)
+    pub batch_total: usize,
+    pub batch_completed: usize,
+    pub batch_failed: usize,
+    pub batch_total_frames: usize,
+    pub batch_total_elapsed: Duration,
+    pub batch_errors: Vec<String>,
+}
+
+/// Tracks per-item results across a batch of exports so the final summary
+/// shows aggregate stats (total frames, time, success count) instead of
+/// only the last file's data.
+#[derive(Debug, Clone, Default)]
+pub struct BatchAccumulator {
+    pub total_items: usize,
+    pub completed_count: usize,
+    pub failed_count: usize,
+    pub total_frames: usize,
+    pub total_elapsed: Duration,
+    pub errors: Vec<String>,
+    pub last_item_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -352,6 +378,10 @@ pub struct App {
     /// export-settings panel to different values.
     pub pending_export_summary: Option<ExportSummary>,
 
+    /// Aggregate accumulator for sequential batch renders. Reset at the
+    /// start of each batch and updated on every `poll_export` Done event.
+    pub batch_accum: BatchAccumulator,
+
     // Which queue item is currently being rendered (for sequential batch)
     pub current_rendering_index: Option<usize>,
 
@@ -377,6 +407,8 @@ pub struct App {
     pub export_focus: ExportFocus,
     pub export_fps: Option<f64>,
     pub export_start_time: Option<Instant>,
+    pub lens_correction_mode: Cell<LensCorrectionMode>,
+    pub blwl_mode: Cell<BlWlMode>,
 
     // Sticky per-codec profiles
     pub prores_profile: ProResProfile,
@@ -442,6 +474,9 @@ pub struct App {
 
     // Persistent ListState offset for the favourites list view
     pub favourites_scroll_offset: Cell<usize>,
+
+    // Selection index for the favourites list view (separate from scroll offset)
+    pub favourites_selected_index: Cell<usize>,
 
     // Timestamp + index of last clicked favourite (for d-key removal)
     pub last_clicked_favourite: Option<(Instant, usize)>,
@@ -556,6 +591,8 @@ pub enum ExportFocus {
     Profile,
     RateControl,
     Fps,
+    LensMode,
+    BlWlMode,
 }
 
 impl App {
@@ -611,6 +648,7 @@ impl App {
             cancel_token: None,
             last_export_summary: None,
             pending_export_summary: None,
+            batch_accum: BatchAccumulator::default(),
 
             export_color_space: ColorSpace::Rec709,
             export_transfer_function: TransferFunction::Gamma24,
@@ -618,6 +656,8 @@ impl App {
             export_focus: ExportFocus::CodecFamily,
             export_fps: None,
             export_start_time: None,
+            lens_correction_mode: Cell::new(LensCorrectionMode::Full),
+            blwl_mode: Cell::new(BlWlMode::Dynamic),
 
             prores_profile: ProResProfile::HQ,
             dnxhr_profile: DnxhrProfile::HQX,
@@ -655,6 +695,7 @@ impl App {
             last_clicked_favourite: None,
             browsing_favourites: false,
             favourites_scroll_offset: Cell::new(0),
+            favourites_selected_index: Cell::new(0),
             presets: ExportPreset::load_all(),
             active_preset: None,
             preset_picker: PresetPickerState::default(),
@@ -1490,9 +1531,11 @@ impl App {
             self.status_message = "No items selected in queue - use Space to select".to_string();
             return;
         }
-        self.status_message = format!("Starting render of {} selected file(s)...", selected_indices.len());
+        let batch_total = selected_indices.len();
+        self.status_message = format!("Starting render of {} selected file(s)...", batch_total);
         // Start the first one
         if let Some(&first_idx) = selected_indices.first() {
+            self.batch_accum = BatchAccumulator { total_items: batch_total, ..Default::default() };
             self.current_rendering_index = Some(first_idx);
             let q = &self.queue[first_idx];
             self.file_info = Some(q.info.clone());
@@ -1507,10 +1550,12 @@ impl App {
             self.status_message = "Queue is empty".to_string();
             return;
         }
-        self.status_message = format!("Starting render of all {} file(s)...", self.queue.len());
+        let batch_total = self.queue.len();
+        self.status_message = format!("Starting render of all {} file(s)...", batch_total);
         for q in &mut self.queue {
             q.selected = true;
         }
+        self.batch_accum = BatchAccumulator { total_items: batch_total, ..Default::default() };
         // Start from the first item
         self.current_rendering_index = Some(0);
         if let Some(q) = self.queue.first() {
@@ -1604,6 +1649,45 @@ impl App {
         };
         self.export_focus = ExportFocus::Fps;
         self.status_message = format!("FPS: {}", Self::fps_label(self.export_fps));
+    }
+
+    pub fn cycle_lens_mode(&mut self, forward: bool) {
+        let cur = self.lens_correction_mode.get();
+        let next = match (cur, forward) {
+            (LensCorrectionMode::Off, true) => LensCorrectionMode::Full,
+            (LensCorrectionMode::Full, true) => LensCorrectionMode::ColorOnly,
+            (LensCorrectionMode::ColorOnly, true) => LensCorrectionMode::Off,
+            (LensCorrectionMode::Off, false) => LensCorrectionMode::ColorOnly,
+            (LensCorrectionMode::ColorOnly, false) => LensCorrectionMode::Full,
+            (LensCorrectionMode::Full, false) => LensCorrectionMode::Off,
+        };
+        self.lens_correction_mode.set(next);
+        self.export_focus = ExportFocus::LensMode;
+        self.status_message = format!("Lens: {}", next.name());
+    }
+
+    pub fn cycle_blwl(&mut self, forward: bool) {
+        const ALL: &[BlWlMode] = &[
+            BlWlMode::Dynamic,
+            BlWlMode::Static,
+            BlWlMode::Preset1023_64,
+            BlWlMode::Preset4095_256,
+            BlWlMode::Preset16383_1024,
+            BlWlMode::Preset65535_4096,
+            BlWlMode::Preset4095_64,
+            BlWlMode::Preset16383_64,
+            BlWlMode::Preset16383_0,
+        ];
+        let cur = self.blwl_mode.get();
+        let pos = ALL.iter().position(|m| *m == cur).unwrap_or(0);
+        let next = if forward {
+            ALL[(pos + 1) % ALL.len()]
+        } else {
+            ALL[(pos + ALL.len() - 1) % ALL.len()]
+        };
+        self.blwl_mode.set(next);
+        self.export_focus = ExportFocus::BlWlMode;
+        self.status_message = format!("BL/WL: {}", next.name());
     }
 
     pub fn cycle_codec(&mut self, forward: bool) {
@@ -1711,10 +1795,6 @@ impl App {
         self.export_cancelled = false;
         self.export_progress = 0.0;
         self.export_start_time = Some(Instant::now());
-        // Starting a fresh export — drop any previous summary so the UI
-        // switches from the post-render panel back to the live progress
-        // panel.
-        self.last_export_summary = None;
         // Capture the settings that this export was launched with so the
         // summary stays accurate even if the user cycles the export-settings
         // panel mid-render.
@@ -1728,6 +1808,12 @@ impl App {
             frame_count: info.frame_count as usize,
             elapsed: Duration::default(),
             result: Ok(()),
+            batch_total: 0,
+            batch_completed: 0,
+            batch_failed: 0,
+            batch_total_frames: 0,
+            batch_total_elapsed: Duration::default(),
+            batch_errors: Vec::new(),
         });
         // Mark queue item as Rendering
         if let Some(idx) = self.current_rendering_index {
@@ -1754,6 +1840,8 @@ impl App {
 
         let rate_control = self.active_rate_control.clone();
         let custom_fps = self.export_fps;
+        let lens_mode = self.lens_correction_mode.get();
+        let blwl_mode = self.blwl_mode.get();
         let stats = Arc::new(PipelineStats::new());
         let stats_for_event = Arc::clone(&stats);
 
@@ -1763,7 +1851,7 @@ impl App {
                     info, output_path, progress_cb, cancel_flag, stats,
                     cs, tf, cf, pp, dp, hp, h4p, ap, vp,
                     hevc_enc, h264_enc, av1_enc, prores_enc,
-                    rate_control, custom_fps,
+                    rate_control, custom_fps, lens_mode, blwl_mode,
                 )
             }));
             // Always emit stats before Done so the UI can persist them,
@@ -2043,6 +2131,29 @@ impl App {
                                 Err(e) => Err(e.to_string()),
                             }
                         };
+                        // Accumulate batch stats
+                        let item_name = summary.output_path
+                            .split(std::path::MAIN_SEPARATOR)
+                            .last()
+                            .unwrap_or(&summary.output_path)
+                            .to_string();
+                        self.batch_accum.completed_count += 1;
+                        self.batch_accum.total_frames += summary.frame_count;
+                        self.batch_accum.total_elapsed += elapsed;
+                        self.batch_accum.last_item_name = item_name;
+                        if summary.result.is_err() {
+                            self.batch_accum.failed_count += 1;
+                            if let Err(ref msg) = summary.result {
+                                self.batch_accum.errors.push(msg.clone());
+                            }
+                        }
+                        // Fill batch aggregation fields from accumulator
+                        summary.batch_total = self.batch_accum.total_items;
+                        summary.batch_completed = self.batch_accum.completed_count;
+                        summary.batch_failed = self.batch_accum.failed_count;
+                        summary.batch_total_frames = self.batch_accum.total_frames;
+                        summary.batch_total_elapsed = self.batch_accum.total_elapsed;
+                        summary.batch_errors = self.batch_accum.errors.clone();
                         self.last_export_summary = Some(summary);
                     }
                     if self.export_cancelled {
@@ -2166,15 +2277,15 @@ impl App {
         if self.favourite_folders.is_empty() {
             return;
         }
-        let cur = self.favourites_scroll_offset.get() as i64;
+        let cur = self.favourites_selected_index.get() as i64;
         let max = (self.favourite_folders.len() as i64) - 1;
         let next = (cur + delta).clamp(0, max);
-        self.favourites_scroll_offset.set(next as usize);
+        self.favourites_selected_index.set(next as usize);
     }
 
     /// Navigate into the favourite at the current cursor position.
     pub fn open_selected_favourite(&mut self) {
-        let idx = self.favourites_scroll_offset.get();
+        let idx = self.favourites_selected_index.get();
         if let Some(path) = self.favourite_folders.get(idx).cloned() {
             self.status_message = format!("Navigated to favourite: {}", path.display());
             self.browser = FileBrowser::from_path(path);
@@ -2186,15 +2297,15 @@ impl App {
 
     /// Delete the favourite at the current cursor position.
     pub fn delete_selected_favourite(&mut self) {
-        let idx = self.favourites_scroll_offset.get();
+        let idx = self.favourites_selected_index.get();
         if idx < self.favourite_folders.len() {
             let name = self.favourite_folders[idx].display().to_string();
             self.favourite_folders.remove(idx);
             self.save_favourites();
             if self.favourite_folders.is_empty() {
                 self.browsing_favourites = false;
-            } else if self.favourites_scroll_offset.get() >= self.favourite_folders.len() {
-                self.favourites_scroll_offset.set(self.favourite_folders.len() - 1);
+            } else if self.favourites_selected_index.get() >= self.favourite_folders.len() {
+                self.favourites_selected_index.set(self.favourite_folders.len() - 1);
             }
             self.status_message = format!("Removed favourite: {}", name);
         }
@@ -2318,6 +2429,17 @@ fn execute_click_action(app: &mut App, action: ClickAction) {
             app.set_focus(FocusTarget::ExportSettings);
             app.export_focus = ExportFocus::RateControl;
             app.cycle_rate_control();
+            return;
+        }
+        ClickAction::CycleLensMode => {
+            app.set_focus(FocusTarget::ExportSettings);
+            app.cycle_lens_mode(true);
+            return;
+        }
+        ClickAction::CycleBlWlMode => {
+            app.set_focus(FocusTarget::ExportSettings);
+            app.cycle_blwl(true);
+            return;
         }
         ClickAction::CycleFps => {
             app.set_focus(FocusTarget::ExportSettings);
@@ -3041,6 +3163,8 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                                         app.status_message = format!("Rate: {}", app.active_rate_control.name());
                                     }
                                     ExportFocus::Fps => app.cycle_export_fps(),
+                                    ExportFocus::LensMode => app.cycle_lens_mode(false),
+                                    ExportFocus::BlWlMode => app.cycle_blwl(false),
                                 }
                             }
                             FocusTarget::Grade => {
@@ -3088,6 +3212,8 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                                     ExportFocus::Profile => app.cycle_profile(true),
                                     ExportFocus::RateControl => app.cycle_rate_control(),
                                     ExportFocus::Fps => app.cycle_export_fps(),
+                                    ExportFocus::LensMode => app.cycle_lens_mode(true),
+                                    ExportFocus::BlWlMode => app.cycle_blwl(true),
                                 }
                             }
                             FocusTarget::Grade => {
@@ -3487,10 +3613,21 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                             } else {
                                 app.browsing_favourites = true;
                                 app.favourites_scroll_offset = Cell::new(0);
+                                app.favourites_selected_index = Cell::new(0);
                                 app.status_message = "Favourites view (press [f] or [Esc] to return)".to_string();
                             }
                         } else if app.focus_target == FocusTarget::ExportSettings {
                             app.cycle_export_fps();
+                        }
+                    }
+                    'm' => {
+                        if app.focus_target == FocusTarget::ExportSettings {
+                            app.cycle_lens_mode(true);
+                        }
+                    }
+                    'w' => {
+                        if app.focus_target == FocusTarget::ExportSettings {
+                            app.cycle_blwl(true);
                         }
                     }
                     'F' => {
@@ -3668,6 +3805,8 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                             ExportFocus::Profile => app.cycle_profile(true),
                             ExportFocus::RateControl => app.cycle_rate_control(),
                             ExportFocus::Fps => app.cycle_export_fps(),
+                            ExportFocus::LensMode => app.cycle_lens_mode(true),
+                            ExportFocus::BlWlMode => app.cycle_blwl(true),
                         }
                     } else if !app.timestamps.is_empty() {
                         let next = (app.frame_index + 1).min(app.timestamps.len() - 1);
@@ -3706,6 +3845,8 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                                 app.status_message = format!("Rate: {}", app.active_rate_control.name());
                             }
                             ExportFocus::Fps => app.cycle_export_fps(),
+                            ExportFocus::LensMode => app.cycle_lens_mode(false),
+                            ExportFocus::BlWlMode => app.cycle_blwl(false),
                         }
                     } else if !app.timestamps.is_empty() {
                         let prev = app.frame_index.saturating_sub(1);
@@ -3757,7 +3898,9 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                             FocusTarget::ExportSettings => {
                                 let show_rate = !matches!(app.export_codec_family, crate::export::CodecFamily::ProRes | crate::export::CodecFamily::DNxHR);
                                 app.export_focus = match app.export_focus {
-                                    ExportFocus::CodecFamily => if show_rate { ExportFocus::RateControl } else { ExportFocus::Fps },
+                                    ExportFocus::CodecFamily => ExportFocus::BlWlMode,
+                                    ExportFocus::BlWlMode => ExportFocus::LensMode,
+                                    ExportFocus::LensMode => if show_rate { ExportFocus::RateControl } else { ExportFocus::Fps },
                                     ExportFocus::RateControl => ExportFocus::Fps,
                                     ExportFocus::Fps => ExportFocus::Profile,
                                     ExportFocus::Profile => ExportFocus::TransferFunction,
@@ -3802,8 +3945,10 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                                     ExportFocus::ColorSpace => ExportFocus::TransferFunction,
                                     ExportFocus::TransferFunction => ExportFocus::Profile,
                                     ExportFocus::Profile => ExportFocus::Fps,
-                                    ExportFocus::Fps => if show_rate { ExportFocus::RateControl } else { ExportFocus::CodecFamily },
-                                    ExportFocus::RateControl => ExportFocus::CodecFamily,
+                                    ExportFocus::Fps => if show_rate { ExportFocus::RateControl } else { ExportFocus::LensMode },
+                                    ExportFocus::RateControl => ExportFocus::LensMode,
+                                    ExportFocus::LensMode => ExportFocus::BlWlMode,
+                                    ExportFocus::BlWlMode => ExportFocus::CodecFamily,
                                 };
                             }
                             FocusTarget::Grade => {
@@ -3879,7 +4024,7 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                 }
                 crossterm::event::KeyCode::Home => {
                     if app.browsing_favourites {
-                        app.favourites_scroll_offset = Cell::new(0);
+                        app.favourites_selected_index = Cell::new(0);
                     } else if app.show_browser {
                         app.browser.selected_index = 0;
                     } else if app.focus_target == FocusTarget::MediaPool {
@@ -3891,7 +4036,7 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                 crossterm::event::KeyCode::End => {
                     if app.browsing_favourites {
                         if !app.favourite_folders.is_empty() {
-                            app.favourites_scroll_offset
+                            app.favourites_selected_index
                                 .set(app.favourite_folders.len() - 1);
                         }
                     } else if app.show_browser {

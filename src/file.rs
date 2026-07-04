@@ -521,6 +521,20 @@ impl McrawFileInfo {
                     self.dynamic_white_level = first_frame_meta.dynamic_white_level;
                     tracing::debug!("dynamic_white_level from first frame: {:?}", self.dynamic_white_level);
                 }
+                // Fallback: if we still don't have a lens shading map (e.g. it was
+                // not in the JSON header or the container-metadata block was
+                // skipped because color_matrix was already populated), read it
+                // from the first frame's per-frame metadata.
+                if self.lens_shading_map.is_none() {
+                    if let Some(ref lsm) = first_frame_meta.lens_shading_map {
+                        self.lens_shading_map = Some(crate::decoder::LensShadingMap {
+                            channels: lsm.channels.clone(),
+                            width: lsm.width,
+                            height: lsm.height,
+                        });
+                        tracing::info!("lens_shading_map from first frame: {}x{}", lsm.width, lsm.height);
+                    }
+                }
             }
         }
     }

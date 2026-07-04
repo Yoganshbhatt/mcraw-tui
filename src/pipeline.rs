@@ -1,7 +1,10 @@
 use crate::color::{
-    normalize_linear_f32, identity_ccm, mat_mul_vec3, mat_mul_3x3, camera_to_xyz_matrix, interpolate_matrix,
+    normalize_linear_per_channel, identity_ccm, mat_mul_vec3, mat_mul_3x3,
+    camera_to_xyz_matrix, interpolate_matrix,
     BilinearDemosaic, ColorSpace, TransferFunction, build_bradford_matrix, D65_XYZ,
-    forward_to_camera_xyz, detect_camera_to_xyz,
+    detect_camera_to_xyz,
+    compute_color_only_map,
+    apply_lens_correction_cpu_with_map,
 };
 use crate::decoder::Decoder;
 use crate::encoder::VideoEncoder;
@@ -19,7 +22,62 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 const PIPELINE_DEPTH: usize = 3;
-struct FrameSlot { bayer: Vec<u16>, frame_bytes: Vec<u8>, as_shot_neutral: [f32; 3] }
+
+/// Black level / white level mode for normalization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlWlMode {
+    Dynamic,
+    Static,
+    Preset1023_64,
+    Preset4095_256,
+    Preset16383_1024,
+    Preset65535_4096,
+    Preset4095_64,
+    Preset16383_64,
+    Preset16383_0,
+}
+
+impl BlWlMode {
+    pub fn name(&self) -> &'static str {
+        match self {
+            BlWlMode::Dynamic => "Dynamic",
+            BlWlMode::Static => "Static",
+            BlWlMode::Preset1023_64 => "1023/64",
+            BlWlMode::Preset4095_256 => "4095/256",
+            BlWlMode::Preset16383_1024 => "16383/1024",
+            BlWlMode::Preset65535_4096 => "65535/4096",
+            BlWlMode::Preset4095_64 => "4095/64",
+            BlWlMode::Preset16383_64 => "16383/64",
+            BlWlMode::Preset16383_0 => "16383/0",
+        }
+    }
+}
+
+/// Lens correction mode for shading map correction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LensCorrectionMode {
+    Off,
+    Full,
+    ColorOnly,
+}
+
+impl LensCorrectionMode {
+    pub fn name(&self) -> &'static str {
+        match self {
+            LensCorrectionMode::Off => "Off",
+            LensCorrectionMode::Full => "Full",
+            LensCorrectionMode::ColorOnly => "Color Only",
+        }
+    }
+}
+
+struct FrameSlot {
+    bayer: Vec<u16>,
+    frame_bytes: Vec<u8>,
+    as_shot_neutral: [f32; 3],
+    dynamic_black_level: Option<[f32; 4]>,
+    dynamic_white_level: Option<f32>,
+}
 
 pub fn build_ffmpeg_codec_args(family: CodecFamily, hevc_encoder: &str, h264_encoder: &str, av1_encoder: &str, prores_encoder: &str, prores: ProResProfile, dnxhr: DnxhrProfile, hevc: HevcProfile, h264: H264Profile, av1: Av1Profile, vp9: Vp9Profile, rate_control: &RateControl, is_wide_gamut: bool) -> (String, String, Vec<String>) {
     family.to_ffmpeg_args(hevc_encoder, h264_encoder, av1_encoder, prores_encoder, prores, dnxhr, hevc, h264, av1, vp9, rate_control, is_wide_gamut)
@@ -87,11 +145,11 @@ pub fn run_naked(info: &McrawFileInfo, output_path: &str) -> Result<()> {
 pub fn run(info: &McrawFileInfo, output_path: &str) -> Result<()> {
     let never_cancel = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(PipelineStats::new());
-    run_export(info.clone(), output_path.to_string(), Arc::new(|_| {}), never_cancel, stats, ColorSpace::Rec709, TransferFunction::Rec709, CodecFamily::ProRes, ProResProfile::HQ, DnxhrProfile::HQX, HevcProfile::Main10_420, H264Profile::Main8bit, Av1Profile::Profile0_420_10bit, Vp9Profile::Profile2_420_10bit, "libx265".to_string(), "libx264".to_string(), "libaom-av1".to_string(), "prores_ks".to_string(), RateControl::Lossless, None)
+    run_export(info.clone(), output_path.to_string(), Arc::new(|_| {}), never_cancel, stats, ColorSpace::Rec709, TransferFunction::Rec709, CodecFamily::ProRes, ProResProfile::HQ, DnxhrProfile::HQX, HevcProfile::Main10_420, H264Profile::Main8bit, Av1Profile::Profile0_420_10bit, Vp9Profile::Profile2_420_10bit, "libx265".to_string(), "libx264".to_string(), "libaom-av1".to_string(), "prores_ks".to_string(), RateControl::Lossless, None, LensCorrectionMode::Full, BlWlMode::Dynamic)
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn Fn(f64) + Send + Sync>, cancelled: Arc<AtomicBool>, stats: Arc<PipelineStats>, export_cs: ColorSpace, export_tf: TransferFunction, codec_family: CodecFamily, prores_profile: ProResProfile, dnxhr_profile: DnxhrProfile, hevc_profile: HevcProfile, h264_profile: H264Profile, av1_profile: Av1Profile, vp9_profile: Vp9Profile, hevc_encoder: String, h264_encoder: String, av1_encoder: String, prores_encoder: String, rate_control: RateControl, custom_fps: Option<f64>) -> Result<()> {
+pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn Fn(f64) + Send + Sync>, cancelled: Arc<AtomicBool>, stats: Arc<PipelineStats>, export_cs: ColorSpace, export_tf: TransferFunction, codec_family: CodecFamily, prores_profile: ProResProfile, dnxhr_profile: DnxhrProfile, hevc_profile: HevcProfile, h264_profile: H264Profile, av1_profile: Av1Profile, vp9_profile: Vp9Profile, hevc_encoder: String, h264_encoder: String, av1_encoder: String, prores_encoder: String, rate_control: RateControl, custom_fps: Option<f64>, lens_mode: LensCorrectionMode, blwl_mode: BlWlMode) -> Result<()> {
     tracing::info!("run_export: input={} output={} codec={} cs={} tf={}", info.path, output_path, codec_family.name(), export_cs.name(), export_tf.name());
     let setup_start = Instant::now();
     let decoder = Decoder::new(&info.path)?; let timestamps = decoder.timestamps()?;
@@ -204,6 +262,29 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
         fused[6], fused[7], fused[8],
     );
     let pattern = info.bayer_pattern; let black_level = info.black_level; let white_level = info.white_level; let total_frames = timestamps.len();
+    let bl_count = info.black_level_count;
+    let bl_per_ch = info.black_level_per_channel;
+    let bl_static_r = bl_per_ch[0];
+    let bl_static_g = if bl_count >= 4 { (bl_per_ch[1] + bl_per_ch[2]) / 2.0 } else { bl_per_ch[0] };
+    let bl_static_b = if bl_count >= 4 { bl_per_ch[3] } else { bl_per_ch[0] };
+
+    // Lens correction data (captured by processor closure).
+    // MOTION format files may not populate sensor_width/sensor_height
+    // (they come from legacy TLV blocks only), so fall back to the
+    // active frame dimensions when those values are zero.
+    let sensor_w = if info.sensor_width > 0 { info.sensor_width as u32 } else { info.width as u32 + info.active_offset_x as u32 };
+    let sensor_h = if info.sensor_height > 0 { info.sensor_height as u32 } else { info.height as u32 + info.active_offset_y as u32 };
+    // Try the info's shading map first, fall back to decoder's container metadata
+    let shading_map = info.lens_shading_map.clone().or_else(|| {
+        decoder.container_metadata().ok().and_then(|cm| cm.lens_shading_map)
+    });
+    if let Some(ref sm) = shading_map {
+        if lens_mode != LensCorrectionMode::Off {
+            tracing::info!("lens shading map found: {}x{}", sm.width, sm.height);
+        }
+    } else if lens_mode != LensCorrectionMode::Off {
+        tracing::warn!("lens correction enabled but no shading map found in file or decoder");
+    }
     let is_wide_gamut = export_cs != ColorSpace::Rec709 && export_cs != ColorSpace::Srgb;
     
     let (codec_name, pix_fmt, mut extra_args) = build_ffmpeg_codec_args(codec_family, &hevc_encoder, &h264_encoder, &av1_encoder, &prores_encoder, prores_profile, dnxhr_profile, hevc_profile, h264_profile, av1_profile, vp9_profile, &rate_control, is_wide_gamut);
@@ -221,7 +302,7 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
     let mut encoder = VideoEncoder::new(&output_path, active_width, active_height, fps, &codec_name, &pix_fmt, &extra_args, audio_temp_path.as_deref(), info.audio_sample_rate, info.audio_channels)?;
     let stride_pixels = stride_width as usize * info.height as usize; let pixel_count = (active_width * active_height) as usize; let bytes_per_frame = pixel_count * 6;
     let (free_tx, free_rx) = bounded::<FrameSlot>(PIPELINE_DEPTH); let (loaded_tx, loaded_rx) = bounded::<FrameSlot>(PIPELINE_DEPTH); let (processed_tx, processed_rx) = bounded::<FrameSlot>(PIPELINE_DEPTH);
-    for _ in 0..PIPELINE_DEPTH { free_tx.send(FrameSlot { bayer: vec![0u16; stride_pixels], frame_bytes: vec![0u8; bytes_per_frame], as_shot_neutral: [0.0; 3] })?; }
+    for _ in 0..PIPELINE_DEPTH { free_tx.send(FrameSlot { bayer: vec![0u16; stride_pixels], frame_bytes: vec![0u8; bytes_per_frame], as_shot_neutral: [0.0; 3], dynamic_black_level: None, dynamic_white_level: None })?; }
     let free_tx_writer = free_tx.clone();
     
     let filters = pattern.to_dcraw_filters(); let mut rcd_pipeline: Option<gpu::RcdPipeline> = None;
@@ -243,6 +324,10 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
                     decoder.load_frame_into(*ts, &mut slot.bayer)?
                 };
                 slot.as_shot_neutral = as_shot_neutral;
+                if let Ok(meta) = decoder.load_frame_metadata(*ts) {
+                    slot.dynamic_black_level = meta.dynamic_black_level;
+                    slot.dynamic_white_level = meta.dynamic_white_level;
+                }
                 // B4: hint the OS to prefetch the next frame's range.
                 if let Some(next_ts) = timestamps.get(i + 1) {
                     decoder.prefetch(*next_ts);
@@ -262,6 +347,18 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
         let stats = Arc::clone(&stats);
         move || -> Result<()> {
             let mut rgb = vec![0.0f32; pixel_count * 3]; let demosaic = BilinearDemosaic::new(pattern);
+
+            // Lens correction pre-setup (computed once, applied per-frame)
+            let (color_only_map, _lens_grid_w, _lens_grid_h) = match &shading_map {
+                Some(sm) if lens_mode == LensCorrectionMode::ColorOnly => {
+                    let cm = compute_color_only_map(&sm.channels, sm.width, sm.height);
+                    (Some(cm), sm.width, sm.height)
+                }
+                Some(sm) => (None, sm.width, sm.height),
+                None => (None, 0, 0),
+            };
+            let has_lens = !matches!(lens_mode, LensCorrectionMode::Off) && shading_map.is_some();
+
             for mut slot in loaded_rx {
                 if cancelled.load(Ordering::Relaxed) { break; }
                 stats.frames_total.fetch_add(1, Ordering::Relaxed);
@@ -317,10 +414,75 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
                     fused
                 };
 
+                // Resolve black/white levels from the selected BL/WL mode.
+                // These are the "src" values used by the lens correction formula
+                // (`(raw - src_bl) / (src_wl - src_bl)`), matching motioncam-fs.
+                let (src_bl_r, src_bl_g, src_bl_b, src_wl) = match blwl_mode {
+                    BlWlMode::Dynamic => {
+                        if let Some(dbl) = slot.dynamic_black_level {
+                            let g_bl = if dbl[1] > 0.0 && dbl[2] > 0.0 {
+                                (dbl[1] + dbl[2]) / 2.0
+                            } else {
+                                dbl[1].max(dbl[2])
+                            };
+                            let wl = slot.dynamic_white_level
+                                .map(|w| w as f64)
+                                .unwrap_or(white_level);
+                            (dbl[0] as f64, g_bl as f64, dbl[3] as f64, wl)
+                        } else {
+                            (bl_static_r, bl_static_g, bl_static_b, white_level)
+                        }
+                    }
+                    BlWlMode::Static => (bl_static_r, bl_static_g, bl_static_b, white_level),
+                    BlWlMode::Preset1023_64 => (64.0, 64.0, 64.0, 1023.0),
+                    BlWlMode::Preset4095_256 => (256.0, 256.0, 256.0, 4095.0),
+                    BlWlMode::Preset16383_1024 => (1024.0, 1024.0, 1024.0, 16383.0),
+                    BlWlMode::Preset65535_4096 => (4096.0, 4096.0, 4096.0, 65535.0),
+                    BlWlMode::Preset4095_64 => (64.0, 64.0, 64.0, 4095.0),
+                    BlWlMode::Preset16383_64 => (64.0, 64.0, 64.0, 16383.0),
+                    BlWlMode::Preset16383_0 => (0.0, 0.0, 0.0, 16383.0),
+                };
+
+                // Compute extended white level and normalization black/white.
+                // When lens correction is active we follow motioncam-fs:
+                //   - Output range is extended by +2 bits for headroom
+                //   - Black level becomes 0 (already subtracted in correction)
+                let (norm_bl_r, norm_bl_g, norm_bl_b, norm_wl) = if has_lens {
+                    let bits = (u16::BITS - (src_wl as u16).leading_zeros()).max(1);
+                    let ext = ((1u64 << (bits + 2).min(16)) - 1) as f64;
+                    (0.0, 0.0, 0.0, ext)
+                } else {
+                    (src_bl_r, src_bl_g, src_bl_b, src_wl)
+                };
+
+                // Lens correction: apply before both GPU and CPU paths to
+                // ensure corrected bayer data is used regardless of backend.
+                if has_lens {
+                    if let Some(ref sm) = shading_map {
+                        let channels = if lens_mode == LensCorrectionMode::ColorOnly {
+                            color_only_map.as_ref().unwrap()
+                        } else {
+                            &sm.channels
+                        };
+                        let _g = PhaseGuard::new(&stats.lens_correction);
+                        apply_lens_correction_cpu_with_map(
+                            &mut slot.bayer, stride_width,
+                            offset_x, offset_y, pattern,
+                            channels, sm.width, sm.height,
+                            sensor_w, sensor_h,
+                            [src_bl_r as f32, src_bl_g as f32, src_bl_g as f32, src_bl_b as f32],
+                            src_wl as f32,
+                            norm_wl as u16,
+                        );
+                    }
+                }
+
+                let gpu_bl = if has_lens { 0.0 } else { black_level as f32 };
+                let gpu_wl = if has_lens { norm_wl as f32 } else { white_level as f32 };
                 let gpu_ok = if let Some(ref mut pipeline) = rcd_pipeline {
                     let gpu_result = {
                         let _g = PhaseGuard::new(&stats.gpu);
-                        pipeline.process(&slot.bayer, filters, black_level as f32, white_level as f32, stride_width, offset_x, offset_y, &fused, &slot.as_shot_neutral, &export_tf)
+                        pipeline.process(&slot.bayer, filters, gpu_bl, gpu_wl, stride_width, offset_x, offset_y, &fused, &slot.as_shot_neutral, &export_tf)
                     };
                     match gpu_result {
                         Ok(rgb48le) => {
@@ -338,7 +500,7 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
                     }
                     {
                         let _g = PhaseGuard::new(&stats.normalize);
-                        normalize_linear_f32(&mut rgb, black_level as f32, white_level as f32);
+                        normalize_linear_per_channel(&mut rgb, norm_bl_r, norm_bl_g, norm_bl_b, norm_wl);
                     }
 
                     let raw_r_gain = if as_shot[0] > 1e-6 && as_shot[1] > 1e-6 { as_shot[1] / as_shot[0] } else { 1.0 };

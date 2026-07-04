@@ -773,6 +773,192 @@ pub fn normalize_linear_f32(pixels: &mut [f32], black_level: f32, white_level: f
     pixels.par_iter_mut().for_each(|v| { *v = (*v - black_level) * inv_range; if *v < 0.0 { *v = 0.0; } else if *v > 1.0 { *v = 1.0; } });
 }
 
+/// Per-channel linear normalization: subtract per-channel black level and
+/// scale to [0,1] using a shared white level.  The input is f32 RGB
+/// triples (r, g, b interleaved).  Each channel is normalized with its
+/// own black level and the common white level.
+///
+/// `bl_r/bl_g/bl_b` — black levels for R, G, B respectively (after
+/// demosaic G1+G2 have been averaged).
+/// `white_level` — shared white level for all channels.
+pub fn normalize_linear_per_channel(rgb: &mut [f32], bl_r: f64, bl_g: f64, bl_b: f64, white_level: f64) {
+    let range_r = if white_level > bl_r { white_level - bl_r } else { 1.0 };
+    let range_g = if white_level > bl_g { white_level - bl_g } else { 1.0 };
+    let range_b = if white_level > bl_b { white_level - bl_b } else { 1.0 };
+    let inv_r = 1.0 / range_r;
+    let inv_g = 1.0 / range_g;
+    let inv_b = 1.0 / range_b;
+    rgb.par_chunks_exact_mut(3).for_each(|chunk| {
+        chunk[0] = ((chunk[0] as f64 - bl_r) * inv_r).clamp(0.0, 1.0) as f32;
+        chunk[1] = ((chunk[1] as f64 - bl_g) * inv_g).clamp(0.0, 1.0) as f32;
+        chunk[2] = ((chunk[2] as f64 - bl_b) * inv_b).clamp(0.0, 1.0) as f32;
+    });
+}
+
+/// Map a Bayer pixel position to a shading map channel index.
+/// Returns 0=R, 1=G1, 2=B, 3=G2 matching the 4-channel grid layout.
+pub fn bayer_phase_to_channel(x: u32, y: u32, pattern: BayerPattern) -> usize {
+    let even_x = x % 2 == 0;
+    let even_y = y % 2 == 0;
+    let is_red = match pattern {
+        BayerPattern::RGGB => even_x && even_y,
+        BayerPattern::BGGR => !even_x && !even_y,
+        BayerPattern::GRBG => !even_x && even_y,
+        BayerPattern::GBRG => even_x && !even_y,
+        _ => even_x && even_y, // QuadBayer → RGGB fallback
+    };
+    let is_blue = match pattern {
+        BayerPattern::RGGB => !even_x && !even_y,
+        BayerPattern::BGGR => even_x && even_y,
+        BayerPattern::GRBG => even_x && !even_y,
+        BayerPattern::GBRG => !even_x && even_y,
+        _ => !even_x && !even_y,
+    };
+    if is_red { return 0; }
+    if is_blue { return 3; }
+    if even_y { 1 } else { 2 }
+}
+
+/// Bilinear interpolation into a flat shading-map channel.
+/// `channel_data` is `[y * grid_w + x]` for a single channel.
+/// `u`, `v` are normalised coordinates in [0, 1] over the sensor area.
+fn interpolate_bilinear(channel_data: &[f32], grid_w: u32, grid_h: u32, u: f32, v: f32) -> f32 {
+    let fx = (u * (grid_w - 1) as f32).clamp(0.0, (grid_w - 1) as f32);
+    let fy = (v * (grid_h - 1) as f32).clamp(0.0, (grid_h - 1) as f32);
+    let ix = fx as usize;
+    let iy = fy as usize;
+    let frac_x = fx - ix as f32;
+    let frac_y = fy - iy as f32;
+
+    let w = grid_w as usize;
+    let get = |gx: usize, gy: usize| channel_data[gy.min(grid_h as usize - 1) * w + gx.min(grid_w as usize - 1)];
+
+    let g00 = get(ix, iy);
+    let g10 = get(ix + 1, iy);
+    let g01 = get(ix, iy + 1);
+    let g11 = get(ix + 1, iy + 1);
+
+    let top = g00 + (g10 - g00) * frac_x;
+    let bot = g01 + (g11 - g01) * frac_x;
+    top + (bot - top) * frac_y
+}
+
+/// Pre-compute a color-only shading map by dividing each grid point by the
+/// minimum gain across all four channels at that position.
+pub fn compute_color_only_map(channels: &[Vec<f32>], grid_w: u32, grid_h: u32) -> Vec<Vec<f32>> {
+    let len = (grid_w * grid_h) as usize;
+    let mut color_map = vec![vec![0.0f32; len]; 4];
+    for i in 0..len {
+        let r = channels[0][i];
+        let g1 = channels[1][i];
+        let g2 = channels[2][i];
+        let b = channels[3][i];
+        let min_g = r.min(g1.min(g2.min(b)));
+        if min_g > 0.0 {
+            color_map[0][i] = r / min_g;
+            color_map[1][i] = g1 / min_g;
+            color_map[2][i] = g2 / min_g;
+            color_map[3][i] = b / min_g;
+        } else {
+            color_map[0][i] = 1.0;
+            color_map[1][i] = 1.0;
+            color_map[2][i] = 1.0;
+            color_map[3][i] = 1.0;
+        }
+    }
+    color_map
+}
+
+/// Apply lens shading correction to raw Bayer data.
+///
+/// Operates **before** demosaic. Each raw pixel is multiplied by the
+/// bilinearly-interpolated gain from the shading map for its channel.
+/// Values are clamped to `clamp_max` (typically the sensor's white level)
+/// to prevent amplification from pushing pixels above the sensor's raw
+/// range, which would disadvantage the subsequent normalize step.
+pub fn apply_lens_correction_cpu(
+    bayer: &mut [u16],
+    stride_width: u32,
+    offset_x: u32,
+    offset_y: u32,
+    pattern: BayerPattern,
+    shading_map_channels: &[Vec<f32>],
+    grid_w: u32,
+    grid_h: u32,
+    sensor_w: u32,
+    sensor_h: u32,
+    color_only: bool,
+    clamp_max: u16,
+) {
+    let (ox, oy) = (offset_x as f32, offset_y as f32);
+    let (sw, sh) = (sensor_w as f32, sensor_h as f32);
+
+    let channels = if color_only {
+        &compute_color_only_map(shading_map_channels, grid_w, grid_h)
+    } else {
+        shading_map_channels
+    };
+
+    let cm = clamp_max as u32;
+    bayer.par_chunks_exact_mut(stride_width as usize)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let vy = (y as f32 + oy) / sh;
+            for (x, pixel) in row.iter_mut().enumerate() {
+                let vx = (x as f32 + ox) / sw;
+                let ch = bayer_phase_to_channel(x as u32, y as u32, pattern);
+                let gain = interpolate_bilinear(&channels[ch], grid_w, grid_h, vx, vy);
+                *pixel = ((*pixel as f32 * gain).round() as u32).min(cm) as u16;
+            }
+        });
+
+    if color_only {
+        let _ = channels;
+    }
+}
+
+/// Apply lens shading correction to raw Bayer data, matching the
+/// motioncam-fs reference implementation exactly.
+///
+/// For each raw pixel: `((pixel - src_black[ch]) / (src_white - src_black[ch])) * gain * extended_wl`
+/// The result is clamped to `extended_wl` and written back to the Bayer buffer.
+/// Subsequent normalization must use `bl=0, wl=extended_wl` to recover the correct
+/// scene-referred `((pixel - bl) / (wl - bl)) * gain`.
+pub fn apply_lens_correction_cpu_with_map(
+    bayer: &mut [u16],
+    stride_width: u32,
+    offset_x: u32,
+    offset_y: u32,
+    pattern: BayerPattern,
+    color_map: &[Vec<f32>],
+    grid_w: u32,
+    grid_h: u32,
+    sensor_w: u32,
+    sensor_h: u32,
+    src_black: [f32; 4],
+    src_white: f32,
+    extended_wl: u16,
+) {
+    let (ox, oy) = (offset_x as f32, offset_y as f32);
+    let (sw, sh) = (sensor_w as f32, sensor_h as f32);
+    let ew = extended_wl as u32;
+
+    bayer.par_chunks_exact_mut(stride_width as usize)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let vy = (y as f32 + oy) / sh;
+            for (x, pixel) in row.iter_mut().enumerate() {
+                let vx = (x as f32 + ox) / sw;
+                let ch = bayer_phase_to_channel(x as u32, y as u32, pattern);
+                let gain = interpolate_bilinear(&color_map[ch], grid_w, grid_h, vx, vy);
+                let bl = src_black[ch];
+                let norm = (*pixel as f32 - bl) / (src_white - bl).max(f32::EPSILON);
+                let val = (norm * gain * ew as f32).round();
+                *pixel = (val as u32).min(ew) as u16;
+            }
+        });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1027,6 +1213,155 @@ impl TransferFunction {
             TransferFunction::HLG => if x < (1.0_f32 / 12.0_f32) { (3.0_f32 * x).sqrt() } else { 0.17883277_f32 * (12.0_f32 * x - 0.28466892_f32).ln() + 0.55991073_f32 },
             TransferFunction::DaVinciIntermediate => if x <= 0.00262409_f32 { x * 10.44426855_f32 } else { 0.07329248_f32 * ((x + 0.0075_f32).log2() + 7.0_f32) },
             TransferFunction::Gamma24 => x.max(0.0).powf(1.0 / 2.4),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lens correction tests
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod lens_tests {
+    use super::*;
+
+    #[test]
+    fn bayer_phase_to_channel_rggb() {
+        let p = BayerPattern::RGGB;
+        // (0,0) = R → ch 0
+        assert_eq!(bayer_phase_to_channel(0, 0, p), 0);
+        // (1,0) = G1 → ch 1
+        assert_eq!(bayer_phase_to_channel(1, 0, p), 1);
+        // (0,1) = G2 → ch 2
+        assert_eq!(bayer_phase_to_channel(0, 1, p), 2);
+        // (1,1) = B → ch 3
+        assert_eq!(bayer_phase_to_channel(1, 1, p), 3);
+    }
+
+    #[test]
+    fn bayer_phase_to_channel_bggr() {
+        let p = BayerPattern::BGGR;
+        assert_eq!(bayer_phase_to_channel(1, 1, p), 0); // R
+        assert_eq!(bayer_phase_to_channel(0, 0, p), 3); // B
+    }
+
+    #[test]
+    fn bayer_phase_to_channel_grbg() {
+        let p = BayerPattern::GRBG;
+        assert_eq!(bayer_phase_to_channel(1, 0, p), 0); // R
+        assert_eq!(bayer_phase_to_channel(0, 1, p), 3); // B
+    }
+
+    #[test]
+    fn bayer_phase_to_channel_gbrg() {
+        let p = BayerPattern::GBRG;
+        assert_eq!(bayer_phase_to_channel(0, 1, p), 0); // R
+        assert_eq!(bayer_phase_to_channel(1, 0, p), 3); // B
+    }
+
+    #[test]
+    fn interpolate_bilinear_identity_map_returns_center_value() {
+        let w = 3u32; let h = 3u32;
+        let data: Vec<f32> = vec![
+            1.0f32, 1.5f32, 1.0f32,
+            1.5f32, 2.0f32, 1.5f32,
+            1.0f32, 1.5f32, 1.0f32,
+        ];
+        let result = interpolate_bilinear(&data, w, h, 0.5f32, 0.5f32);
+        assert!((result - 2.0f32).abs() < 1e-5f32, "center={}", result);
+    }
+
+    #[test]
+    fn interpolate_bilinear_corner_returns_edge_value() {
+        let w = 2u32; let h = 2u32;
+        let data: Vec<f32> = vec![1.0f32, 2.0f32, 3.0f32, 4.0f32];
+        let result = interpolate_bilinear(&data, w, h, 0.0f32, 0.0f32);
+        assert!((result - 1.0f32).abs() < 1e-5f32, "topleft={}", result);
+        let result = interpolate_bilinear(&data, w, h, 1.0f32, 1.0f32);
+        assert!((result - 4.0f32).abs() < 1e-5f32, "botright={}", result);
+    }
+
+    #[test]
+    fn compute_color_only_map_uniform_returns_identity() {
+        let w = 2u32; let h = 2u32;
+        let channels = vec![
+            vec![2.0f32; 4],
+            vec![2.0f32; 4],
+            vec![2.0f32; 4],
+            vec![2.0f32; 4],
+        ];
+        let result = compute_color_only_map(&channels, w, h);
+        for ch in &result {
+            for v in ch {
+                assert!((*v - 1.0f32).abs() < 1e-5f32, "color_only should be 1.0, got {}", v);
+            }
+        }
+    }
+
+    #[test]
+    fn compute_color_only_map_different_channels_preserves_ratio() {
+        let w = 1u32; let h = 1u32;
+        let channels = vec![
+            vec![4.0f32],
+            vec![2.0f32],
+            vec![2.0f32],
+            vec![4.0f32],
+        ];
+        let result = compute_color_only_map(&channels, w, h);
+        assert!((result[0][0] - 2.0f32).abs() < 1e-5f32, "R={}", result[0][0]);
+        assert!((result[1][0] - 1.0f32).abs() < 1e-5f32, "G1={}", result[1][0]);
+        assert!((result[2][0] - 1.0f32).abs() < 1e-5f32, "G2={}", result[2][0]);
+        assert!((result[3][0] - 2.0f32).abs() < 1e-5f32, "B={}", result[3][0]);
+    }
+
+    #[test]
+    fn normalize_linear_per_channel_basic() {
+        let mut rgb = vec![1000.0f32, 2000.0f32, 1500.0f32];
+        normalize_linear_per_channel(&mut rgb, 0.0f64, 0.0f64, 0.0f64, 4000.0f64);
+        assert!((rgb[0] - 0.25f32).abs() < 1e-5f32, "R={}", rgb[0]);
+        assert!((rgb[1] - 0.5f32).abs() < 1e-5f32, "G={}", rgb[1]);
+        assert!((rgb[2] - 0.375f32).abs() < 1e-5f32, "B={}", rgb[2]);
+    }
+
+    #[test]
+    fn normalize_linear_per_channel_per_channel_bl() {
+        let mut rgb = vec![1000.0f32, 2000.0f32, 1500.0f32];
+        normalize_linear_per_channel(&mut rgb, 100.0f64, 200.0f64, 50.0f64, 2000.0f64);
+        let r_exp = (1000.0f64 - 100.0f64) / (2000.0f64 - 100.0f64);
+        let g_exp = (2000.0f64 - 200.0f64) / (2000.0f64 - 200.0f64);
+        let b_exp = (1500.0f64 - 50.0f64) / (2000.0f64 - 50.0f64);
+        assert!((rgb[0] - r_exp as f32).abs() < 1e-5f32, "R={}", rgb[0]);
+        assert!((rgb[1] - g_exp as f32).abs() < 1e-5f32, "G={}", rgb[1]);
+        assert!((rgb[2] - b_exp as f32).abs() < 1e-5f32, "B={}", rgb[2]);
+    }
+
+    #[test]
+    fn apply_lens_correction_identity_map_preserves_pixels() {
+        let w = 4u32; let h = 4u32;
+        let mut bayer: Vec<u16> = (0u16..w as u16 * h as u16).collect();
+        let original = bayer.clone();
+        let channels = vec![vec![1.0f32; (w * h) as usize]; 4];
+        apply_lens_correction_cpu_with_map(
+            &mut bayer, w, 0, 0, BayerPattern::RGGB,
+            &channels, 2, 2, w, h,
+            [0.0; 4], 65535.0, 65535,
+        );
+        for (i, (&orig, &new)) in original.iter().zip(bayer.iter()).enumerate() {
+            assert_eq!(orig, new, "pixel {} should be unchanged", i);
+        }
+    }
+
+    #[test]
+    fn apply_lens_correction_uniform_gain_scales_correctly() {
+        let w = 4u32; let h = 4u32;
+        let mut bayer: Vec<u16> = vec![100u16; (w * h) as usize];
+        let channels = vec![vec![2.0f32; (w * h) as usize]; 4];
+        apply_lens_correction_cpu_with_map(
+            &mut bayer, w, 0, 0, BayerPattern::RGGB,
+            &channels, 2, 2, w, h,
+            [0.0; 4], 65535.0, 65535,
+        );
+        for (i, &p) in bayer.iter().enumerate() {
+            assert_eq!(p, 200u16, "pixel {} should be 200, got {}", i, p);
         }
     }
 }
