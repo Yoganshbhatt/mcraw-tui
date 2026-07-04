@@ -1,6 +1,6 @@
 # Rust build artifacts
 /target
-Cargo.lock
+# Cargo.lock intentionally committed for reproducible binary builds
 
 # Media files (sample clips, exports)
 *.mcraw
