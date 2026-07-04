@@ -260,6 +260,10 @@ pub enum ExportEvent {
 /// Snapshot of the most recently finished export. Kept so the UI can show a
 /// post-render summary (codec, settings, elapsed time, output path, etc.)
 /// instead of immediately reverting to the preview panel.
+///
+/// When `batch_total > 1` the summary represents an aggregate of all items
+/// in a batch, with the per-item fields showing the **last** file that was
+/// rendered so the user still has a specific reference.
 #[derive(Debug, Clone)]
 pub struct ExportSummary {
     pub output_path: String,
@@ -271,6 +275,27 @@ pub struct ExportSummary {
     pub frame_count: usize,
     pub elapsed: Duration,
     pub result: Result<(), String>,
+    // Batch aggregation fields (batch_total = 0 for single-item exports)
+    pub batch_total: usize,
+    pub batch_completed: usize,
+    pub batch_failed: usize,
+    pub batch_total_frames: usize,
+    pub batch_total_elapsed: Duration,
+    pub batch_errors: Vec<String>,
+}
+
+/// Tracks per-item results across a batch of exports so the final summary
+/// shows aggregate stats (total frames, time, success count) instead of
+/// only the last file's data.
+#[derive(Debug, Clone, Default)]
+pub struct BatchAccumulator {
+    pub total_items: usize,
+    pub completed_count: usize,
+    pub failed_count: usize,
+    pub total_frames: usize,
+    pub total_elapsed: Duration,
+    pub errors: Vec<String>,
+    pub last_item_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -352,6 +377,10 @@ pub struct App {
     /// an accurate `ExportSummary` even if the user has since cycled the
     /// export-settings panel to different values.
     pub pending_export_summary: Option<ExportSummary>,
+
+    /// Aggregate accumulator for sequential batch renders. Reset at the
+    /// start of each batch and updated on every `poll_export` Done event.
+    pub batch_accum: BatchAccumulator,
 
     // Which queue item is currently being rendered (for sequential batch)
     pub current_rendering_index: Option<usize>,
@@ -445,6 +474,9 @@ pub struct App {
 
     // Persistent ListState offset for the favourites list view
     pub favourites_scroll_offset: Cell<usize>,
+
+    // Selection index for the favourites list view (separate from scroll offset)
+    pub favourites_selected_index: Cell<usize>,
 
     // Timestamp + index of last clicked favourite (for d-key removal)
     pub last_clicked_favourite: Option<(Instant, usize)>,
@@ -616,6 +648,7 @@ impl App {
             cancel_token: None,
             last_export_summary: None,
             pending_export_summary: None,
+            batch_accum: BatchAccumulator::default(),
 
             export_color_space: ColorSpace::Rec709,
             export_transfer_function: TransferFunction::Gamma24,
@@ -662,6 +695,7 @@ impl App {
             last_clicked_favourite: None,
             browsing_favourites: false,
             favourites_scroll_offset: Cell::new(0),
+            favourites_selected_index: Cell::new(0),
             presets: ExportPreset::load_all(),
             active_preset: None,
             preset_picker: PresetPickerState::default(),
@@ -1497,9 +1531,11 @@ impl App {
             self.status_message = "No items selected in queue - use Space to select".to_string();
             return;
         }
-        self.status_message = format!("Starting render of {} selected file(s)...", selected_indices.len());
+        let batch_total = selected_indices.len();
+        self.status_message = format!("Starting render of {} selected file(s)...", batch_total);
         // Start the first one
         if let Some(&first_idx) = selected_indices.first() {
+            self.batch_accum = BatchAccumulator { total_items: batch_total, ..Default::default() };
             self.current_rendering_index = Some(first_idx);
             let q = &self.queue[first_idx];
             self.file_info = Some(q.info.clone());
@@ -1514,10 +1550,12 @@ impl App {
             self.status_message = "Queue is empty".to_string();
             return;
         }
-        self.status_message = format!("Starting render of all {} file(s)...", self.queue.len());
+        let batch_total = self.queue.len();
+        self.status_message = format!("Starting render of all {} file(s)...", batch_total);
         for q in &mut self.queue {
             q.selected = true;
         }
+        self.batch_accum = BatchAccumulator { total_items: batch_total, ..Default::default() };
         // Start from the first item
         self.current_rendering_index = Some(0);
         if let Some(q) = self.queue.first() {
@@ -1757,10 +1795,6 @@ impl App {
         self.export_cancelled = false;
         self.export_progress = 0.0;
         self.export_start_time = Some(Instant::now());
-        // Starting a fresh export — drop any previous summary so the UI
-        // switches from the post-render panel back to the live progress
-        // panel.
-        self.last_export_summary = None;
         // Capture the settings that this export was launched with so the
         // summary stays accurate even if the user cycles the export-settings
         // panel mid-render.
@@ -1774,6 +1808,12 @@ impl App {
             frame_count: info.frame_count as usize,
             elapsed: Duration::default(),
             result: Ok(()),
+            batch_total: 0,
+            batch_completed: 0,
+            batch_failed: 0,
+            batch_total_frames: 0,
+            batch_total_elapsed: Duration::default(),
+            batch_errors: Vec::new(),
         });
         // Mark queue item as Rendering
         if let Some(idx) = self.current_rendering_index {
@@ -2091,6 +2131,29 @@ impl App {
                                 Err(e) => Err(e.to_string()),
                             }
                         };
+                        // Accumulate batch stats
+                        let item_name = summary.output_path
+                            .split(std::path::MAIN_SEPARATOR)
+                            .last()
+                            .unwrap_or(&summary.output_path)
+                            .to_string();
+                        self.batch_accum.completed_count += 1;
+                        self.batch_accum.total_frames += summary.frame_count;
+                        self.batch_accum.total_elapsed += elapsed;
+                        self.batch_accum.last_item_name = item_name;
+                        if summary.result.is_err() {
+                            self.batch_accum.failed_count += 1;
+                            if let Err(ref msg) = summary.result {
+                                self.batch_accum.errors.push(msg.clone());
+                            }
+                        }
+                        // Fill batch aggregation fields from accumulator
+                        summary.batch_total = self.batch_accum.total_items;
+                        summary.batch_completed = self.batch_accum.completed_count;
+                        summary.batch_failed = self.batch_accum.failed_count;
+                        summary.batch_total_frames = self.batch_accum.total_frames;
+                        summary.batch_total_elapsed = self.batch_accum.total_elapsed;
+                        summary.batch_errors = self.batch_accum.errors.clone();
                         self.last_export_summary = Some(summary);
                     }
                     if self.export_cancelled {
@@ -2214,15 +2277,15 @@ impl App {
         if self.favourite_folders.is_empty() {
             return;
         }
-        let cur = self.favourites_scroll_offset.get() as i64;
+        let cur = self.favourites_selected_index.get() as i64;
         let max = (self.favourite_folders.len() as i64) - 1;
         let next = (cur + delta).clamp(0, max);
-        self.favourites_scroll_offset.set(next as usize);
+        self.favourites_selected_index.set(next as usize);
     }
 
     /// Navigate into the favourite at the current cursor position.
     pub fn open_selected_favourite(&mut self) {
-        let idx = self.favourites_scroll_offset.get();
+        let idx = self.favourites_selected_index.get();
         if let Some(path) = self.favourite_folders.get(idx).cloned() {
             self.status_message = format!("Navigated to favourite: {}", path.display());
             self.browser = FileBrowser::from_path(path);
@@ -2234,15 +2297,15 @@ impl App {
 
     /// Delete the favourite at the current cursor position.
     pub fn delete_selected_favourite(&mut self) {
-        let idx = self.favourites_scroll_offset.get();
+        let idx = self.favourites_selected_index.get();
         if idx < self.favourite_folders.len() {
             let name = self.favourite_folders[idx].display().to_string();
             self.favourite_folders.remove(idx);
             self.save_favourites();
             if self.favourite_folders.is_empty() {
                 self.browsing_favourites = false;
-            } else if self.favourites_scroll_offset.get() >= self.favourite_folders.len() {
-                self.favourites_scroll_offset.set(self.favourite_folders.len() - 1);
+            } else if self.favourites_selected_index.get() >= self.favourite_folders.len() {
+                self.favourites_selected_index.set(self.favourite_folders.len() - 1);
             }
             self.status_message = format!("Removed favourite: {}", name);
         }
@@ -3550,6 +3613,7 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                             } else {
                                 app.browsing_favourites = true;
                                 app.favourites_scroll_offset = Cell::new(0);
+                                app.favourites_selected_index = Cell::new(0);
                                 app.status_message = "Favourites view (press [f] or [Esc] to return)".to_string();
                             }
                         } else if app.focus_target == FocusTarget::ExportSettings {
@@ -3960,7 +4024,7 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                 }
                 crossterm::event::KeyCode::Home => {
                     if app.browsing_favourites {
-                        app.favourites_scroll_offset = Cell::new(0);
+                        app.favourites_selected_index = Cell::new(0);
                     } else if app.show_browser {
                         app.browser.selected_index = 0;
                     } else if app.focus_target == FocusTarget::MediaPool {
@@ -3972,7 +4036,7 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                 crossterm::event::KeyCode::End => {
                     if app.browsing_favourites {
                         if !app.favourite_folders.is_empty() {
-                            app.favourites_scroll_offset
+                            app.favourites_selected_index
                                 .set(app.favourite_folders.len() - 1);
                         }
                     } else if app.show_browser {
