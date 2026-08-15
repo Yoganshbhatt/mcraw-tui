@@ -1,3 +1,5 @@
+
+
 # mcraw-tui
 
 ![Demo](assets/demo.gif)
@@ -21,7 +23,7 @@ Cross-platform terminal UI for browsing and exporting MotionCam `.mcraw` files t
 
 - **Rust** (edition 2021, no toolchain pin)
 - **FFmpeg 5.0+** on `PATH` (required at runtime for video encoding)
-- **motioncam-decoder-rust**: Clone alongside this repo (`git clone https://github.com/Yoganshbhatt/motioncam-decoder-rust ../motioncam-decoder-rust`)
+- **motioncam-decoder-rust**: Clone one directory up (`git clone https://github.com/Yoganshbhatt/motioncam-decoder-rust ../motioncam-decoder-rust`)
 
 ## Quick install
 
