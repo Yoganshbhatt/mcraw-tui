@@ -16,6 +16,7 @@ pub mod file_browser;
 pub mod gpu;
 pub mod gradient;
 pub mod grading;
+pub mod hl;
 pub mod gui;
 pub mod hardware;
 pub mod metadata;

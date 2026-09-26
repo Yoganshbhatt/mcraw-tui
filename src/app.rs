@@ -2593,7 +2593,7 @@ pub async fn run(args: Cli) -> Result<()> {
             color_space, transfer_function,
             prores_profile, dnxhr_profile, hevc_profile, h264_profile,
             av1_profile, vp9_profile, rate_control,
-            lens_correction, blwl, no_highlight_recovery, fps,
+            lens_correction, blwl, fps, no_highlight_recovery,
         }) => {
             let path = match file {
                 Some(p) => p,
@@ -2662,6 +2662,9 @@ pub async fn run(args: Cli) -> Result<()> {
                 _ => anyhow::bail!("Invalid lens correction mode: {}", lens_correction),
             };
 
+            // Highlight recovery is on unless explicitly disabled. See src/hl.rs.
+            let highlight_recovery = !no_highlight_recovery;
+
             let blwl_mode = match blwl.to_lowercase().as_str() {
                 "dynamic" => BlWlMode::Dynamic,
                 "static" => BlWlMode::Static,
@@ -2708,7 +2711,7 @@ pub async fn run(args: Cli) -> Result<()> {
                     cs, tf, codec_family,
                     pp, dp, hp, h264p, av1p, vp9p,
                     hevc_encoder, h264_encoder, av1_encoder, prores_encoder,
-                    rc, fps, lens, blwl_mode, !no_highlight_recovery,
+                    rc, fps, lens, blwl_mode, highlight_recovery,
                 )
             }).await;
 

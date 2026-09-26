@@ -5,14 +5,14 @@ use crate::color::{
     detect_camera_to_xyz,
     compute_color_only_map,
     apply_lens_correction_cpu_with_map,
-    clip_mask, raw_pin_mask, reconstruct_clipped, apply_display_rolloff, ReconstructParams,
-    luma_collapse_after_wb,
+    apply_display_rolloff,
 };
 use crate::decoder::Decoder;
 use crate::encoder::VideoEncoder;
 use crate::export::{Av1Profile, CodecFamily, DnxhrProfile, H264Profile, HevcProfile, ProResProfile, RateControl, Vp9Profile};
 use crate::file::McrawFileInfo;
 use crate::gpu;
+use crate::hl;
 use crate::stats::{PhaseGuard, PipelineStats};
 use anyhow::{anyhow, Result};
 use crossbeam_channel::bounded;
@@ -264,6 +264,22 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
         fused[6], fused[7], fused[8],
     );
     let pattern = info.bayer_pattern; let white_level = info.white_level; let total_frames = timestamps.len();
+    // The censored-photosite completion expresses "neutral" as the file's own
+    // as-shot neutral triple (src/hl.rs). That is exact on the ForwardMatrix
+    // path — fm1 maps the as-shot-WB'd neutral to D50, the CAT ends at the
+    // output white, and the output matrix is D65 — and only approximate on the
+    // ColorMatrix1 path, whose per-frame Bradford CAT is built from the scene
+    // white. Verify once per export and say so loudly if it does not hold.
+    if highlight_recovery {
+        let n = mat_mul_vec3(&crate::color::invert_3x3(&fused), &[1.0, 1.0, 1.0]);
+        let g = if n[1].is_finite() && n[1].abs() > 1e-6 { n[1] } else { 1.0 };
+        let dev = (n[0] / g - 1.0).abs().max((n[1] / g - 1.0).abs()).max((n[2] / g - 1.0).abs());
+        if dev > 1e-2 {
+            tracing::warn!("highlight recovery: fused matrix is not neutral-at-unity (deviation {:.4}, path {}); the completion will inherit the ColorMatrix1 approximation", dev, matrix_path);
+        } else {
+            tracing::info!("highlight recovery: neutral identity verified (deviation {deviation:.2e}, path {path})", deviation = dev, path = matrix_path);
+        }
+    }
     let bl_count = info.black_level_count;
     let bl_per_ch = info.black_level_per_channel;
     let bl_static_r = bl_per_ch[0];
@@ -308,7 +324,7 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
     let free_tx_writer = free_tx.clone();
     
     let filters = pattern.to_dcraw_filters(); let mut rcd_pipeline: Option<gpu::RcdPipeline> = None;
-    // TEMP-DEBUG: force CPU path to bisect the collapse bug (revert before commit)
+    // MCRAW_FORCE_CPU=1 forces the CPU path (useful for A/B against the GPU).
     if std::env::var("MCRAW_FORCE_CPU").as_deref() == Ok("1") {
         rcd_pipeline = None;
     } else if let Ok(ctx) = pollster::block_on(gpu::GpuContext::new()) {
@@ -347,13 +363,15 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
     
     // AgX pipeline is intentionally disabled. It will be reintroduced
     // as a separate feature; for now the render path is scene-referred
-    // raw → WB → highlight-recon → CCM → OETF.
+    // raw → WB → CCM → OETF.
 
     let processor_handle = std::thread::Builder::new().name("processor".into()).spawn({
         let cancelled = cancelled.clone();
         let stats = Arc::clone(&stats);
         move || -> Result<()> {
             let mut rgb = vec![0.0f32; pixel_count * 3]; let demosaic = BilinearDemosaic::new(pattern);
+            let mut hl_scratch = hl::HlScratch::new();
+            let hl_geom = hl::HlGeometry::from_info(stride_width, offset_x, offset_y, active_width, active_height, pattern);
 
             // Lens correction pre-setup (computed once, applied per-frame)
             let (color_only_map, _lens_grid_w, _lens_grid_h) = match &shading_map {
@@ -366,8 +384,10 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
             };
             let has_lens = !matches!(lens_mode, LensCorrectionMode::Off) && shading_map.is_some();
 
+            let mut frame_index: u64 = 0;
             for mut slot in loaded_rx {
                 if cancelled.load(Ordering::Relaxed) { break; }
+                frame_index += 1;
                 stats.frames_total.fetch_add(1, Ordering::Relaxed);
                 slot.frame_bytes.fill(0); let as_shot = slot.as_shot_neutral;
 
@@ -462,48 +482,31 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
                     (src_bl_r, src_bl_g, src_bl_b, src_wl)
                 };
 
-                // Highlight-reconstruction clip threshold, in the *normalized*
-                // space produced by `normalize_linear_per_channel`. The sensor
-                // clip ceiling is the min of the per-frame dynamic WL (the
-                // true well reading) and the selected src WL. The 0.99 factor
-                // pre-triggers on near-ceiling pixels (real sensors compress
-                // slightly below the nominal ceiling, and sensor noise is
-                // several raw levels wide — a razor-thin margin at 0.995
-                // splits one highlight population across the mask boundary,
-                // leaving half neutralized and half pink). With lens
-                // correction the normalization range is extended (+2 bits),
-                // so the threshold lands at ~0.25 — never reference the
-                // extended WL as a clip point: it is not a sensor ceiling.
-                //
-                // The threshold is computed unconditionally: reconstruction is
-                // gated by `highlight_recovery`, but the clipped-pair neutral
-                // collapse (always-on anti-magenta guarantee, HL-handling.md
-                // §3.2) needs the same mask in BOTH export states.
-                //
-                // `pin_thr_raw` is the COLLAPSE-GATE threshold — flat raw CFA
-                // units (0.99 × clip_raw), deliberately decoupled from
-                // recon_threshold: physically pinned sensor data, and nothing
-                // else, trips the neutral collapse. Sub-threshold photosites
-                // (e.g. 0.983×WL) are real data — WB + CCM push them to
-                // wide-gamut colors legitimately and they must pass through
-                // untouched (user-mandated no-pre-trigger rule).
-                let clip_raw = slot
-                    .dynamic_white_level
-                    .map(|w| w as f64)
-                    .filter(|w| *w > 0.0)
-                    .unwrap_or(src_wl)
-                    .min(src_wl);
-                let pin_thr_raw = 0.99 * clip_raw;
-                let recon_threshold = {
-                    (0.99 * (clip_raw - norm_bl_r) / (norm_wl - norm_bl_r)).clamp(0.0, 1.0) as f32
-                };
-                // Lens-trap invariant: the clip ceiling is ALWAYS the
-                // un-extended sensor ceiling (min(dyn_wl, src_wl)), never the
-                // lens-extended norm_wl (+2 bits). Otherwise recon silently
-                // never fires on the lens path.
-                debug_assert!(clip_raw <= src_wl + 1e-6, "clip_raw must be un-extended");
-                debug_assert!(pin_thr_raw <= clip_raw + 1e-6, "pin threshold above ceiling");
-                debug_assert!((0.0..=1.0).contains(&recon_threshold), "recon threshold range");
+                // Censored-photosite completion, in the RAW domain, BEFORE lens
+                // correction (the sensor railed at src_wl; the shading map is a
+                // calibration gain that must be divided back out, not folded
+                // into the estimate) and BEFORE demosaic. The resolved src
+                // blacks and rail are the same values the lens formula uses.
+                // Running here also benefits the GPU path, whose upload happens
+                // further down from the same `slot.bayer`; the GPU's own pass
+                // will replace this and this becomes a no-op there, which the
+                // pass's idempotence makes harmless.
+                if highlight_recovery {
+                    let _g = PhaseGuard::new(&stats.hl_complete);
+                    let hp = hl::HlParams::new(hl::HlPolicy::Full, src_wl, [src_bl_r, src_bl_g, src_bl_b], as_shot);
+                    let (_cens, rewritten) = hl_scratch.apply(&mut slot.bayer, &hl_geom, &hp);
+                    if frame_index % 60 == 0 {
+                        tracing::info!("hl-complete: censored={} rewritten={} {}", _cens, rewritten, hp.summary());
+                    }
+                } else {
+                    // OFF (--no-highlight-recovery): bit-exact sensor truth.
+                    // No raw photosite is written; the magenta is the sensor's
+                    // own colour error, documented not hidden. The
+                    // ratio-preserving display rolloff still applies
+                    // downstream. HlPolicy::Prior (multi-censored blocks only)
+                    // stays available as an internal middle arm for the
+                    // hl_review harness, not as export behaviour.
+                }
 
                 // Lens correction: apply before both GPU and CPU paths to
                 // ensure corrected bayer data is used regardless of backend.
@@ -538,16 +541,10 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
                     (src_bl_r as f32, src_bl_g as f32, src_bl_b as f32)
                 };
                 let gpu_wl = if has_lens { norm_wl as f32 } else { white_level as f32 };
-                let lc = export_cs.luma_coefficients();
-                let fused_luma = [
-                    lc[0] * fused[0] + lc[1] * fused[3] + lc[2] * fused[6],
-                    lc[0] * fused[1] + lc[1] * fused[4] + lc[2] * fused[7],
-                    lc[0] * fused[2] + lc[1] * fused[5] + lc[2] * fused[8],
-                ];
                 let gpu_ok = if let Some(ref mut pipeline) = rcd_pipeline {
                     let gpu_result = {
                         let _g = PhaseGuard::new(&stats.gpu);
-                        pipeline.process(&slot.bayer, filters, gpu_bl_r, gpu_bl_g, gpu_bl_b, gpu_wl, stride_width, offset_x, offset_y, &fused, &slot.as_shot_neutral, &export_tf, highlight_recovery, recon_threshold, pin_thr_raw as f32, fused_luma)
+                        pipeline.process(&slot.bayer, filters, gpu_bl_r, gpu_bl_g, gpu_bl_b, gpu_wl, stride_width, offset_x, offset_y, &fused, &slot.as_shot_neutral, &export_tf)
                     };
                     match gpu_result {
                         Ok(rgb48le) => {
@@ -579,89 +576,11 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
                             as_shot, raw_r_gain, raw_b_gain, r_gain, b_gain
                         );
                     }
-                    // Highlight reconstruction: raw-space (pre-WB, pre-CCM)
-                    // estimate of clipped channels from healthy neighbors
-                    // (HL-handling.md §3). Clean pixels are never touched.
-                    // The collapsed-pair neutral gate below NO LONGER reads
-                    // a demosaiced-plane mask — it reads RAW sensor truth:
-                    // the pre-demosaic 2×2-block pin registry built by
-                    // raw_pin_mask() (user-approved design). Demosaic
-                    // interpolation (bilinear/RCD) can average pinned
-                    // photosites beneath the mask threshold (the GPU magenta
-                    // residual); the raw CFA cannot lie. Pixels with ≥ 2
-                    // pinned channels carry no hue info and render
-                    // luma-neutral, never magenta (§3.2, deviation D9).
-                    // Pixels whose block carries no pin keep their recorded
-                    // color — scene-referred, no pre-trigger.
-                    let mut collapse_mask: Option<Vec<u8>> = None;
-                    if highlight_recovery && recon_threshold > 0.0 {
-                        let _g = PhaseGuard::new(&stats.reconstruct);
-                        let (mask, clipped) = clip_mask(&rgb, recon_threshold);
-                        if clipped > 0 {
-                            tracing::info!(
-                                "hl-recon cpu: threshold={recon_threshold:.4} clipped={clipped}/{} pixels",
-                                rgb.len() / 3
-                            );
-                            let params = ReconstructParams {
-                                r_gain,
-                                b_gain,
-                                fused_luma: Some(fused_luma),
-                            };
-                            reconstruct_clipped(&mut rgb, active_width, active_height, &mask, &params);
-                        }
-                    }
-                    if pin_thr_raw > 0.0 {
-                        let mask = raw_pin_mask(
-                            &slot.bayer,
-                            stride_width as usize,
-                            offset_x as usize,
-                            offset_y as usize,
-                            active_width as usize,
-                            active_height as usize,
-                            pattern,
-                            pin_thr_raw,
-                        );
-                        let collapsed = mask
-                            .par_iter()
-                            .filter(|m| m.count_ones() >= 2)
-                            .count();
-                        tracing::info!(
-                            "hl-collapse cpu: pin_thr_raw={pin_thr_raw:.1} collapsed={collapsed}/{} pixels (raw-truth gate, neutral, never magenta)",
-                            rgb.len() / 3
-                        );
-                        collapse_mask = Some(mask);
-                    }
                     {
                         let _g = PhaseGuard::new(&stats.wb_hl_ccm);
-                        let collapse = collapse_mask.as_deref();
-                        rgb.par_chunks_exact_mut(3).enumerate().for_each(|(px, chunk)| {
+                        rgb.par_chunks_exact_mut(3).for_each(|chunk| {
                             // 1. Apply WB
-                            let r = chunk[0] * r_gain;
-                            let g = chunk[1];
-                            let b = chunk[2] * b_gain;
-                            let mut wb = [r, g, b];
-
-                            // 1b. Clipped-pair neutral collapse: ≥ 2 channels
-                            // at the sensor ceiling → replace the WB'd triple
-                            // with its fused-luma neutral (brightness kept,
-                            // no hue invented). Bit-exact for every pixel
-                            // with < 2 clipped channels.
-                            if let Some(cmask) = collapse {
-                                let m = cmask[px];
-                                if m.count_ones() >= 2 {
-                                    luma_collapse_after_wb(&mut wb, m, fused_luma);
-                                } else if m == 0b010 {
-                                    // G-pinned single clip (G is the WB anchor,
-                                    // gain 1.0): the WB'd R/B overshoot the
-                                    // pinned G and the CCM's negative
-                                    // secondaries flip the ratio magenta. Cap
-                                    // the unclipped channels at the WB'd
-                                    // pinned G — brightness from the measured
-                                    // anchor, no hue invented (D10).
-                                    wb[0] = wb[0].min(wb[1]);
-                                    wb[2] = wb[2].min(wb[1]);
-                                }
-                            }
+                            let wb = [chunk[0] * r_gain, chunk[1], chunk[2] * b_gain];
 
                             // 2. Apply CCM
                             let out = mat_mul_vec3(&fused, &wb);
@@ -670,15 +589,17 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
                             chunk[2] = out[2].max(0.0);
                         });
                     }
+                    // Display-boundary rolloff, display-referred transfers only.
+                    // Hue-preserving (uniform scale) so it cannot introduce a
+                    // channel-ratio error, and identity below 1.0 so it cannot
+                    // temper anything a display-referred deliverable would have
+                    // shown as not-white. Scene-referred (log) exports are
+                    // untouched: their headroom belongs to the colourist.
+                    if export_tf.is_display_referred() {
+                        apply_display_rolloff(&mut rgb);
+                    }
                     {
                         let _g = PhaseGuard::new(&stats.oetf);
-                        // Hue-preserving display rolloff for display-referred
-                        // curves only (HL-handling.md §4): identity below 1.0,
-                        // uniform scalar compression above — R:G:B ratios are
-                        // invariant. Scene-referred/log exports get no rolloff.
-                        if export_tf.is_display_referred() {
-                            apply_display_rolloff(&mut rgb);
-                        }
                         export_tf.process(&mut rgb);
                     }
 

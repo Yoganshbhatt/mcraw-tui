@@ -148,9 +148,11 @@ impl PhaseTimer {
 pub struct PipelineStats {
     pub decode: PhaseTimer,
     pub lens_correction: PhaseTimer,
+    /// RAW-domain completion of censored photosites (`src/hl.rs`). Runs
+    /// before lens correction and demosaic, so it is its own phase.
+    pub hl_complete: PhaseTimer,
     pub demosaic: PhaseTimer,
     pub normalize: PhaseTimer,
-    pub reconstruct: PhaseTimer,
     pub wb_hl_ccm: PhaseTimer,
     pub oetf: PhaseTimer,
     pub pack: PhaseTimer,
@@ -173,9 +175,9 @@ impl Default for PipelineStats {
         Self {
             decode: PhaseTimer::default(),
             lens_correction: PhaseTimer::default(),
+            hl_complete: PhaseTimer::default(),
             demosaic: PhaseTimer::default(),
             normalize: PhaseTimer::default(),
-            reconstruct: PhaseTimer::default(),
             wb_hl_ccm: PhaseTimer::default(),
             oetf: PhaseTimer::default(),
             pack: PhaseTimer::default(),
@@ -231,9 +233,9 @@ impl PipelineStats {
                 ("setup".to_string(),      self.setup.snapshot()),
                 ("decode".to_string(),     self.decode.snapshot()),
                 ("lens_correction".to_string(), self.lens_correction.snapshot()),
+                ("hl_complete".to_string(),  self.hl_complete.snapshot()),
                 ("demosaic".to_string(),   self.demosaic.snapshot()),
                 ("normalize".to_string(),  self.normalize.snapshot()),
-                ("reconstruct".to_string(),self.reconstruct.snapshot()),
                 ("wb_hl_ccm".to_string(),  self.wb_hl_ccm.snapshot()),
                 ("oetf".to_string(),       self.oetf.snapshot()),
                 ("pack".to_string(),       self.pack.snapshot()),

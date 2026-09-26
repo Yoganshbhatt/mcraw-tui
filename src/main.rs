@@ -14,6 +14,7 @@ mod file;
 mod gradient;
 mod grading;
 mod gui;
+mod hl;
 mod file_browser;
 mod hardware;
 mod metadata;

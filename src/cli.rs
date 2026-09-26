@@ -58,14 +58,15 @@ pub enum CliCommands {
         /// Black/white level mode: dynamic, static, 1023/64, 4095/256, 16383/1024, 65535/4096, 4095/64, 16383/64, 16383/0
         #[arg(long, default_value = "dynamic")]
         blwl: String,
-        /// Disable highlight reconstruction (raw-space clipped-channel
-        /// estimation). Off exists purely for A/B verification; the
-        /// reconstruction is the data-preserving default (HL-handling.md §3).
-        #[arg(long)]
-        no_highlight_recovery: bool,
         /// Override output frame rate
         #[arg(long)]
         fps: Option<f64>,
+        /// Disable highlight recovery: bit-exact sensor output, no raw
+        /// photosite is completed (the sensor's own clipped colour error is
+        /// preserved). Default (flag absent) is the full neutral-axis
+        /// reconstruction.
+        #[arg(long)]
+        no_highlight_recovery: bool,
     },
 }
 
@@ -142,13 +143,13 @@ impl CliCommands {
                 file, format, output, color_space, transfer_function,
                 prores_profile, dnxhr_profile, hevc_profile, h264_profile,
                 av1_profile, vp9_profile, rate_control,
-                lens_correction, blwl, no_highlight_recovery, fps,
+                lens_correction, blwl, fps, no_highlight_recovery,
             } => CliCommands::Export {
                 file: file.or(top_level_file),
                 format, output, color_space, transfer_function,
                 prores_profile, dnxhr_profile, hevc_profile, h264_profile,
                 av1_profile, vp9_profile, rate_control,
-                lens_correction, blwl, no_highlight_recovery, fps,
+                lens_correction, blwl, fps, no_highlight_recovery,
             },
         }
     }
