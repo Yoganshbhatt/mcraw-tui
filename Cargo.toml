@@ -72,3 +72,6 @@ lru = "0.12"
 
 # Base64 encoding for Kitty terminal graphics protocol
 base64 = "0.22"
+
+[dev-dependencies]
+naga = "24.0.0"

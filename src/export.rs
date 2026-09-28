@@ -1,3 +1,5 @@
+use crate::color::ColorSpace;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodecFamily {
     ProRes,
@@ -48,6 +50,8 @@ impl CodecFamily {
     ///   runtime-detected encoder names.
     /// - Profile is resolved independently so the user's choice is preserved.
     /// - Rate-control flags are appended for HEVC / H.264 / AV1.
+    /// - `cs` selects the explicit RGB→YUV conversion for YUV outputs.
+    #[allow(clippy::too_many_arguments)]
     pub fn to_ffmpeg_args(
         &self,
         hevc_encoder: &str,
@@ -61,7 +65,7 @@ impl CodecFamily {
         av1: Av1Profile,
         vp9: Vp9Profile,
         rate_control: &RateControl,
-        is_wide_gamut: bool,
+        cs: ColorSpace,
     ) -> (String, String, Vec<String>) {
         let mut base_codec_name: String = String::new();
         let mut base_pix_fmt: String = String::new();
@@ -77,7 +81,11 @@ impl CodecFamily {
                     ProResProfile::P4444 => ("4", "yuva444p10le"),
                     ProResProfile::XQ4444 => ("5", "yuva444p12le"),
                 };
-                let pix_fmt = match (is_wide_gamut, prores) {
+                // Wide-gamut ProRes keeps its historic planar-RGB path
+                // (`gbrp10le`) — deliberately parked, not in this change.
+                // Signalling for those files must claim NO matrix, which
+                // `get_ffmpeg_vui_tags` enforces from the pixel format.
+                let pix_fmt = match (is_wide_gamut_cs(cs), prores) {
                     (true, ProResProfile::P4444 | ProResProfile::XQ4444) => base_pix,
                     (true, _) => "gbrp10le",
                     (false, _) => base_pix,
@@ -99,21 +107,22 @@ impl CodecFamily {
                 base_extra = vec!["-profile:v", profile_str];
             }
             CodecFamily::HEVC => {
+                // The requested profile is honoured for every colour space.
+                // The former wide-gamut override emitted `gbrp10le` (RGB
+                // 4:4:4) regardless of the requested 4:2:0 — a silent
+                // format substitution, and the one implicated in the
+                // Resolve green/magenta incident (untagged RGB planes).
+                // Wide-gamut YUV now goes through the explicit conversion
+                // below, which is the same conversion the VUI advertises.
                 match hevc_encoder {
                     "libx265" => {
-                        if is_wide_gamut {
-                            base_codec_name = "libx265".to_string();
-                            base_pix_fmt = "gbrp10le".to_string();
-                            base_extra = vec![];
-                        } else {
-                            let pix_fmt = match hevc {
-                                HevcProfile::Main10_420 => "yuv420p10le",
-                                HevcProfile::Main10_444 => "yuv444p10le",
-                            };
-                            base_codec_name = "libx265".to_string();
-                            base_pix_fmt = pix_fmt.to_string();
-                            base_extra = vec!["-preset", "slow"];
-                        }
+                        let pix_fmt = match hevc {
+                            HevcProfile::Main10_420 => "yuv420p10le",
+                            HevcProfile::Main10_444 => "yuv444p10le",
+                        };
+                        base_codec_name = "libx265".to_string();
+                        base_pix_fmt = pix_fmt.to_string();
+                        base_extra = vec!["-preset", "slow"];
                     }
                     "hevc_nvenc" => {
                         base_codec_name = "hevc_nvenc".to_string();
@@ -135,30 +144,32 @@ impl CodecFamily {
                         base_extra = vec!["-realtime", "true"];
                     }
                     _ => {
-                        if is_wide_gamut {
-                            base_codec_name = "libx265".to_string();
-                            base_pix_fmt = "gbrp10le".to_string();
-                            base_extra = vec!["-preset", "slow"];
-                        } else {
-                            let pix_fmt = match hevc {
-                                HevcProfile::Main10_420 => "yuv420p10le",
-                                HevcProfile::Main10_444 => "yuv444p10le",
-                            };
-                            base_codec_name = "libx265".to_string();
-                            base_pix_fmt = pix_fmt.to_string();
-                            base_extra = vec!["-pix_fmt", pix_fmt, "-preset", "slow"];
-                        }
+                        let pix_fmt = match hevc {
+                            HevcProfile::Main10_420 => "yuv420p10le",
+                            HevcProfile::Main10_444 => "yuv444p10le",
+                        };
+                        base_codec_name = "libx265".to_string();
+                        base_pix_fmt = pix_fmt.to_string();
+                        base_extra = vec!["-pix_fmt", pix_fmt, "-preset", "slow"];
                     }
                 }
             }
             CodecFamily::H264 => {
-                if is_wide_gamut {
-                    // H264 has no 10-bit planar RGB support, and doesn't
-                    // encode wide-gamut properly. Use libx265 with gbrp10le.
-                    base_codec_name = "libx265".to_string();
-                    base_pix_fmt = "gbrp10le".to_string();
-                    base_extra = vec!["-pix_fmt", "gbrp10le"];
-                } else {
+                if is_wide_gamut_cs(cs) {
+                    // H.264 (8/10-bit, 4:2:0/4:2:2) has no wide-gamut
+                    // story: its VUI cannot signal AWG/DWG primaries, and
+                    // 4:2:0 subsampling of a wide gamut costs real chroma.
+                    // Wide-gamut H.264 is therefore refused rather than
+                    // silently mislabelled — callers get a loud warning and
+                    // an HEVC/proxy recommendation.
+                    tracing::warn!(
+                        "wide-gamut H.264 is not supported (VUI cannot signal the primaries, \
+                         4:2:0 would discard wide-gamut chroma); falling back to libx264 \
+                         YUV with an honest bt2020nc tag — prefer HEVC or ProRes/DNxHR for \
+                         wide-gamut deliverables"
+                    );
+                }
+                {
                     match h264_encoder {
                         "h264_nvenc" => {
                             let (pf, ext) = match h264 {
@@ -266,18 +277,26 @@ impl CodecFamily {
         // Convert static extra args to owned Strings
         let mut extra: Vec<String> = base_extra.iter().map(|&s| s.to_string()).collect();
 
-        // Inject a scale filter for wide-gamut → YUV pixel formats.
-        // Planar RGB formats (gbrp*) bypass RGB→YUV conversion entirely,
-        // so no matrix correction is needed — the data stays in pure RGB
-        // through the entire encode pipeline.
-        // For YUV formats we force swscale to use the bt2020nc (non-constant
-        // luminance) matrix in full range so the mathematical rotation from
-        // RGB preserves 100% of the wide-gamut colorimetry. Without this,
-        // FFmpeg defaults to BT.601/BT.709 matrix coefficients which clip
-        // values outside the BT.709 gamut.
-        if is_wide_gamut && !base_pix_fmt.starts_with("gbrp") && !base_pix_fmt.starts_with("rgb") {
+        // Inject an EXPLICIT RGB→YUV conversion for every YUV output.
+        //
+        // Why this is unconditional: FFmpeg's swscale otherwise picks its
+        // own defaults (BT.601 for HD-sized frames — measured bit-exact),
+        // which is a latent colour error AND a tag/data mismatch. The
+        // matrix + range written here are the SAME values written into the
+        // bitstream VUI by `pipeline::get_ffmpeg_vui_tags`, so the
+        // conversion is always honestly signalled. That pairing is
+        // load-bearing: claiming a YCbCr matrix for RGB planes (or vice
+        // versa) is the green/magenta decode failure — pinned by the
+        // `tagged_matrix_matches_conversion` test.
+        //
+        // Planar RGB output (gbrp*) is identity: no conversion, no matrix
+        // claim.
+        if !base_pix_fmt.starts_with("gbrp") && !base_pix_fmt.starts_with("rgb") && !base_pix_fmt.starts_with("yuva") {
+            let conv = yuv_conversion_for(cs);
             extra.push("-vf".into());
-            extra.push(format!("scale=flags=accurate_rnd+full_chroma_int:out_color_matrix=bt2020nc:out_range=full,format={}", base_pix_fmt));
+            extra.push(format!(
+                "scale=flags=accurate_rnd+full_chroma_int:out_color_matrix={}:out_range={},format={}",
+                conv.matrix, conv.range, base_pix_fmt));
         }
 
         // Append rate-control flags. ProRes / DNxHR ignore CRF / bitrate
@@ -539,6 +558,49 @@ impl Vp9Profile {
 
 /// A hybrid rate-control / constant-quality preset.
 ///
+/// True when `cs` is anything other than the BT.709 / sRGB container
+/// primaries — i.e. a wide-gamut working space that needs an explicit
+/// non-709 conversion matrix to survive YUV encoding.
+pub fn is_wide_gamut_cs(cs: ColorSpace) -> bool {
+    !matches!(cs, ColorSpace::Rec709 | ColorSpace::Srgb)
+}
+
+/// The explicit RGB→YUV conversion applied by the encoder, mirrored in the
+/// bitstream VUI. Single source of truth for both: the scale filter and the
+/// colour tags must always agree, otherwise a decoder that trusts the tags
+/// (Resolve does) applies the wrong matrix and the picture turns green and
+/// magenta.
+///
+/// - Rec.709 / sRGB: the ecosystem default. NLEs assume 709 for untagged or
+///   709-tagged YUV, and the in-domain clipping measurement for our log
+///   pipeline was 0.000%.
+/// - Wide gamuts: BT.2020 non-constant-luminance in full range. It is the
+///   only matrix that cannot clip a wide-gamut source, and it matches the
+///   tagging convention of the professional AWG3/LogC3 references
+///   (`bt2020nc` + `bt2020` primaries).
+///
+/// Note the primaries tag deliberately stays `unspecified` for camera-vendor
+/// gamuts: no standard primaries code point covers AWG3's red primary, so any
+/// standard tag would be a mislabel. The transfer carries no standard code
+/// point for LogC3 either (`unknown`). Meaning travels via the filename and
+/// the explicit input assignment in the NLE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct YuvConversion {
+    /// FFmpeg/swscale matrix name, also the VUI `matrix_coefficients` name.
+    pub matrix: &'static str,
+    /// FFmpeg range keyword (`tv` = limited 64-940, `full` = 0-1023).
+    pub range: &'static str,
+}
+
+/// Conversion spec for a colour space. See [`YuvConversion`].
+pub fn yuv_conversion_for(cs: ColorSpace) -> YuvConversion {
+    if is_wide_gamut_cs(cs) {
+        YuvConversion { matrix: "bt2020nc", range: "full" }
+    } else {
+        YuvConversion { matrix: "bt709", range: "tv" }
+    }
+}
+
 /// Quality presets (`Lossless` / `High` / `Standard`) map to `-cq` (HW) or
 /// `-crf` (SW).  Bitrate presets (`Master400M` / `Standard150M`) map to
 /// `-b:v` / `-maxrate`.  The `Custom` variant lets the user type an arbitrary
@@ -685,6 +747,173 @@ pub fn rate_control_args(rc: &RateControl, encoder_name: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build the full arg list for one (family, colour space, profile) combo
+    /// the way `run_export` does.
+    fn args_for(family: CodecFamily, cs: ColorSpace, hevc: HevcProfile) -> (String, String, Vec<String>) {
+        family.to_ffmpeg_args(
+            "libx265", "libx264", "libaom-av1", "prores_ks",
+            ProResProfile::HQ, DnxhrProfile::HQX, hevc,
+            H264Profile::High10bit, Av1Profile::Profile0_420_10bit,
+            Vp9Profile::Profile2_420_10bit, &RateControl::Lossless, cs,
+        )
+    }
+
+    fn joined(extra: &[String]) -> String { extra.join(" ") }
+
+    /// The requested subsampling must survive for every colour space. The
+    /// removed wide-gamut override emitted `gbrp10le` (RGB 4:4:4) whatever
+    /// the user asked for, which silently produced 444 files from a 420
+    /// request — the format-contract break behind the Resolve incident.
+    #[test]
+    fn hevc_honours_requested_profile_for_every_colour_space() {
+        for cs in [ColorSpace::Rec709, ColorSpace::ARRIWideGamut3, ColorSpace::Srgb, ColorSpace::Rec2020] {
+            let (_, pf, extra) = args_for(CodecFamily::HEVC, cs, HevcProfile::Main10_420);
+            assert_eq!(pf, "yuv420p10le", "420 request must stay 420 for {cs:?}");
+            assert!(!joined(&extra).contains("gbrp"), "{cs:?} leaked an RGB pixel format into a 420 export");
+
+            let (_, pf, _) = args_for(CodecFamily::HEVC, cs, HevcProfile::Main10_444);
+            assert_eq!(pf, "yuv444p10le", "444 request must stay 444 for {cs:?}");
+        }
+    }
+
+    /// Every YUV output gets an explicit conversion, and it is the one the
+    /// tags claim. FFmpeg's default (BT.601 at HD sizes, measured
+    /// bit-exact) is never allowed to choose silently.
+    #[test]
+    fn every_yuv_output_declares_an_explicit_conversion() {
+        let cases = [
+            (CodecFamily::HEVC, ColorSpace::Rec709, "yuv420p10le", "bt709", "tv"),
+            (CodecFamily::HEVC, ColorSpace::ARRIWideGamut3, "yuv420p10le", "bt2020nc", "full"),
+            (CodecFamily::DNxHR, ColorSpace::ARRIWideGamut3, "yuv422p10le", "bt2020nc", "full"),
+            (CodecFamily::DNxHR, ColorSpace::Rec709, "yuv422p10le", "bt709", "tv"),
+            (CodecFamily::ProRes, ColorSpace::Rec709, "yuv422p10le", "bt709", "tv"),
+        ];
+        for (family, cs, want_pf, want_matrix, want_range) in cases {
+            let (_, pf, extra) = match family {
+                CodecFamily::ProRes => family.to_ffmpeg_args(
+                    "libx265", "libx264", "libaom-av1", "prores_ks", ProResProfile::HQ,
+                    DnxhrProfile::HQX, HevcProfile::Main10_420, H264Profile::High10bit,
+                    Av1Profile::Profile0_420_10bit, Vp9Profile::Profile2_420_10bit,
+                    &RateControl::Lossless, cs),
+                _ => args_for(family, cs, HevcProfile::Main10_420),
+            };
+            assert_eq!(pf, want_pf, "{family:?}/{cs:?} pixel format");
+            let text = joined(&extra);
+            assert!(text.contains("-vf"), "{family:?}/{cs:?} has no conversion filter: {text}");
+            assert!(text.contains(&format!("out_color_matrix={want_matrix}")), "{family:?}/{cs:?} matrix: {text}");
+            assert!(text.contains(&format!("out_range={want_range}")), "{family:?}/{cs:?} range: {text}");
+        }
+    }
+
+    /// Planar RGB output is the identity conversion: no filter, and — the
+    /// part that matters — no matrix claim anywhere in the argument list.
+    #[test]
+    fn rgb_output_never_claims_a_ycbcr_matrix() {
+        let (_, pf, extra) = CodecFamily::ProRes.to_ffmpeg_args(
+            "libx265", "libx264", "libaom-av1", "prores_ks", ProResProfile::HQ,
+            DnxhrProfile::HQX, HevcProfile::Main10_420, H264Profile::High10bit,
+            Av1Profile::Profile0_420_10bit, Vp9Profile::Profile2_420_10bit,
+            &RateControl::Lossless, ColorSpace::ARRIWideGamut3);
+        assert_eq!(pf, "gbrp10le");
+        let text = joined(&extra);
+        assert!(!text.contains("-vf"), "RGB output must not be converted: {text}");
+        assert!(!text.contains("colormatrix"), "RGB output must not claim a matrix: {text}");
+
+        let tags = crate::pipeline::get_ffmpeg_vui_tags(
+            &ColorSpace::ARRIWideGamut3, &crate::color::TransferFunction::ARRIlog3, &pf, "libx265");
+        let tag_text = tags.join(" ");
+        assert!(!tag_text.contains("colormatrix"), "RGB tag claims a matrix: {tag_text}");
+        assert!(!tag_text.contains("colorspace"), "RGB tag claims a matrix: {tag_text}");
+    }
+
+    /// libx265 ignores `-color_*`; only `-x265-params` reaches the VUI.
+    /// Emitting the dead form again is the regression this pins.
+    #[test]
+    fn libx265_signalling_uses_x265_params() {
+        let tags = crate::pipeline::get_ffmpeg_vui_tags(
+            &ColorSpace::Rec709, &crate::color::TransferFunction::Rec709, "yuv420p10le", "libx265");
+        let text = tags.join(" ");
+        assert!(tags.first().map(String::as_str) == Some("-x265-params"), "{text}");
+        assert!(text.contains("colorprim=bt709"), "{text}");
+        assert!(text.contains("transfer=bt709"), "{text}");
+        assert!(text.contains("colormatrix=bt709"), "{text}");
+        assert!(text.contains("range=limited"), "{text}");
+        assert!(!text.contains("-color_primaries"), "dead -color_* form for libx265: {text}");
+
+        // Wide gamut: BT.2020 NCL, full range, primaries left unspecified
+        // (no standard code point describes AWG3's red primary).
+        let tags = crate::pipeline::get_ffmpeg_vui_tags(
+            &ColorSpace::ARRIWideGamut3, &crate::color::TransferFunction::ARRIlog3, "yuv420p10le", "libx265");
+        let text = tags.join(" ");
+        assert!(text.contains("colorprim=unspecified"), "{text}");
+        assert!(text.contains("transfer=unknown"), "{text}");
+        assert!(text.contains("colormatrix=bt2020nc"), "{text}");
+        assert!(text.contains("range=full"), "{text}");
+    }
+
+    /// Non-x265 encoders keep the generic options, which they do honour.
+    #[test]
+    fn non_x265_encoders_keep_generic_colour_options() {
+        let tags = crate::pipeline::get_ffmpeg_vui_tags(
+            &ColorSpace::ARRIWideGamut3, &crate::color::TransferFunction::ARRIlog3, "yuv422p10le", "prores_ks");
+        let text = tags.join(" ");
+        assert!(text.contains("-color_primaries unspecified"), "{text}");
+        assert!(text.contains("-color_trc unknown"), "{text}");
+        assert!(text.contains("-colorspace bt2020nc"), "{text}");
+        assert!(text.contains("-color_range full"), "{text}");
+    }
+
+    /// The pairing invariant across the whole export matrix: whatever matrix
+    /// the scale filter converts with is the matrix the tags advertise.
+    /// A mismatch is the green/magenta decode failure, reproduced on a
+    /// bit-identical stream by flipping only the tag.
+    #[test]
+    fn tagged_matrix_matches_conversion() {
+        let spaces = [
+            ColorSpace::Rec709, ColorSpace::Srgb, ColorSpace::ARRIWideGamut3,
+            ColorSpace::Rec2020, ColorSpace::DaVinciWideGamut, ColorSpace::SGamut3,
+        ];
+        let families = [CodecFamily::HEVC, CodecFamily::DNxHR, CodecFamily::ProRes];
+        for cs in spaces {
+            for family in families {
+                let (codec, pf, extra) = match family {
+                    CodecFamily::ProRes => family.to_ffmpeg_args(
+                        "libx265", "libx264", "libaom-av1", "prores_ks", ProResProfile::HQ,
+                        DnxhrProfile::HQX, HevcProfile::Main10_420, H264Profile::High10bit,
+                        Av1Profile::Profile0_420_10bit, Vp9Profile::Profile2_420_10bit,
+                        &RateControl::Lossless, cs),
+                    _ => args_for(family, cs, HevcProfile::Main10_420),
+                };
+                if crate::pipeline::is_planar_rgb_fmt(&pf) { continue; }
+                let text = joined(&extra);
+                let filter_matrix = text.split("out_color_matrix=").nth(1)
+                    .and_then(|s| s.split(':').next()).expect("no conversion matrix");
+                let tags = crate::pipeline::get_ffmpeg_vui_tags(
+                    &cs, &crate::color::TransferFunction::ARRIlog3, &pf, &codec).join(" ");
+                let tagged = if codec == "libx265" {
+                    tags.split("colormatrix=").nth(1)
+                        .map(|s| s.split(':').next().unwrap()).unwrap_or(filter_matrix)
+                } else {
+                    tags.split("-colorspace ").nth(1).map(|s| s.split(' ').next().unwrap()).unwrap_or("")
+                };
+                assert_eq!(tagged, filter_matrix,
+                    "{family:?}/{cs:?}: filter converts with {filter_matrix} but tags say {tagged}");
+            }
+        }
+    }
+
+    /// Wide-gamut + subsampling is a lossy test/proxy combination; the
+    /// exporter must say so rather than let it pass as a master.
+    #[test]
+    fn wide_gamut_subsampled_is_documented_as_test_scope() {
+        let conv = yuv_conversion_for(ColorSpace::ARRIWideGamut3);
+        assert_eq!(conv.matrix, "bt2020nc");
+        assert_eq!(conv.range, "full");
+        assert!(is_wide_gamut_cs(ColorSpace::ARRIWideGamut3));
+        assert!(!is_wide_gamut_cs(ColorSpace::Rec709));
+        assert!(!is_wide_gamut_cs(ColorSpace::Srgb));
+    }
 
     #[test]
     fn rate_control_lossless_software_uses_crf() {

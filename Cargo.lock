@@ -994,6 +994,7 @@ dependencies = [
  "lru",
  "mimalloc",
  "motioncam-decoder",
+ "naga",
  "percent-encoding",
  "pollster",
  "ratatui",

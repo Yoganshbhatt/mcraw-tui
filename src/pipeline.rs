@@ -10,7 +10,7 @@ use crate::color::{
 };
 use crate::decoder::Decoder;
 use crate::encoder::VideoEncoder;
-use crate::export::{Av1Profile, CodecFamily, DnxhrProfile, H264Profile, HevcProfile, ProResProfile, RateControl, Vp9Profile};
+use crate::export::{Av1Profile, CodecFamily, DnxhrProfile, H264Profile, HevcProfile, ProResProfile, RateControl, Vp9Profile, yuv_conversion_for};
 use crate::file::McrawFileInfo;
 use crate::gpu;
 use crate::hl;
@@ -82,41 +82,59 @@ struct FrameSlot {
     dynamic_white_level: Option<f32>,
 }
 
-pub fn build_ffmpeg_codec_args(family: CodecFamily, hevc_encoder: &str, h264_encoder: &str, av1_encoder: &str, prores_encoder: &str, prores: ProResProfile, dnxhr: DnxhrProfile, hevc: HevcProfile, h264: H264Profile, av1: Av1Profile, vp9: Vp9Profile, rate_control: &RateControl, is_wide_gamut: bool) -> (String, String, Vec<String>) {
-    family.to_ffmpeg_args(hevc_encoder, h264_encoder, av1_encoder, prores_encoder, prores, dnxhr, hevc, h264, av1, vp9, rate_control, is_wide_gamut)
+pub fn build_ffmpeg_codec_args(family: CodecFamily, hevc_encoder: &str, h264_encoder: &str, av1_encoder: &str, prores_encoder: &str, prores: ProResProfile, dnxhr: DnxhrProfile, hevc: HevcProfile, h264: H264Profile, av1: Av1Profile, vp9: Vp9Profile, rate_control: &RateControl, cs: ColorSpace) -> (String, String, Vec<String>) {
+    family.to_ffmpeg_args(hevc_encoder, h264_encoder, av1_encoder, prores_encoder, prores, dnxhr, hevc, h264, av1, vp9, rate_control, cs)
 }
 
-/// Map our `ColorSpace` / `TransferFunction` to **valid** FFmpeg VUI codes.
+/// Build the bitstream colour signalling for one export.
+/// True for planar-RGB pixel formats, where an RGB→YCbCr conversion does
+/// not exist and a matrix tag must therefore never be asserted.
+pub fn is_planar_rgb_fmt(pix_fmt: &str) -> bool {
+    pix_fmt.starts_with("gbrp") || pix_fmt.starts_with("rgb")
+}
+
+/// Build the bitstream colour signalling for one export.
 ///
-/// FFmpeg only accepts a fixed enum of ITU-R / SMPTE color tags. Camera-vendor
-/// gamuts (S-Gamut3, ARRI WG, V-Gamut, etc.) have no standard code, so we
-/// signal `bt2020` (the closest superset wide-gamut tag) for primaries and
-/// `bt2020nc` for the matrix coefficients. Log curves with no standard TRC
-/// code are signalled as `unknown` — downstream tools should rely on the
-/// filename / sidecar to identify the actual curve.
+/// Two things this must get right, both measured on this toolchain:
 ///
-/// Returning an empty vec is also valid (FFmpeg will simply omit VUI tags),
-/// but we always emit something so the bitstream is self-describing.
-pub fn get_ffmpeg_vui_tags(color_space: &ColorSpace, transfer: &TransferFunction) -> Vec<&'static str> {
-    let (primaries, matrix) = match color_space {
-        ColorSpace::Rec709 | ColorSpace::Srgb => ("bt709", "bt709"),
-        ColorSpace::Rec2020 => ("bt2020", "bt2020nc"),
-        ColorSpace::DciP3 => ("smpte431", "bt2020nc"),
-        ColorSpace::DisplayP3 => ("smpte432", "bt2020nc"),
-        // Camera-vendor wide gamuts: no standard FFmpeg tag exists.
-        // Signal the closest superset (bt2020) so the bitstream is at least
-        // syntactically valid and decoders treat it as wide-gamut content.
-        ColorSpace::FGamut
-        | ColorSpace::FGamutC
-        | ColorSpace::SGamut3
-        | ColorSpace::SGamut3Cine
-        | ColorSpace::ARRIWideGamut3
-        | ColorSpace::ARRIWideGamut4
-        | ColorSpace::CanonCinemaGamut
-        | ColorSpace::PanasonicVGamut
-        | ColorSpace::DaVinciWideGamut
-        | ColorSpace::ACESAP1
-        | ColorSpace::AppleWideGamut => ("bt2020", "bt2020nc"),
+/// 1. **Mechanism.** FFmpeg's `-color_primaries` / `-color_trc` /
+///    `-colorspace` / `-color_range` output options are silently dropped by
+///    `libx265` — verified for BT.709 and BT.2020, for RGB and YUV pixel
+///    formats alike (every deliverable read back `unknown`). Only
+///    `-x265-params colorprim=…:transfer=…:colormatrix=…:range=…` actually
+///    reaches the HEVC VUI. Other encoders in the family are driven through
+///    the generic options, which they do honour, so the argument form is
+///    selected per encoder rather than per codec family.
+///
+/// 2. **Pairing.** The matrix and range written here MUST equal the values
+///    `export::yuv_conversion_for` put in the scale filter. Asserting a
+///    YCbCr matrix for RGB planes (or a wrong one for YUV planes) is exactly
+///    the green/magenta decode failure: flipping only the matrix tag on a
+///    bit-identical stream reproduced it (full-frame green-gap −46, sky
+///    +40). RGB output claims no matrix at all.
+///
+/// Primaries/transfer stay `unspecified` for camera-vendor gamuts and log
+/// curves: ITU-R/SMPTE define no code point for them, and writing a
+/// *different* standard's value would be a mislabel that a colour-managed
+/// NLE would act on.
+pub fn get_ffmpeg_vui_tags(
+    color_space: &ColorSpace,
+    transfer: &TransferFunction,
+    pix_fmt: &str,
+    encoder: &str,
+) -> Vec<String> {
+    let primaries = match color_space {
+        ColorSpace::Rec709 | ColorSpace::Srgb => "bt709",
+        ColorSpace::Rec2020 => "bt2020",
+        ColorSpace::DciP3 => "smpte431",
+        ColorSpace::DisplayP3 => "smpte432",
+        // Camera-vendor gamuts (F-Gamut, S-Gamut3, AWG3/4, Canon Cinema
+        // Gamut, V-Gamut, DWG, AP1, Apple Wide Gamut): no standard code
+        // point describes them, and no standard gamut is a superset
+        // (AWG3's red primary is outside BT.2020). `unspecified` is the
+        // truthful answer and also the safest: an NLE is then obliged to
+        // use the operator's input assignment instead of guessing.
+        _ => "unspecified",
     };
     let trc = match transfer {
         TransferFunction::Rec709 => "bt709",
@@ -129,10 +147,37 @@ pub fn get_ffmpeg_vui_tags(color_space: &ColorSpace, transfer: &TransferFunction
         // Camera log curves (S-Log3, V-Log, ARRI LogC3, C-Log3, F-Log2,
         // Apple Log, ACEScct, DaVinci Intermediate) have no standard
         // FFmpeg/ITU TRC code. `unknown` tells decoders not to attempt
-        // any inverse-OETF — the metadata / filename identifies the curve.
+        // any inverse-OETF — the filename / NLE input assignment
+        // identifies the curve.
         _ => "unknown",
     };
-    vec!["-color_primaries", primaries, "-color_trc", trc, "-colorspace", matrix]
+
+    // Planar RGB: identity conversion. Claiming a YCbCr matrix here is the
+    // bug, so no matrix or range is asserted at all.
+    if is_planar_rgb_fmt(pix_fmt) {
+        return match encoder {
+            "libx265" => vec!["-x265-params".into(), format!("colorprim={primaries}:transfer={trc}")],
+            _ => vec!["-color_primaries".into(), primaries.into(), "-color_trc".into(), trc.into()],
+        };
+    }
+
+    let conv = yuv_conversion_for(*color_space);
+    let range_kw = if conv.range == "full" { "full" } else { "limited" };
+    match encoder {
+        // x265's own spelling for the non-constant-luminance BT.2020
+        // matrix is `bt2020nc` (verified in the VUI); `bt2020ncl` is
+        // rejected and silently drops the tag.
+        "libx265" => vec![
+            "-x265-params".into(),
+            format!("colorprim={primaries}:transfer={trc}:colormatrix={}:range={range_kw}", conv.matrix),
+        ],
+        _ => vec![
+            "-color_primaries".into(), primaries.into(),
+            "-color_trc".into(), trc.into(),
+            "-colorspace".into(), conv.matrix.into(),
+            "-color_range".into(), range_kw.into(),
+        ],
+    }
 }
 
 pub fn run_naked(info: &McrawFileInfo, output_path: &str) -> Result<()> {
@@ -304,10 +349,10 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
     } else if lens_mode != LensCorrectionMode::Off {
         tracing::warn!("lens correction enabled but no shading map found in file or decoder");
     }
-    let is_wide_gamut = export_cs != ColorSpace::Rec709 && export_cs != ColorSpace::Srgb;
-    
-    let (codec_name, pix_fmt, mut extra_args) = build_ffmpeg_codec_args(codec_family, &hevc_encoder, &h264_encoder, &av1_encoder, &prores_encoder, prores_profile, dnxhr_profile, hevc_profile, h264_profile, av1_profile, vp9_profile, &rate_control, is_wide_gamut);
-    let vui_tags = get_ffmpeg_vui_tags(&export_cs, &export_tf); extra_args.extend(vui_tags.into_iter().map(String::from));
+    let (codec_name, pix_fmt, mut extra_args) = build_ffmpeg_codec_args(codec_family, &hevc_encoder, &h264_encoder, &av1_encoder, &prores_encoder, prores_profile, dnxhr_profile, hevc_profile, h264_profile, av1_profile, vp9_profile, &rate_control, export_cs);
+    let vui_tags = get_ffmpeg_vui_tags(&export_cs, &export_tf, &pix_fmt, &codec_name);
+    tracing::info!("export signalling: codec={} pix_fmt={} vui={:?}", codec_name, pix_fmt, vui_tags);
+    extra_args.extend(vui_tags);
     
     let audio_temp_path = if info.has_audio && info.audio_sample_rate > 0 && info.audio_channels > 0 {
         let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
