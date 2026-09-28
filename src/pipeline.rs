@@ -6,6 +6,7 @@ use crate::color::{
     compute_color_only_map,
     apply_lens_correction_cpu_with_map,
     apply_display_rolloff,
+    apply_basic_highlight_desat,
 };
 use crate::decoder::Decoder;
 use crate::encoder::VideoEncoder;
@@ -333,6 +334,13 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
             rcd_pipeline = Some(pipeline);
         }
     }
+    // CFA phase assumption: `hl::color_at` maps active-region coords while
+    // the demosaic and the RCD shaders map sensor coords + offset parity.
+    // All reviewed files report offset (0,0), where the three agree. An odd
+    // offset would complete the wrong colour's photosites — loud, not silent.
+    if offset_x & 1 == 1 || offset_y & 1 == 1 {
+        tracing::warn!("odd active offset ({offset_x},{offset_y}): HL completion phase differs from demosaic phase");
+    }
     stats.setup.record(setup_start.elapsed());
     
     let loader_handle = std::thread::Builder::new().name("loader".into()).spawn({
@@ -487,13 +495,22 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
                 // calibration gain that must be divided back out, not folded
                 // into the estimate) and BEFORE demosaic. The resolved src
                 // blacks and rail are the same values the lens formula uses.
-                // Running here also benefits the GPU path, whose upload happens
-                // further down from the same `slot.bayer`; the GPU's own pass
-                // will replace this and this becomes a no-op there, which the
-                // pass's idempotence makes harmless.
-                if highlight_recovery {
+                // `hp` is hoisted: the GPU path receives the same params for
+                // its own on-device pass, so exactly one backend completes
+                // each frame (mutual exclusion — idempotence would make
+                // overlap harmless, but the redundant CPU pass costs ~15 ms).
+                let hp = hl::HlParams::new(if highlight_recovery { hl::HlPolicy::Full } else { hl::HlPolicy::Sensor }, src_wl, [src_bl_r, src_bl_g, src_bl_b], as_shot);
+                // GPU-HL is valid ONLY on raw-domain mosaic: `hp` is
+                // calibrated for pre-lens DNs (rail src_wl, blacks src_bl).
+                // With lens correction on, the device mosaic is
+                // black-subtracted and rescaled to the 0..norm_wl domain
+                // (4095 for 10-bit), where raw-domain params miscensor and
+                // compress (measured: sun core 0.47x level). So lens-on
+                // completion is owned by the CPU-HL pass below for BOTH
+                // backends; the on-device pass serves lens-off exports.
+                let gpu_hl = rcd_pipeline.is_some() && highlight_recovery && !has_lens;
+                if highlight_recovery && !gpu_hl {
                     let _g = PhaseGuard::new(&stats.hl_complete);
-                    let hp = hl::HlParams::new(hl::HlPolicy::Full, src_wl, [src_bl_r, src_bl_g, src_bl_b], as_shot);
                     let (_cens, rewritten) = hl_scratch.apply(&mut slot.bayer, &hl_geom, &hp);
                     if frame_index % 60 == 0 {
                         tracing::info!("hl-complete: censored={} rewritten={} {}", _cens, rewritten, hp.summary());
@@ -544,7 +561,7 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
                 let gpu_ok = if let Some(ref mut pipeline) = rcd_pipeline {
                     let gpu_result = {
                         let _g = PhaseGuard::new(&stats.gpu);
-                        pipeline.process(&slot.bayer, filters, gpu_bl_r, gpu_bl_g, gpu_bl_b, gpu_wl, stride_width, offset_x, offset_y, &fused, &slot.as_shot_neutral, &export_tf)
+                        pipeline.process(&slot.bayer, filters, gpu_bl_r, gpu_bl_g, gpu_bl_b, gpu_wl, stride_width, offset_x, offset_y, &fused, &slot.as_shot_neutral, &export_tf, &hp, gpu_hl, pattern)
                     };
                     match gpu_result {
                         Ok(rgb48le) => {
@@ -556,6 +573,15 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
                 } else { false };
 
                 if !gpu_ok {
+                    if gpu_hl {
+                        // The GPU owned this frame's completion but the
+                        // dispatch failed: fall back to the CPU pass before
+                        // the CPU demosaic, or the raw censored bayer would
+                        // demosaic unrecovered (a silent regression vs the
+                        // pre-GPU behaviour, where the bayer was completed).
+                        let _g = PhaseGuard::new(&stats.hl_complete);
+                        hl_scratch.apply(&mut slot.bayer, &hl_geom, &hp);
+                    }
                     {
                         let _g = PhaseGuard::new(&stats.demosaic);
                         demosaic.process_par_into(&slot.bayer, stride_width, offset_x, offset_y, active_width, active_height, &pattern, &mut rgb)?;
@@ -580,7 +606,15 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
                         let _g = PhaseGuard::new(&stats.wb_hl_ccm);
                         rgb.par_chunks_exact_mut(3).for_each(|chunk| {
                             // 1. Apply WB
-                            let wb = [chunk[0] * r_gain, chunk[1], chunk[2] * b_gain];
+                            let mut wb = [chunk[0] * r_gain, chunk[1], chunk[2] * b_gain];
+
+                            // 1b. OFF/basic mode only: classic neutral desat
+                            // of clipped highlights (no RAW reconstruction).
+                            // ON/reconstruction must NOT run this — it would
+                            // crush the completed 1.0-1.9 gradient (08).
+                            if !highlight_recovery {
+                                apply_basic_highlight_desat(&mut wb);
+                            }
 
                             // 2. Apply CCM
                             let out = mat_mul_vec3(&fused, &wb);

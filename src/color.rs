@@ -821,6 +821,39 @@ pub fn highlight_clip(pixels: &mut [f32], threshold: f32) {
     }
 }
 
+/// Basic highlight handling for OFF/basic mode (no RAW reconstruction).
+///
+/// Restores the pre-HL-reconstruction baseline pass (85e6a1e era, see the
+/// color-pipeline-validation skill): per-pixel desaturation toward neutral
+/// on white-balanced values, BEFORE the CCM. Exact legacy math, kept
+/// bit-stable on purpose — the CPU export and the `main_basic` WGSL entry
+/// point must agree to 1 LSB:
+///
+/// ```text
+/// m = max(r, g, b);  n = min(m, 1.0)
+/// t = m > 0.95 ? min((m - 0.95) / 0.05, 1.0) : 0.0
+/// rgb += (n - rgb) * t
+/// ```
+///
+/// Properties: identity below 0.95 (genuine colors untouched); at-rail
+/// imbalance (sensor magenta) collapses to neutral white; smooth (C0)
+/// ramp, no hard clip — relative brightness is preserved, which is what
+/// separates this from `min(1.0)` clipping. Runs for OFF (`Sensor`) exports
+/// on both backends and all transfer families; ON (`Full`) exports must NOT
+/// call this — reconstruction owns those pixels, and this pass would crush
+/// the completed 1.0-1.9 gradient into a flat slab (see Scratch-HL/08).
+pub fn apply_basic_highlight_desat(rgb: &mut [f32]) {
+    rgb.par_chunks_exact_mut(3).for_each(|c| {
+        let m = c[0].max(c[1]).max(c[2]);
+        if m <= 0.95 { return; }
+        let n = m.min(1.0);
+        let t = ((m - 0.95) / 0.05).min(1.0);
+        c[0] += (n - c[0]) * t;
+        c[1] += (n - c[1]) * t;
+        c[2] += (n - c[2]) * t;
+    });
+}
+
 pub fn normalize_linear(pixels: &mut [f32], black_level: f64, white_level: f64) {
     let range = if white_level > black_level { white_level - black_level } else { 1.0 }; let inv_range = 1.0 / range;
     for v in pixels.iter_mut() { *v = ((*v as f64 - black_level) * inv_range).clamp(0.0, 1.0) as f32; }
@@ -1034,6 +1067,41 @@ pub fn apply_lens_correction_cpu_with_map(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OFF/basic desat: at-rail sensor magenta collapses to neutral white.
+    #[test]
+    fn basic_highlight_desat_neutralizes_rail_magenta() {
+        let mut px = [1.0f32, 0.9, 1.0];
+        apply_basic_highlight_desat(&mut px);
+        assert_eq!(px, [1.0, 1.0, 1.0]);
+    }
+
+    /// Below 0.95 the pass is bit-identical (genuine colors untouched).
+    #[test]
+    fn basic_highlight_desat_identity_below_threshold() {
+        let mut px = [0.9f32, 0.1, 0.3];
+        apply_basic_highlight_desat(&mut px);
+        assert_eq!(px, [0.9, 0.1, 0.3]);
+    }
+
+    /// Ramp midpoint: m=0.975 -> t=0.5, mixed toward n=min(m,1).
+    #[test]
+    fn basic_highlight_desat_ramp_midpoint_value() {
+        let mut px = [0.975f32, 0.8, 0.7];
+        apply_basic_highlight_desat(&mut px);
+        assert!((px[0] - 0.975).abs() < 1e-6);
+        assert!((px[1] - 0.8875).abs() < 1e-6);
+        assert!((px[2] - 0.8375).abs() < 1e-6);
+    }
+
+    /// Super-white neutral pulls to display white (documented basic-mode
+    /// behavior — ON/reconstruction owns the gradient, never this pass).
+    #[test]
+    fn basic_highlight_desat_caps_superwhite_at_one() {
+        let mut px = [1.2f32, 1.19, 1.21];
+        apply_basic_highlight_desat(&mut px);
+        assert_eq!(px, [1.0, 1.0, 1.0]);
+    }
 
     /// The detector should pick the identity matrix as-is when given the
     /// identity (the row-sum white is exactly D50).

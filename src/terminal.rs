@@ -49,7 +49,7 @@ pub fn detect() -> TerminalProtocol {
             "kitty" => return TerminalProtocol::Kitty,
             "sixel" => return TerminalProtocol::Sixel,
             "text" => return TerminalProtocol::TextFallback,
-            _ => {}  // unrecognised value → fall through to auto-detect
+            _ => {} // unrecognised value → fall through to auto-detect
         }
     }
 

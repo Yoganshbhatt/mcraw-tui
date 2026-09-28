@@ -17,6 +17,7 @@ struct Uniforms {
     black_r: f32, black_g: f32, black_b: f32, _black_pad: f32,
     ccm_row0: vec4<f32>, ccm_row1: vec4<f32>, ccm_row2: vec4<f32>,
     phase_x: i32, phase_y: i32,
+    _pad: vec2<u32>,
 };
 
 @group(0) @binding(0) var cfa_tex: texture_2d<u32>;

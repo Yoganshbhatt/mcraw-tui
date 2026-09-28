@@ -4,6 +4,7 @@ struct Uniforms {
     black_r: f32, black_g: f32, black_b: f32, _black_pad: f32,
     ccm_row0: vec4<f32>, ccm_row1: vec4<f32>, ccm_row2: vec4<f32>,
     phase_x: i32, phase_y: i32,
+    _pad: vec2<u32>,
 };
 
 const WB_GAIN_MIN: f32 = 0.1;
@@ -80,11 +81,13 @@ fn read_lp(gx: i32, gy: i32) -> f32 {
     return textureLoad(lp_tex, vec2<i32>(cx, cy), 0).r;
 }
 
-@compute @workgroup_size(16, 16)
-fn main(
-    @builtin(workgroup_id) wg_id: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>
-) {
+/// Shared body for both fill entry points (`main` = ON/reconstruction,
+/// `main_basic` = OFF/basic handling). `g_basic` selects the highlight
+/// branch; every `workgroupBarrier()` stays on unconditional paths, so both
+/// entries inherit valid synchronization.
+var<private> g_basic: bool;
+
+fn run(wg_id: vec3<u32>, lid: vec3<u32>) {
     let tile_origin_x = i32(wg_id.x * VALID_X);
     let tile_origin_y = i32(wg_id.y * VALID_Y);
     let thread_id = lid.y * 16u + lid.x;
@@ -254,24 +257,28 @@ fn main(
                 let gw = gn;
                 let bw = bn * wb_b;
 
-                // 2. Highlight Reconstruction — desaturate toward neutral
-                //    when a single channel clips. Only for display-referred
-                //    curves (Linear gm=0, Rec.709 gm=1, Gamma2.4 gm=12).
-                //    Log curves encode 4-100× of dynamic range — skip to
-                //    preserve highlight detail for the scene-referred OETF.
                 let is_display_referred = gm == 0u || gm == 1u || gm == 12u;
+                // 2. Highlight handling — mode-selected (see `g_basic`).
+                //    ON  (reconstruction): no desaturation at all. The
+                //      completed 1.0-1.9 gradient must reach the rolloff
+                //      intact; any level-triggered mix here crushes it into
+                //      a flat slab (Scratch-HL/08).
+                //    OFF (basic): the classic neutral desaturation on WB'd
+                //      values, exact mirror of `apply_basic_highlight_desat`
+                //      in `src/color.rs` (same ops, same order, same 0.95
+                //      ramp) — at-rail sensor imbalance collapses to white
+                //      with no reconstruction and no hard clip.
                 var final_rw = rw;
                 var final_gw = gw;
                 var final_bw = bw;
-                if (is_display_referred) {
-                    let max_raw = max(rn, max(gn, bn));
-                    let max_wb  = max(rw, max(gw, bw));
-                    let t_highlight = clamp((max_raw - 0.95) / 0.05, 0.0, 1.0);
-                    let neutral = min(1.0, max_wb);
-                    if (t_highlight > 0.0) {
-                        final_rw = mix(rw, neutral, t_highlight);
-                        final_gw = mix(gw, neutral, t_highlight);
-                        final_bw = mix(bw, neutral, t_highlight);
+                if (g_basic) {
+                    let m0 = max(rw, max(gw, bw));
+                    if (m0 > 0.95) {
+                        let n0 = min(m0, 1.0);
+                        let t0 = min((m0 - 0.95) / 0.05, 1.0);
+                        final_rw = rw + (n0 - rw) * t0;
+                        final_gw = gw + (n0 - gw) * t0;
+                        final_bw = bw + (n0 - bw) * t0;
                     }
                 }
 
@@ -284,11 +291,32 @@ fn main(
                 gout = max(gout, 0.0);
                 bout = max(bout, 0.0);
 
-                // 4. Gamut soft-clip (log curves only): desaturate extreme
-                //    out-of-gamut values (>1.0) toward luminance. Prevents
-                //    "wild highlight peaks" from wide-gamut CCM matrices
-                //    (DWG, CanonCG, SG3C) while preserving in-gamut colors.
-                if (!is_display_referred) {
+                // 3b. Display-boundary rolloff — exact mirror of
+                // `apply_display_rolloff` in `src/color.rs` (same ops, same
+                // order, B = 20). Compresses the completed 1.0-1.9 gradient
+                // smoothly before the OETF; identity at/below 1.0.
+                // Finite by construction (WB gains and CCM entries are
+                // bounded; m1 > 1.0 keeps the divisor >= 1.0), so no
+                // non-finite guard is expressible — or needed — here.
+                if (is_display_referred) {
+                    let m1 = max(rout, max(gout, bout));
+                    if (m1 > 1.0) {
+                        let s1 = (1.0 + (m1 - 1.0) / (1.0 + 20.0 * (m1 - 1.0))) / m1;
+                        rout *= s1;
+                        gout *= s1;
+                        bout *= s1;
+                    }
+                }
+
+                // 4. Gamut soft-clip (log curves, BASIC entry only):
+                //    desaturate extreme out-of-gamut values (>1.0) toward
+                //    luminance. Guards uncompleted wild peaks in OFF/basic
+                //    mode. The ON entry bypasses it: completed data is
+                //    neutral by construction, the CPU log path has no such
+                //    stage, and silent luminance-anchored desat in scene/log
+                //    data destroys highlight chroma the colorist owns
+                //    (measured 12x collapse on real frames pre-gate).
+                if (!is_display_referred && g_basic) {
                     let max_val = max(rout, max(gout, bout));
                     if (max_val > 1.0) {
                         let lum = 0.2126 * rout + 0.7152 * gout + 0.0722 * bout;
@@ -423,4 +451,22 @@ fn main(
             }
         }
     }
+}
+
+@compute @workgroup_size(16, 16)
+fn main(
+    @builtin(workgroup_id) wg_id: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>
+) {
+    g_basic = false;
+    run(wg_id, lid);
+}
+
+@compute @workgroup_size(16, 16)
+fn main_basic(
+    @builtin(workgroup_id) wg_id: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>
+) {
+    g_basic = true;
+    run(wg_id, lid);
 }
