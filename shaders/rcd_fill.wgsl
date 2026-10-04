@@ -259,10 +259,12 @@ fn run(wg_id: vec3<u32>, lid: vec3<u32>) {
 
                 let is_display_referred = gm == 0u || gm == 1u || gm == 12u;
                 // 2. Highlight handling — mode-selected (see `g_basic`).
-                //    ON  (reconstruction): no desaturation at all. The
-                //      completed 1.0-1.9 gradient must reach the rolloff
+                //    ON  (reconstruction): no LEVEL-triggered desaturation —
+                //      the completed 1.0-1.9 gradient must reach the rolloff
                 //      intact; any level-triggered mix here crushes it into
-                //      a flat slab (Scratch-HL/08).
+                //      a flat slab (Scratch-HL/08). Imbalance-hedging happens
+                //      later, post-CCM (3a), so completed-neutral data is
+                //      never touched while residuals are eased to luminance.
                 //    OFF (basic): the classic neutral desaturation on WB'd
                 //      values, exact mirror of `apply_basic_highlight_desat`
                 //      in `src/color.rs` (same ops, same order, same 0.95
@@ -290,6 +292,30 @@ fn run(wg_id: vec3<u32>, lid: vec3<u32>) {
                 rout = max(rout, 0.0);
                 gout = max(gout, 0.0);
                 bout = max(bout, 0.0);
+
+                // 3a. ON/display hedge — exact mirror of
+                // `apply_on_highlight_imbalance_hedge` in `src/color.rs`
+                // (same ops, same order, same gates). Eases imbalanced
+                // above-rail residuals (single-censored warm-sky bias)
+                // toward luminance BEFORE the rolloff; balanced
+                // completed-neutral data (imbalance ~0) passes through
+                // untouched. OFF/basic keeps the classic desat above.
+                if (is_display_referred && !g_basic) {
+                    let mh = max(rout, max(gout, bout));
+                    if (mh >= 0.995) {
+                        let mnh = min(rout, min(gout, bout));
+                        let imbh = (mh - mnh) / mh;
+                        if (imbh > 0.2) {
+                            var tl = (mh - 0.995) / 0.005; tl = clamp(tl, 0.0, 1.0); tl = tl * tl * (3.0 - 2.0 * tl);
+                            var tih = (imbh - 0.2) / 0.2; tih = clamp(tih, 0.0, 1.0); tih = tih * tih * (3.0 - 2.0 * tih);
+                            let th = tl * tih;
+                            let lh = 0.2126 * rout + 0.7152 * gout + 0.0722 * bout;
+                            rout += (lh - rout) * th;
+                            gout += (lh - gout) * th;
+                            bout += (lh - bout) * th;
+                        }
+                    }
+                }
 
                 // 3b. Display-boundary rolloff — exact mirror of
                 // `apply_display_rolloff` in `src/color.rs` (same ops, same

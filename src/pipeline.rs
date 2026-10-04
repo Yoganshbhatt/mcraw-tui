@@ -7,6 +7,8 @@ use crate::color::{
     apply_lens_correction_cpu_with_map,
     apply_display_rolloff,
     apply_basic_highlight_desat,
+    apply_on_highlight_imbalance_hedge,
+    apply_exposure_gain,
 };
 use crate::decoder::Decoder;
 use crate::encoder::VideoEncoder;
@@ -193,11 +195,11 @@ pub fn run_naked(info: &McrawFileInfo, output_path: &str) -> Result<()> {
 pub fn run(info: &McrawFileInfo, output_path: &str) -> Result<()> {
     let never_cancel = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(PipelineStats::new());
-    run_export(info.clone(), output_path.to_string(), Arc::new(|_| {}), never_cancel, stats, ColorSpace::Rec709, TransferFunction::Rec709, CodecFamily::ProRes, ProResProfile::HQ, DnxhrProfile::HQX, HevcProfile::Main10_420, H264Profile::Main8bit, Av1Profile::Profile0_420_10bit, Vp9Profile::Profile2_420_10bit, "libx265".to_string(), "libx264".to_string(), "libaom-av1".to_string(), "prores_ks".to_string(), RateControl::Lossless, None, LensCorrectionMode::Full, BlWlMode::Dynamic, true)
+    run_export(info.clone(), output_path.to_string(), Arc::new(|_| {}), never_cancel, stats, ColorSpace::Rec709, TransferFunction::Rec709, CodecFamily::ProRes, ProResProfile::HQ, DnxhrProfile::HQX, HevcProfile::Main10_420, H264Profile::Main8bit, Av1Profile::Profile0_420_10bit, Vp9Profile::Profile2_420_10bit, "libx265".to_string(), "libx264".to_string(), "libaom-av1".to_string(), "prores_ks".to_string(), RateControl::Lossless, None, LensCorrectionMode::Full, BlWlMode::Dynamic, true, 0.0)
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn Fn(f64) + Send + Sync>, cancelled: Arc<AtomicBool>, stats: Arc<PipelineStats>, export_cs: ColorSpace, export_tf: TransferFunction, codec_family: CodecFamily, prores_profile: ProResProfile, dnxhr_profile: DnxhrProfile, hevc_profile: HevcProfile, h264_profile: H264Profile, av1_profile: Av1Profile, vp9_profile: Vp9Profile, hevc_encoder: String, h264_encoder: String, av1_encoder: String, prores_encoder: String, rate_control: RateControl, custom_fps: Option<f64>, lens_mode: LensCorrectionMode, blwl_mode: BlWlMode, highlight_recovery: bool) -> Result<()> {
+pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn Fn(f64) + Send + Sync>, cancelled: Arc<AtomicBool>, stats: Arc<PipelineStats>, export_cs: ColorSpace, export_tf: TransferFunction, codec_family: CodecFamily, prores_profile: ProResProfile, dnxhr_profile: DnxhrProfile, hevc_profile: HevcProfile, h264_profile: H264Profile, av1_profile: Av1Profile, vp9_profile: Vp9Profile, hevc_encoder: String, h264_encoder: String, av1_encoder: String, prores_encoder: String, rate_control: RateControl, custom_fps: Option<f64>, lens_mode: LensCorrectionMode, blwl_mode: BlWlMode, highlight_recovery: bool, exposure_ev: f32) -> Result<()> {
     tracing::info!("run_export: input={} output={} codec={} cs={} tf={}", info.path, output_path, codec_family.name(), export_cs.name(), export_tf.name());
     let setup_start = Instant::now();
     let decoder = Decoder::new(&info.path)?; let timestamps = decoder.timestamps()?;
@@ -592,6 +594,17 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
                     }
                 }
 
+                // Diagnostic exposure shift (CLI --exposure-ev, default
+                // 0 = off): linear gain on the mosaic after completion and
+                // lens, before demosaic/upload, so both backends see
+                // identically scaled data (GPU uploads this buffer). The
+                // black pedestal scales with the gain — a documented
+                // approximation, irrelevant for highlight inspection,
+                // which is all this flag is for.
+                if exposure_ev != 0.0 && exposure_ev.is_finite() {
+                    apply_exposure_gain(&mut slot.bayer, exposure_ev);
+                }
+
                 // GPU gets the same per-channel blacks the CPU normalizes
                 // with (norm_bl_*): 0 when lens correction already
                 // subtracted them, else the resolved src blacks. The WGSL
@@ -668,13 +681,21 @@ pub fn run_export(info: McrawFileInfo, output_path: String, on_progress: Arc<dyn
                             chunk[2] = out[2].max(0.0);
                         });
                     }
-                    // Display-boundary rolloff, display-referred transfers only.
+                    // Display-boundary handling, display-referred transfers only.
                     // Hue-preserving (uniform scale) so it cannot introduce a
                     // channel-ratio error, and identity below 1.0 so it cannot
                     // temper anything a display-referred deliverable would have
                     // shown as not-white. Scene-referred (log) exports are
                     // untouched: their headroom belongs to the colourist.
+                    //
+                    // ON/reconstruction only: hedge imbalanced above-rail
+                    // residuals (single-censored warm-sky bias) toward
+                    // luminance BEFORE the rolloff compresses levels. Balanced
+                    // completed-neutral data passes through bit-identically.
                     if export_tf.is_display_referred() {
+                        if highlight_recovery {
+                            apply_on_highlight_imbalance_hedge(&mut rgb);
+                        }
                         apply_display_rolloff(&mut rgb);
                     }
                     {

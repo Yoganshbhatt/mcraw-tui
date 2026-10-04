@@ -67,6 +67,13 @@ pub enum CliCommands {
         /// reconstruction.
         #[arg(long)]
         no_highlight_recovery: bool,
+        /// Diagnostic exposure shift in stops, applied as a linear gain to
+        /// the mosaic after completion+lens and before demosaic (both
+        /// backends identically). Negative values pull highlights out of
+        /// clipping for inspection. Default 0. Not a grading control: the
+        /// black pedestal scales with the gain (documented approximation).
+        #[arg(long, default_value = "0.0")]
+        exposure_ev: f32,
     },
 }
 
@@ -144,12 +151,14 @@ impl CliCommands {
                 prores_profile, dnxhr_profile, hevc_profile, h264_profile,
                 av1_profile, vp9_profile, rate_control,
                 lens_correction, blwl, fps, no_highlight_recovery,
+                exposure_ev,
             } => CliCommands::Export {
                 file: file.or(top_level_file),
                 format, output, color_space, transfer_function,
                 prores_profile, dnxhr_profile, hevc_profile, h264_profile,
                 av1_profile, vp9_profile, rate_control,
                 lens_correction, blwl, fps, no_highlight_recovery,
+                exposure_ev,
             },
         }
     }

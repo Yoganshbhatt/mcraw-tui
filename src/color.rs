@@ -842,6 +842,47 @@ pub fn highlight_clip(pixels: &mut [f32], threshold: f32) {
 /// on both backends and all transfer families; ON (`Full`) exports must NOT
 /// call this — reconstruction owns those pixels, and this pass would crush
 /// the completed 1.0-1.9 gradient into a flat slab (see Scratch-HL/08).
+/// Hedge for reconstructed-highlight residuals on the ON/display path.
+///
+/// Rationale (identifiability): at a single-censored photosite under a warm
+/// illuminant, the true value is ambiguous between "hot neutral" and "warm
+/// scene" from local data alone. The completion bets hot-neutral, leaving a
+/// systematic imbalance that narrow-gamut display rendering amplifies (same
+/// linear data reads neutral in AWG3/LogC3) while log forgives. This hedges
+/// the bet at render time, display-only: pixels at or above the rail whose
+/// channels disagree are eased toward luminance. Completed-neutral data
+/// (imbalance ~0), uncensored brights (below rail) and genuinely smooth
+/// gradients pass through bit-identically; log exports never call this.
+/// The WGSL port in `rcd_fill.wgsl` (ON entry) must mirror these ops exactly.
+pub fn apply_on_highlight_imbalance_hedge(rgb: &mut [f32]) {
+    rgb.par_chunks_exact_mut(3).for_each(|c| {
+        let m = c[0].max(c[1]).max(c[2]);
+        if m < 0.995 { return; }
+        let mn = c[0].min(c[1]).min(c[2]);
+        let imb = if m > 1e-6 { (m - mn) / m } else { 0.0 };
+        if imb <= 0.2 { return; }
+        let mut tl = (m - 0.995) / 0.005; tl = tl.clamp(0.0, 1.0); tl = tl * tl * (3.0 - 2.0 * tl);
+        let mut ti = (imb - 0.2) / 0.2; ti = ti.clamp(0.0, 1.0); ti = ti * ti * (3.0 - 2.0 * ti);
+        let t = tl * ti;
+        let l = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        c[0] += (l - c[0]) * t;
+        c[1] += (l - c[1]) * t;
+        c[2] += (l - c[2]) * t;
+    });
+}
+
+/// Diagnostic linear gain on raw mosaic values (CLI `--exposure-ev`, in
+/// stops). Applied after completion+lens, before demosaic, so both backends
+/// see identically scaled data. `ev = 0` is bit-identical (early return, no
+/// rounding). Non-finite `ev` is treated as 0. Saturates at u16::MAX.
+pub fn apply_exposure_gain(bayer: &mut [u16], ev: f32) {
+    if ev == 0.0 || !ev.is_finite() { return; }
+    let g = 2f32.powf(ev);
+    bayer.par_iter_mut().for_each(|v| {
+        *v = ((*v as f32) * g).clamp(0.0, 65535.0) as u16;
+    });
+}
+
 pub fn apply_basic_highlight_desat(rgb: &mut [f32]) {
     rgb.par_chunks_exact_mut(3).for_each(|c| {
         let m = c[0].max(c[1]).max(c[2]);
@@ -1068,12 +1109,72 @@ pub fn apply_lens_correction_cpu_with_map(
 mod tests {
     use super::*;
 
+    /// Exposure gain: ev=0 bit-identical, -3EV scales by 1/8, saturates.
+    #[test]
+    fn exposure_gain_exact() {
+        let mut m = vec![1023u16, 64, 512, 8000];
+        apply_exposure_gain(&mut m, 0.0);
+        assert_eq!(m, vec![1023, 64, 512, 8000]);
+        apply_exposure_gain(&mut m, -3.0);
+        assert_eq!(m, vec![127, 8, 64, 1000]);
+        let mut big = vec![60000u16];
+        apply_exposure_gain(&mut big, 1.0);
+        assert_eq!(big, vec![65535]);
+        let mut nan = vec![100u16];
+        apply_exposure_gain(&mut nan, f32::NAN);
+        assert_eq!(nan, vec![100]);
+    }
+
     /// OFF/basic desat: at-rail sensor magenta collapses to neutral white.
     #[test]
     fn basic_highlight_desat_neutralizes_rail_magenta() {
         let mut px = [1.0f32, 0.9, 1.0];
         apply_basic_highlight_desat(&mut px);
         assert_eq!(px, [1.0, 1.0, 1.0]);
+    }
+
+    /// ON/display hedge: an imbalanced above-rail residual (the G-only warm-sky
+    /// signature: R/B at rail, G low) is eased strongly toward luminance.
+    #[test]
+    fn on_hedge_neutralizes_imbalanced_above_rail() {
+        let mut px = [1.0f32, 0.66, 1.0];
+        let gap_before = (px[0] + px[2]) / 2.0 - px[1];
+        apply_on_highlight_imbalance_hedge(&mut px);
+        let gap_after = (px[0] + px[2]) / 2.0 - px[1];
+        assert!(gap_after < 0.3 * gap_before,
+                "hedge too weak: {gap_before:.3} -> {gap_after:.3}");
+    }
+
+    /// ON/display hedge: completed-neutral data (imbalance ~0) is bit-identical.
+    #[test]
+    fn on_hedge_identity_for_balanced() {
+        let mut px = [1.5f32, 1.52, 1.49];
+        let before = px;
+        apply_on_highlight_imbalance_hedge(&mut px);
+        assert_eq!(px, before);
+    }
+
+    /// ON/display hedge: uncensored brights below the rail are bit-identical
+    /// (genuine colors, e.g. LEDs, untouched).
+    #[test]
+    fn on_hedge_identity_below_rail() {
+        let mut px = [0.99f32, 0.1, 0.05];
+        let before = px;
+        apply_on_highlight_imbalance_hedge(&mut px);
+        assert_eq!(px, before);
+    }
+
+    /// ON/display hedge: luminance-anchored (perceived brightness preserved)
+    /// and C0-smooth across the rail boundary (no banding step).
+    #[test]
+    fn on_hedge_preserves_luma_and_is_smooth() {
+        let luma = |p: &[f32]| 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2];
+        let mut hi = [1.0f32, 1.3, 1.0]; let l0 = luma(&hi);
+        apply_on_highlight_imbalance_hedge(&mut hi);
+        assert!((luma(&hi) - l0).abs() < 1e-5, "luma moved");
+        let mut a = [0.994f32, 1.3, 0.994]; apply_on_highlight_imbalance_hedge(&mut a);
+        let mut b = [0.996f32, 1.3, 0.996]; apply_on_highlight_imbalance_hedge(&mut b);
+        for i in 0..3 { assert!((a[i] - b[i]).abs() < 0.05, "step at rail boundary"); }
     }
 
     /// Below 0.95 the pass is bit-identical (genuine colors untouched).

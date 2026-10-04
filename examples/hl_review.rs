@@ -226,9 +226,12 @@ fn run(o: &Opts) -> Result<bool, anyhow::Error> {
     let (_c, rewritten) = scratch.apply(&mut completed, &geom, &params);
     let pass_ms = t0.elapsed().as_secs_f64() * 1e3;
 
-    // ---- render both through the chain
-    let before = render(&frame.bayer, &geom, &frame, &fused, cs, tf, &o.view);
-    let after = render(&completed, &geom, &frame, &fused, cs, tf, &o.view);
+    // ---- render both through the chain. The `after` image mirrors the
+    // export chain exactly, including the ON/display imbalance hedge for
+    // Full policy (the `before` image is raw truth and never hedged).
+    let hedge_after = policy == HlPolicy::Full && o.view != "log";
+    let before = render(&frame.bayer, &geom, &frame, &fused, cs, tf, &o.view, false);
+    let after = render(&completed, &geom, &frame, &fused, cs, tf, &o.view, hedge_after);
 
     // ---- report
     let out_dir = o.out.clone().unwrap_or_else(|| {
@@ -487,9 +490,11 @@ fn fused_matrix(info: &McrawFileInfo, cs: ColorSpace) -> [f32; 9] {
     mat_mul_3x3(&cs.get_xyz_to_rgb_matrix(), &mat_mul_3x3(&cat, &cam_to_xyz))
 }
 
-/// Full chain: demosaic → normalise → WB → CCM → [rolloff] → OETF → sRGB.
+/// Full chain: demosaic → normalise → WB → CCM → [hedge] → [rolloff] → OETF.
+/// `hedge` mirrors the export ON/display imbalance hedge (pipeline.rs); the
+/// raw-truth `before` image always passes false.
 fn render(bayer: &[u16], g: &HlGeometry, f: &Frame, fused: &[f32; 9], cs: ColorSpace,
-          tf: TransferFunction, view: &str) -> Vec<f32> {
+          tf: TransferFunction, view: &str, hedge: bool) -> Vec<f32> {
     let mut rgb = vec![0f32; g.width * g.height * 3];
     let dem = BilinearDemosaic::new(g.pattern);
     dem.process_par_into(bayer, g.stride as u32, g.offset_x as u32, g.offset_y as u32,
@@ -502,6 +507,13 @@ fn render(bayer: &[u16], g: &HlGeometry, f: &Frame, fused: &[f32; 9], cs: ColorS
         let o = mat_mul_vec3(fused, &wb);
         c[0] = o[0].max(0.0); c[1] = o[1].max(0.0); c[2] = o[2].max(0.0);
     });
+    // Preview PNGs need display-referred codes for viewing. A log transfer
+    // leaves scene codes, so it gets a viewing encode; any other transfer
+    // already display-encoded the triple, and a second OETF would wash
+    // brights to white and hide real chroma (it masked the Rec709-ON
+    // residual tint through analysis — the after-PNG is a pipeline witness,
+    // not a pretty picture).
+    let needs_viewing_encode = view == "log";
     match view {
         "log" => { tf.process(&mut rgb); }
         _ => {
@@ -512,14 +524,17 @@ fn render(bayer: &[u16], g: &HlGeometry, f: &Frame, fused: &[f32; 9], cs: ColorS
                     for v in c.iter_mut() { *v = *v * 1.35; }
                 });
             }
+            if hedge { apply_on_highlight_imbalance_hedge(&mut rgb); }
             apply_display_rolloff(&mut rgb);
             tf.process(&mut rgb);
         }
     }
-    // linear -> sRGB for viewing
-    rgb.par_chunks_exact_mut(3).for_each(|c| {
-        for v in c.iter_mut() { *v = rec709_oetf((*v).clamp(0.0, 1.0)); }
-    });
+    if needs_viewing_encode {
+        // log -> sRGB for viewing
+        rgb.par_chunks_exact_mut(3).for_each(|c| {
+            for v in c.iter_mut() { *v = rec709_oetf((*v).clamp(0.0, 1.0)); }
+        });
+    }
     let _ = cs;
     rgb
 }

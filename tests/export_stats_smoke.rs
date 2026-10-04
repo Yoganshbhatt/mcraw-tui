@@ -89,6 +89,7 @@ fn export_pipeline_emits_per_phase_stats() {
         mcraw_tui::pipeline::LensCorrectionMode::Full,
         mcraw_tui::pipeline::BlWlMode::Dynamic,
         true,
+        0.0,
     );
 
     let wall = start.elapsed();

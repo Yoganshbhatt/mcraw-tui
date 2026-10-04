@@ -648,6 +648,67 @@ mod tests {
         assert!(gap > 5000.0, "ON path desaturated chromatic highlights: gap={gap:.0}");
     }
 
+    /// ON/display hedge parity: an imbalanced above-rail field (censored R/B
+    /// completed to the rail, dim G — the warm-sky residual shape) must be
+    /// eased toward luminance through the ON entry, matching the CPU
+    /// `apply_on_highlight_imbalance_hedge` chain within 3 LSB. Pre-fix the
+    /// ON entry had no hedge (gap ~12000 codes); the fixed path prints a
+    /// partial residual (~2900 — the lower bound pins that the gate is
+    /// partial, not a nuke-to-zero). Interior only (RCD edges).
+    #[test]
+    fn on_hedge_parity_on_adapter() {
+        use crate::file::BayerPattern;
+        use crate::hl::{HlGeometry, HlParams, HlPolicy, HlScratch};
+        let ctx = match pollster::block_on(super::GpuContext::new()) {
+            Ok(c) => std::sync::Arc::new(c),
+            Err(_) => { eprintln!("SKIP on_hedge_parity_on_adapter: no GPU adapter"); return; }
+        };
+        let (w, h) = (64u32, 48u32);
+        let pattern = BayerPattern::GBRG;
+        let mut mosaic = vec![0u16; (w * h) as usize];
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let c = crate::hl::color_at(x as i32, y as i32, pattern);
+                mosaic[y * w as usize + x] = if c == 1 { 700 } else { 1800 };
+            }
+        }
+        let full = HlParams::new(HlPolicy::Full, 1023.0, [64.0, 64.0, 64.0], [1.0, 1.0, 1.0]);
+        let mut pipe = super::RcdPipeline::new(ctx, w, h).expect("RcdPipeline::new");
+        let bytes = pipe.process(&mosaic, 0x49494949, 64.0, 64.0, 64.0, 1023.0, w, 0, 0,
+            &crate::color::identity_ccm(), &[1.0, 1.0, 1.0],
+            &crate::color::TransferFunction::Rec709, &full, true, pattern).expect("process");
+        let u16s: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        // CPU reference: the HL pass floors censored R/B to exactly the rail
+        // (support ratio 0.663 < 1 -> est = max(0.663, 1.0) = 1.0 -> DN 1023);
+        // flat field keeps both demosaics exact, isolating the hedge stage.
+        let mut m2 = mosaic.clone();
+        let g = HlGeometry { stride: w as usize, offset_x: 0, offset_y: 0,
+                             width: w as usize, height: h as usize, pattern };
+        HlScratch::new().apply(&mut m2, &g, &full);
+        assert_eq!(m2[1], 1023, "censored B must complete to exactly the rail");
+        let norm = |v: f32| (v - 64.0) / 959.0;
+        let mut cref = [norm(1023.0), norm(700.0), norm(1023.0)];
+        crate::color::apply_on_highlight_imbalance_hedge(&mut cref);
+        crate::color::TransferFunction::Rec709.process(&mut cref);
+        let cexp = cref.map(|v| (v.clamp(0.0, 1.0) * 65535.0) as u16);
+        let mut maxd = 0i32;
+        let (mut sr, mut sg, mut sb) = (0u64, 0u64, 0u64); let mut n = 0u64;
+        for y in 4..h as usize - 4 {
+            for x in 4..w as usize - 4 {
+                let px = &u16s[(y * w as usize + x) * 3..][..3];
+                maxd = maxd.max((px[0] as i32 - cexp[0] as i32).abs())
+                    .max((px[1] as i32 - cexp[1] as i32).abs())
+                    .max((px[2] as i32 - cexp[2] as i32).abs());
+                sr += px[0] as u64; sg += px[1] as u64; sb += px[2] as u64; n += 1;
+            }
+        }
+        let gap = ((sr + sb) as f64 / 2.0 - sg as f64) / n as f64;
+        eprintln!("on-hedge: max deviation {maxd} codes, residual green-gap {gap:.0} codes (want ~2900)");
+        assert!(gap < 5000.0, "ON hedge did not fire on imbalanced rail residual: gap={gap:.0}");
+        assert!(gap > 500.0, "ON hedge nuked the residual instead of easing it: gap={gap:.0}");
+        assert!(maxd <= 3, "CPU/GPU ON hedge must agree, maxd={maxd}");
+    }
+
     /// ON-log must NOT desaturate: the log soft-clip (luminance-anchored,
     /// `t_soft` up to ~0.9 on completed highlights) has no CPU counterpart
     /// and collapses highlight chroma (measured 12x loss on real frames).

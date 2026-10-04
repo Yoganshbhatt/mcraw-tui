@@ -30,6 +30,8 @@
 Thumbs.db
 
 # Working files / design docs
+# (active notes live in docs/ — one rule covers the whole folder)
+docs/
 OPTIMIZATION_SESSION.json
 mcraw-stats-test.json
 mcraw-tui-redesign.txt

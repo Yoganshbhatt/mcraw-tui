@@ -79,4 +79,4 @@ Full keybinding reference: press `?` in the TUI or see the architecture doc.
 
 ## License
 
-Apache-2.0
+GPL-3.0-or-later — see [LICENSE](LICENSE). Copyright (C) 2026 Yogansh Bhatt.
