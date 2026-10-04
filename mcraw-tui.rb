@@ -1,18 +1,18 @@
 class McrawTui < Formula
   desc "Cross Platform TUI for encoding your motioncam MCRAW files to professional video formats. All in the Terminal."
   homepage "https://github.com/Yoganshbhatt/mcraw-tui"
-  version "0.2.4"
+  version "0.2.5"
   license "Apache-2.0"
 
   if OS.mac? && Hardware::CPU.arm?
-    url "https://github.com/Yoganshbhatt/mcraw-tui/releases/download/v0.2.4/mcraw-tui-aarch64-apple-darwin.zip"
-    sha256 "865669B08A99E237D6225F7F4CC82FFAC0B1B56D7691B6F496B44F0660F18962"
+    url "https://github.com/Yoganshbhatt/mcraw-tui/releases/download/v0.2.5/mcraw-tui-aarch64-apple-darwin.zip"
+    sha256 "9E874F92CD862CB7B3EFCF2279146E2C0115929FF4A7B31D491A15A1C9CD725B"
   elsif OS.mac? && Hardware::CPU.intel?
-    url "https://github.com/Yoganshbhatt/mcraw-tui/releases/download/v0.2.4/mcraw-tui-x86_64-apple-darwin.zip"
-    sha256 "6B61A70F3D8AA5FAEBEC688FF5640E32C11CEF4B8C1CCB83E3B0916A3E60EA60"
+    url "https://github.com/Yoganshbhatt/mcraw-tui/releases/download/v0.2.5/mcraw-tui-x86_64-apple-darwin.zip"
+    sha256 "4B363F31147CE64B160173C22AE2D5BB01F64B96C20E75F504C08718FEBC56DF"
   elsif OS.linux? && Hardware::CPU.intel?
-    url "https://github.com/Yoganshbhatt/mcraw-tui/releases/download/v0.2.4/mcraw-tui-x86_64-unknown-linux-gnu.zip"
-    sha256 "4EC865E15FA0939122DA1EF90CF213F62098AD5B37E4D0FEEED43F103724CD97"
+    url "https://github.com/Yoganshbhatt/mcraw-tui/releases/download/v0.2.5/mcraw-tui-x86_64-unknown-linux-gnu.zip"
+    sha256 "05A048054061D20DFB707DC39D0AF1086A18CC414B47464D39ADA398EAB2CB57"
   end
 
   depends_on "ffmpeg"
