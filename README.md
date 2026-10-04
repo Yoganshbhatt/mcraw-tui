@@ -16,6 +16,7 @@ Cross-platform terminal UI for browsing and exporting MotionCam `.mcraw` files t
 - **Custom FPS**: Per-item export frame rate override (23.976, 24, 25, 30, 50, 60, 120 fps)
 - **Custom BL/WL Overrides**: Black level / white level per-channel overrides with 9 modes (Dynamic, Static and 7 custom presets)
 - **Lens Correction**: Vignette and color cast correction (Off / ColorOnly / Full modes) with per-channel shading map interpolation
+- **HL Recovery Toggle**: Highlight-reconstruction on/off switch in Export Settings (`y` key) with CPU/GPU parity
 - **Hardware acceleration**: Auto-detects NVENC, AMF, QSV, VideoToolbox encoders
 - **Pure Rust**: No C++ dependencies, no FFI
 
@@ -68,6 +69,7 @@ mcraw-tui info -f <file.mcraw>
 | `a` / `A` | Add selected / all to queue |
 | `v` / `R` | Render selected / all items |
 | `c/g/t/p/r` | Cycle codec / gamut / transfer / profile / rate |
+| `y` | Toggle HL recovery ON/OFF (when export focused) |
 | `↑/↓/j/k` | Navigate lists / grade sliders |
 | `←/→/h/l` | Frame navigation / grade slider selection |
 | `?` | Help overlay |

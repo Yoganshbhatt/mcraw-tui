@@ -272,6 +272,10 @@ pub struct ExportSummary {
     pub color_space: String,
     pub transfer: String,
     pub rate_control: String,
+    /// Highlight-recovery state the export was launched with (see
+    /// `App::highlight_recovery`; captured for the same reason as the rest:
+    /// the user may cycle the panel mid-render).
+    pub hl_recovery: bool,
     pub frame_count: usize,
     pub elapsed: Duration,
     pub result: Result<(), String>,
@@ -409,6 +413,11 @@ pub struct App {
     pub export_start_time: Option<Instant>,
     pub lens_correction_mode: Cell<LensCorrectionMode>,
     pub blwl_mode: Cell<BlWlMode>,
+    /// Highlight-recovery (reconstruction) for TUI-launched exports.
+    /// Default true (Full reconstruction). Session-local on purpose: presets
+    /// snapshot codec/gamut/transfer/rate only, so applying a preset never
+    /// flips this silently; the toggle always shows the live value.
+    pub highlight_recovery: bool,
 
     // Sticky per-codec profiles
     pub prores_profile: ProResProfile,
@@ -593,6 +602,7 @@ pub enum ExportFocus {
     Fps,
     LensMode,
     BlWlMode,
+    HighlightRecovery,
 }
 
 impl App {
@@ -658,6 +668,7 @@ impl App {
             export_start_time: None,
             lens_correction_mode: Cell::new(LensCorrectionMode::Full),
             blwl_mode: Cell::new(BlWlMode::Dynamic),
+            highlight_recovery: true,
 
             prores_profile: ProResProfile::HQ,
             dnxhr_profile: DnxhrProfile::HQX,
@@ -878,6 +889,7 @@ impl App {
                 if is_current {
                     // Worker produced data for the current file — force Ghost Widget write
                     self.last_written_media_index.set(None);
+                    if !matches!(crate::terminal::protocol(), crate::terminal::TerminalProtocol::TextFallback) {
                     if let Some(sixel) = result.sixel {
                         self.sixel_pending.set(true);
                         self.preview_state = PreviewState::Ready {
@@ -888,6 +900,13 @@ impl App {
                     } else {
                         let msg = result.error.unwrap_or_else(|| "Unknown error".into());
                         self.preview_state = PreviewState::Error(msg);
+                    }
+                    } else {
+                        // No graphics support: never hold image bytes in
+                        // Ready state — the write path must have nothing to
+                        // emit, so a false-positive protocol detection can
+                        // only lose the thumbnail, never corrupt the UI.
+                        self.preview_state = PreviewState::Empty;
                     }
                 }
             }
@@ -911,12 +930,16 @@ impl App {
         let needs_regen = self.needs_rethumbnail.get();
         if !needs_regen {
             if let Some(cached) = self.thumbnail_cache.get(&path_buf) {
-                self.sixel_pending.set(true);
-                self.preview_state = PreviewState::Ready {
-                    sixel: cached.sixel,
-                    width: cached.width,
-                    height: cached.height,
-                };
+                if matches!(crate::terminal::protocol(), crate::terminal::TerminalProtocol::TextFallback) {
+                    self.preview_state = PreviewState::Empty;
+                } else {
+                    self.sixel_pending.set(true);
+                    self.preview_state = PreviewState::Ready {
+                        sixel: cached.sixel,
+                        width: cached.width,
+                        height: cached.height,
+                    };
+                }
                 return;
             }
         }
@@ -930,6 +953,13 @@ impl App {
         //     Without this, the first thumbnail would use 320x180 fallback.
         if self.preview_panel_chars.get().is_none() {
             self.pending_preview_ts = Some(ts);  // restore so next tick retries
+            return;
+        }
+
+        // 4b. No graphics support: don't burn worker threads generating
+        // images nobody can display. Empty renders the "no preview" panel.
+        if matches!(crate::terminal::protocol(), crate::terminal::TerminalProtocol::TextFallback) {
+            self.preview_state = PreviewState::Empty;
             return;
         }
 
@@ -1690,6 +1720,53 @@ impl App {
         self.status_message = format!("BL/WL: {}", next.name());
     }
 
+    /// Toggle highlight-recovery reconstruction for TUI-launched exports.
+    /// ON (default) = Full neutral-axis reconstruction; OFF = Sensor basic
+    /// mode (zero raw writes, display-side neutral handling only). A plain
+    /// bool — direction is meaningless, so forward/backward both flip.
+    pub fn toggle_highlight_recovery(&mut self) {
+        self.highlight_recovery = !self.highlight_recovery;
+        self.export_focus = ExportFocus::HighlightRecovery;
+        self.status_message = format!(
+            "HL Recovery: {}",
+            if self.highlight_recovery { "ON" } else { "OFF" }
+        );
+    }
+
+    /// Move export-panel focus one step up (k). Single source of truth for
+    /// the Up chain — the key handler and the tests share it, so the chain
+    /// cannot drift out of sync with what is tested.
+    pub fn step_export_focus_up(&mut self) {
+        let show_rate = !matches!(self.export_codec_family, crate::export::CodecFamily::ProRes | crate::export::CodecFamily::DNxHR);
+        self.export_focus = match self.export_focus {
+            ExportFocus::CodecFamily => ExportFocus::HighlightRecovery,
+            ExportFocus::HighlightRecovery => ExportFocus::BlWlMode,
+            ExportFocus::BlWlMode => ExportFocus::LensMode,
+            ExportFocus::LensMode => if show_rate { ExportFocus::RateControl } else { ExportFocus::Fps },
+            ExportFocus::RateControl => ExportFocus::Fps,
+            ExportFocus::Fps => ExportFocus::Profile,
+            ExportFocus::Profile => ExportFocus::TransferFunction,
+            ExportFocus::TransferFunction => ExportFocus::ColorSpace,
+            ExportFocus::ColorSpace => ExportFocus::CodecFamily,
+        };
+    }
+
+    /// Move export-panel focus one step down (j). See `step_export_focus_up`.
+    pub fn step_export_focus_down(&mut self) {
+        let show_rate = !matches!(self.export_codec_family, crate::export::CodecFamily::ProRes | crate::export::CodecFamily::DNxHR);
+        self.export_focus = match self.export_focus {
+            ExportFocus::CodecFamily => ExportFocus::ColorSpace,
+            ExportFocus::ColorSpace => ExportFocus::TransferFunction,
+            ExportFocus::TransferFunction => ExportFocus::Profile,
+            ExportFocus::Profile => ExportFocus::Fps,
+            ExportFocus::Fps => if show_rate { ExportFocus::RateControl } else { ExportFocus::LensMode },
+            ExportFocus::RateControl => ExportFocus::LensMode,
+            ExportFocus::LensMode => ExportFocus::BlWlMode,
+            ExportFocus::BlWlMode => ExportFocus::HighlightRecovery,
+            ExportFocus::HighlightRecovery => ExportFocus::CodecFamily,
+        };
+    }
+
     pub fn cycle_codec(&mut self, forward: bool) {
         self.export_codec_family = if forward {
             self.export_codec_family.next()
@@ -1779,6 +1856,7 @@ impl App {
             self.active_profile_name(), self.active_rate_control.name());
         let cs = self.export_color_space;
         let tf = self.export_transfer_function;
+        let hl_recovery = self.highlight_recovery;
         let cf = self.export_codec_family;
         let pp = self.prores_profile;
         let dp = self.dnxhr_profile;
@@ -1805,6 +1883,7 @@ impl App {
             color_space: cs.name().to_string(),
             transfer: tf.name().to_string(),
             rate_control: self.active_rate_control.name(),
+            hl_recovery: hl_recovery,
             frame_count: info.frame_count as usize,
             elapsed: Duration::default(),
             result: Ok(()),
@@ -1826,11 +1905,12 @@ impl App {
         let (tx, rx) = mpsc::channel::<ExportEvent>();
         self.export_rx = Some(rx);
         self.status_message = format!(
-            "Starting export: {} / {} via {} {} ...",
+            "Starting export: {} / {} via {} {} [HL {}] ...",
             cs.name(),
             tf.name(),
             cf.name(),
             self.active_profile_name(),
+            if hl_recovery { "ON" } else { "OFF" },
         );
 
         let progress_cb = {
@@ -1851,7 +1931,8 @@ impl App {
                     info, output_path, progress_cb, cancel_flag, stats,
                     cs, tf, cf, pp, dp, hp, h4p, ap, vp,
                     hevc_enc, h264_enc, av1_enc, prores_enc,
-                    rate_control, custom_fps, lens_mode, blwl_mode, true,
+                    rate_control, custom_fps, lens_mode, blwl_mode, hl_recovery,
+                    0.0,
                 )
             }));
             // Always emit stats before Done so the UI can persist them,
@@ -2441,6 +2522,11 @@ fn execute_click_action(app: &mut App, action: ClickAction) {
             app.cycle_blwl(true);
             return;
         }
+        ClickAction::CycleHl => {
+            app.set_focus(FocusTarget::ExportSettings);
+            app.toggle_highlight_recovery();
+            return;
+        }
         ClickAction::CycleFps => {
             app.set_focus(FocusTarget::ExportSettings);
             app.cycle_export_fps();
@@ -2594,6 +2680,7 @@ pub async fn run(args: Cli) -> Result<()> {
             prores_profile, dnxhr_profile, hevc_profile, h264_profile,
             av1_profile, vp9_profile, rate_control,
             lens_correction, blwl, fps, no_highlight_recovery,
+            exposure_ev,
         }) => {
             let path = match file {
                 Some(p) => p,
@@ -2712,6 +2799,7 @@ pub async fn run(args: Cli) -> Result<()> {
                     pp, dp, hp, h264p, av1p, vp9p,
                     hevc_encoder, h264_encoder, av1_encoder, prores_encoder,
                     rc, fps, lens, blwl_mode, highlight_recovery,
+                    exposure_ev,
                 )
             }).await;
 
@@ -2902,12 +2990,18 @@ pub async fn run(args: Cli) -> Result<()> {
 
                             let _ = out.queue(MoveTo(place_x, place_y));
                             let _ = out.write_all(sixel);
-                            let place = format!("\x1b_Ga=p,i=0,c={fit_w},r={fit_h},m=0\x1b\\");
+                            // Image ID 1 (ID 0 is rejected) + q=2 (suppress
+                            // the Gi=1;OK response that would otherwise arrive
+                            // as phantom keypresses in the event loop).
+                            let place = format!("\x1b_Ga=p,i=1,q=2,c={fit_w},r={fit_h},m=0\x1b\\");
                             let _ = out.write_all(place.as_bytes());
                         }
-                    } else {
-                        // Sixel / fallback — render at natural pixel size at
+                    } else if crate::terminal::protocol() == crate::terminal::TerminalProtocol::Sixel {
+                        // Sixel — render at natural pixel size at
                         // the centered position computed by render_preview_panel.
+                        // NOTE: TextFallback intentionally emits NOTHING here.
+                        // Writing image bytes to a terminal with no graphics
+                        // support prints them as garbage text over the UI.
                         let _ = out.queue(MoveTo(x, y));
                         let _ = out.write_all(sixel);
                     }
@@ -3285,6 +3379,7 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                                     ExportFocus::Fps => app.cycle_export_fps(),
                                     ExportFocus::LensMode => app.cycle_lens_mode(false),
                                     ExportFocus::BlWlMode => app.cycle_blwl(false),
+                                    ExportFocus::HighlightRecovery => app.toggle_highlight_recovery(),
                                 }
                             }
                             FocusTarget::Grade => {
@@ -3334,6 +3429,7 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                                     ExportFocus::Fps => app.cycle_export_fps(),
                                     ExportFocus::LensMode => app.cycle_lens_mode(true),
                                     ExportFocus::BlWlMode => app.cycle_blwl(true),
+                                    ExportFocus::HighlightRecovery => app.toggle_highlight_recovery(),
                                 }
                             }
                             FocusTarget::Grade => {
@@ -3927,6 +4023,7 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                             ExportFocus::Fps => app.cycle_export_fps(),
                             ExportFocus::LensMode => app.cycle_lens_mode(true),
                             ExportFocus::BlWlMode => app.cycle_blwl(true),
+                            ExportFocus::HighlightRecovery => app.toggle_highlight_recovery(),
                         }
                     } else if !app.timestamps.is_empty() {
                         let next = (app.frame_index + 1).min(app.timestamps.len() - 1);
@@ -3967,6 +4064,7 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                             ExportFocus::Fps => app.cycle_export_fps(),
                             ExportFocus::LensMode => app.cycle_lens_mode(false),
                             ExportFocus::BlWlMode => app.cycle_blwl(false),
+                            ExportFocus::HighlightRecovery => app.toggle_highlight_recovery(),
                         }
                     } else if !app.timestamps.is_empty() {
                         let prev = app.frame_index.saturating_sub(1);
@@ -3986,6 +4084,15 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                         app.grade_strip_idle_ticks = 15;
                     }
                 }
+                // 'y' toggles HL recovery (mnemonic: recoverY — placed off the
+                // h/j/k/l navigation cluster after 'H' proved too close to
+                // 'h' (Left/cycle-back): sticky-shift and fat-finger presses
+                // toggled recovery while navigating values.
+                crossterm::event::KeyCode::Char('y') => {
+                    if app.focus_target == FocusTarget::ExportSettings {
+                        app.toggle_highlight_recovery();
+                    }
+                }
                 crossterm::event::KeyCode::Char('H') => {
                     if app.focus_target == FocusTarget::Grade {
                         let step = GradeSliders::step_large(app.grade_focus);
@@ -3994,6 +4101,11 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                         app.phosphor_trail.push((old_norm, 4));
                         app.grade_strip_active = true;
                         app.grade_strip_idle_ticks = 15;
+                    } else if app.focus_target == FocusTarget::ExportSettings {
+                        // 'H' is free outside Grade focus: toggle HL recovery
+                        // directly (arrows/scroll/click also work once the
+                        // HighlightRecovery row is focused).
+                        app.toggle_highlight_recovery();
                     }
                 }
                 crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
@@ -4016,17 +4128,7 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                                 }
                             }
                             FocusTarget::ExportSettings => {
-                                let show_rate = !matches!(app.export_codec_family, crate::export::CodecFamily::ProRes | crate::export::CodecFamily::DNxHR);
-                                app.export_focus = match app.export_focus {
-                                    ExportFocus::CodecFamily => ExportFocus::BlWlMode,
-                                    ExportFocus::BlWlMode => ExportFocus::LensMode,
-                                    ExportFocus::LensMode => if show_rate { ExportFocus::RateControl } else { ExportFocus::Fps },
-                                    ExportFocus::RateControl => ExportFocus::Fps,
-                                    ExportFocus::Fps => ExportFocus::Profile,
-                                    ExportFocus::Profile => ExportFocus::TransferFunction,
-                                    ExportFocus::TransferFunction => ExportFocus::ColorSpace,
-                                    ExportFocus::ColorSpace => ExportFocus::CodecFamily,
-                                };
+                                app.step_export_focus_up();
                             }
                             FocusTarget::Grade => {
                                 if app.grade_focus > 0 {
@@ -4059,17 +4161,7 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
                                 }
                             }
                             FocusTarget::ExportSettings => {
-                                let show_rate = !matches!(app.export_codec_family, crate::export::CodecFamily::ProRes | crate::export::CodecFamily::DNxHR);
-                                app.export_focus = match app.export_focus {
-                                    ExportFocus::CodecFamily => ExportFocus::ColorSpace,
-                                    ExportFocus::ColorSpace => ExportFocus::TransferFunction,
-                                    ExportFocus::TransferFunction => ExportFocus::Profile,
-                                    ExportFocus::Profile => ExportFocus::Fps,
-                                    ExportFocus::Fps => if show_rate { ExportFocus::RateControl } else { ExportFocus::LensMode },
-                                    ExportFocus::RateControl => ExportFocus::LensMode,
-                                    ExportFocus::LensMode => ExportFocus::BlWlMode,
-                                    ExportFocus::BlWlMode => ExportFocus::CodecFamily,
-                                };
+                                app.step_export_focus_down();
                             }
                             FocusTarget::Grade => {
                                 if app.grade_focus + 1 < GradeSliders::count() {
@@ -4190,3 +4282,71 @@ async fn handle_event(app: &mut App, event: Event, _encoder: &Encoder, click_reg
 }
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app() -> App {
+        App::new_with_placeholder(None)
+    }
+
+    #[test]
+    fn hl_recovery_defaults_on() {
+        let app = test_app();
+        assert!(app.highlight_recovery);
+    }
+
+    #[test]
+    fn hl_toggle_flips_focus_and_status() {
+        let mut app = test_app();
+        app.toggle_highlight_recovery();
+        assert!(!app.highlight_recovery);
+        assert_eq!(app.export_focus, ExportFocus::HighlightRecovery);
+        assert!(app.status_message.contains("OFF"));
+        app.toggle_highlight_recovery();
+        assert!(app.highlight_recovery);
+        assert!(app.status_message.contains("ON"));
+    }
+
+    /// Both Up (k) and Down (j) focus chains must pass through the new
+    /// variant exactly once — otherwise keyboard navigation skips or
+    /// dead-ends on the HL row. The chains live in
+    /// `step_export_focus_up/down`, shared with the key handler.
+    #[test]
+    fn hl_row_reachable_in_both_focus_chains() {
+        for start in [
+            ExportFocus::CodecFamily, ExportFocus::ColorSpace,
+            ExportFocus::TransferFunction, ExportFocus::Profile,
+            ExportFocus::RateControl, ExportFocus::Fps,
+            ExportFocus::LensMode, ExportFocus::BlWlMode,
+            ExportFocus::HighlightRecovery,
+        ] {
+            for stepper in [true, false] {
+                let mut app = test_app();
+                app.export_focus = start;
+                let mut seen_hl = 0;
+                for _ in 0..9 {
+                    if stepper { app.step_export_focus_up(); } else { app.step_export_focus_down(); }
+                    if app.export_focus == ExportFocus::HighlightRecovery { seen_hl += 1; }
+                }
+                assert_eq!(app.export_focus, start, "chain does not cycle from {start:?}");
+                assert_eq!(seen_hl, 1, "chain visits HL {seen_hl}x from {start:?}");
+            }
+        }
+        // ProRes hides the Rate row (8-step cycle): HL must still be
+        // visited exactly once with no dead end.
+        for stepper in [true, false] {
+            let mut app = test_app();
+            app.export_codec_family = crate::export::CodecFamily::ProRes;
+            app.export_focus = ExportFocus::CodecFamily;
+            let mut seen_hl = 0;
+            for _ in 0..8 {
+                if stepper { app.step_export_focus_up(); } else { app.step_export_focus_down(); }
+                if app.export_focus == ExportFocus::HighlightRecovery { seen_hl += 1; }
+            }
+            assert_eq!(app.export_focus, ExportFocus::CodecFamily);
+            assert_eq!(seen_hl, 1);
+        }
+    }
+}

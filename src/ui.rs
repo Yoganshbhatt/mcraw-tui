@@ -108,6 +108,7 @@ pub enum ClickAction {
     CycleRate,
     CycleLensMode,
     CycleBlWlMode,
+    CycleHl,
     ImportOption1,
     ImportOption2,
     ClosePopup,
@@ -1172,6 +1173,13 @@ fn render_export_summary(frame: &mut Frame, app: &App, area: Rect, border_color:
         Span::styled(&summary.rate_control, Style::default().fg(Palette::VALUE)),
     ]));
     lines.push(Line::from(vec![
+        Span::styled("  HL Rec:      ", Style::default().fg(Palette::LABEL)),
+        Span::styled(
+            if summary.hl_recovery { "ON" } else { "OFF" },
+            Style::default().fg(Palette::VALUE),
+        ),
+    ]));
+    lines.push(Line::from(vec![
         Span::styled("  Frames:      ", Style::default().fg(Palette::LABEL)),
         Span::styled(format!("{}", summary.frame_count), Style::default().fg(Palette::VALUE)),
     ]));
@@ -1949,6 +1957,23 @@ fn render_export_settings(frame: &mut Frame, app: &App, area: Rect, regions: &mu
         regions.push(ClickRegion { area: bw_area, action: ClickAction::CycleBlWlMode });
     }
 
+    // --- HL Recovery ---
+    let hl_y = bw_y + 1;
+    {
+        let hl_focused = app.export_focus == ExportFocus::HighlightRecovery && is_focused;
+        let hl_val = if app.highlight_recovery { "ON" } else { "OFF" };
+        lines.push(Line::from(vec![
+            Span::styled("  HL Rec:   ", Style::default().fg(Palette::LABEL)),
+            Span::styled(hl_val, if hl_focused {
+                Style::default().fg(Palette::FOCUSED).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Palette::VALUE)
+            }),
+        ]));
+        let hl_area = Rect { x: area.x + 1, y: hl_y, width: area.width.saturating_sub(2), height: 1 };
+        regions.push(ClickRegion { area: hl_area, action: ClickAction::CycleHl });
+    }
+
     lines.push(Line::from(""));
     if let Some(ref folder) = app.export_folder {
         let disp = folder.to_string_lossy().to_string();
@@ -1967,7 +1992,7 @@ fn render_export_settings(frame: &mut Frame, app: &App, area: Rect, regions: &mu
             Style::default().fg(Palette::LABEL),
         )));
     }
-    lines.push(Line::from(Span::styled("  [c] Codec  [g] Gamut  [t] Transfer  [f] FPS  [r] Rate  [m] Lens  [w] BL/WL  [P] Preset  [p] Save", Style::default().fg(Color::White))));
+    lines.push(Line::from(Span::styled("  [c] Codec  [g] Gamut  [t] Transfer  [f] FPS  [r] Rate  [m] Lens  [w] BL/WL  [y] HL  [P] Preset  [p] Save", Style::default().fg(Color::White))));
 
     let panel = Paragraph::new(lines)
         .block(
@@ -2671,6 +2696,7 @@ fn render_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::styled("  ←/→        Change value of focused setting", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  c/g/t/r    Cycle codec/gamut/transfer/rate", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  m/w        Cycle lens mode / black-white level mode", Style::default().fg(Palette::VALUE))),
+        Line::from(Span::styled("  y          Toggle HL recovery (when export focused)", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  P          Open preset picker (apply saved preset)", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  p          Save current settings as preset", Style::default().fg(Palette::VALUE))),
         Line::from(Span::styled("  i          Edit custom rate (when export focused)", Style::default().fg(Palette::VALUE))),
@@ -2986,5 +3012,49 @@ fn truncate(s: &str, max: usize) -> String {
         let mut out: String = s.chars().take(max - 1).collect();
         out.push('…');
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn test_app() -> App {
+        App::new_with_placeholder(None)
+    }
+
+    /// The HL row renders with the live value, registers exactly one click
+    /// region on its own row (touch), and focus-highlight follows
+    /// `export_focus` (keyboard).
+    #[test]
+    fn export_panel_renders_hl_row_with_focus_and_click_region() {
+        for (hl, label) in [(true, "ON"), (false, "OFF")] {
+            let mut app = test_app();
+            app.highlight_recovery = hl;
+            app.export_focus = ExportFocus::HighlightRecovery;
+            app.focus_target = FocusTarget::ExportSettings;
+            let backend = TestBackend::new(100, 40);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let mut regions: Vec<ClickRegion> = Vec::new();
+            terminal
+                .draw(|f| render_export_settings(f, &app, f.area(), &mut regions))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(text.contains("HL Rec:"), "HL row missing");
+            assert!(text.contains(label), "HL value {label} missing");
+            let hl_regions: Vec<_> = regions
+                .iter()
+                .filter(|r| r.action == ClickAction::CycleHl)
+                .collect();
+            assert_eq!(hl_regions.len(), 1, "exactly one HL click region");
+            assert_eq!(hl_regions[0].area.height, 1, "HL region must be one row");
+        }
     }
 }

@@ -171,19 +171,41 @@ fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
 
 /// Encode an RGBA buffer as Kitty graphics protocol raw RGB (`f=24`).
 ///
-/// Uses `a=t` (transmit only, image ID=0, replace=1) to send the pixel
-/// data without displaying. The caller must emit a subsequent `a=p` (place)
-/// command to display the image at the cursor position — this two-step
-/// approach works around WezTerm on Windows where `a=T` (transmit+display)
-/// ignores the cursor position and snaps to pixel (0,0).
+/// Uses image ID 1 (ID 0 is rejected by Kitty — transmitted sequences
+/// vanish silently) and `a=t` (transmit only) plus a subsequent `a=p`
+/// (place) command — this two-step approach works around WezTerm on Windows
+/// where `a=T` (transmit+display) ignores the cursor position and snaps to
+/// pixel (0,0).
+///
+/// Both commands carry `q=2` (suppress all responses). Without it Kitty
+/// answers every transmit with `Gi=<id>;OK` bytes on terminal input, which
+/// the event loop would parse as phantom keypresses (`g` cycles gamut under
+/// ExportSettings focus, `i` toggles file info, ...).
+///
+/// The payload is chunked at 4096 bytes with `m=1` (more data follows).
+/// Terminals cap their APC/OSC input buffers (often ~1 MiB); a single
+/// unchunked escape carrying a whole thumbnail overflows the buffer and
+/// the terminal prints the payload as garbage text over the UI.
 fn kitty_encode(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
     use base64::Engine;
     let rgb = rgba_to_rgb(rgba);
     let b64 = base64::engine::general_purpose::STANDARD.encode(&rgb);
-    let header = format!("\x1b_Ga=t,i=0,r=1,f=24,s={},v={},m=0;", width, height);
-    let mut out = header.into_bytes();
-    out.extend_from_slice(b64.as_bytes());
-    out.extend_from_slice(b"\x1b\\");
+    let bytes = b64.as_bytes();
+    const CHUNK: usize = 4096;
+    const IMAGE_ID: u32 = 1;
+    let mut out = Vec::with_capacity(bytes.len() + 256);
+    let n = (bytes.len() + CHUNK - 1) / CHUNK.max(1);
+    for (i, chunk) in bytes.chunks(CHUNK).enumerate() {
+        let more = if i + 1 < n { 1 } else { 0 };
+        let header = if i == 0 {
+            format!("\x1b_Ga=t,i={IMAGE_ID},q=2,r=1,f=24,s={},v={},m={};", width, height, more)
+        } else {
+            format!("\x1b_Gm={};", more)
+        };
+        out.extend_from_slice(header.as_bytes());
+        out.extend_from_slice(chunk);
+        out.extend_from_slice(b"\x1b\\");
+    }
     out
 }
 
@@ -645,4 +667,46 @@ pub fn cpu_thumbnail(
     let encoded = encode_rgba_to_terminal(&rgba, out_w as usize, out_h as usize)?;
 
     Ok((encoded, out_w, out_h))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Kitty emission contract (proven against Kitty 0.49.1 with live
+    /// `cat` tests): nonzero image ID (ID 0 is silently rejected — no
+    /// image, no error), `q=2` on every command (otherwise Kitty's
+    /// `Gi=<id>;OK` responses arrive as phantom keypresses), correct
+    /// chunk flags, and base64 payload intact across chunks.
+    #[test]
+    fn kitty_encode_uses_nonzero_id_quiet_and_chunks() {
+        // Small: single chunk, m=0.
+        let small = vec![128u8; 8 * 8 * 4];
+        let out = kitty_encode(&small, 8, 8);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("i=1,"), "image ID must be nonzero");
+        assert!(!text.contains("i=0,"), "image ID 0 is rejected by Kitty");
+        assert!(text.contains("q=2"), "responses must be suppressed");
+        assert!(text.contains("m=0;"), "single chunk must close with m=0");
+        assert!(!text.contains("m=1;"), "single chunk must not set m=1");
+        // Large: multi-chunk, first chunks m=1, last m=0.
+        let big = vec![200u8; 64 * 64 * 4];
+        let out = kitty_encode(&big, 64, 64);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("m=1;"), "large payload must chunk with m=1");
+        assert!(text.rsplit("m=").next().unwrap().starts_with("0;"),
+                "final chunk must close with m=0");
+        // Payload survival: strip escapes, decode, compare.
+        let mut payload = String::new();
+        for part in text.split("\x1b\\") {
+            if let Some(semi) = part.find(';') {
+                payload.push_str(&part[semi + 1..]);
+            }
+        }
+        let decoded = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD, payload.trim_end(),
+        ).unwrap();
+        let expected = rgba_to_rgb(&big);
+        assert_eq!(decoded, expected, "chunked payload must reassemble exactly");
+    }
 }

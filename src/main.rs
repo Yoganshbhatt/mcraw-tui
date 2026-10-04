@@ -11,12 +11,12 @@ mod encoder;
 mod error;
 mod export;
 mod file;
+mod file_browser;
 mod gradient;
 mod grading;
 mod gui;
-mod hl;
-mod file_browser;
 mod hardware;
+mod hl;
 mod metadata;
 mod pipeline;
 mod preset;
@@ -68,8 +68,8 @@ fn init_logging() -> WorkerGuard {
     let file_appender = tracing_appender::rolling::daily(&log_dir, "mcraw-tui.log");
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("mcraw_tui=info"));
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("mcraw_tui=info"));
 
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
@@ -101,7 +101,17 @@ async fn main() -> Result<()> {
 
     let protocol = crate::terminal::detect();
     crate::terminal::init(protocol);
-    tracing::info!("terminal protocol: {}", crate::terminal::protocol_name(protocol));
+    tracing::info!(
+        "terminal protocol: {}",
+        crate::terminal::protocol_name(protocol)
+    );
+    tracing::info!("terminal env: TERM={:?} TERM_PROGRAM={:?} KITTY_WINDOW_ID={} WEZTERM_EXECUTABLE={} KONSOLE_VERSION={} WT_SESSION={}",
+        std::env::var("TERM").unwrap_or_default(),
+        std::env::var("TERM_PROGRAM").unwrap_or_default(),
+        std::env::var("KITTY_WINDOW_ID").is_ok(),
+        std::env::var("WEZTERM_EXECUTABLE").is_ok(),
+        std::env::var("KONSOLE_VERSION").is_ok(),
+        std::env::var("WT_SESSION").is_ok());
 
     let args = cli::Cli::parse();
     tracing::info!("cli args: {:?}", args);
